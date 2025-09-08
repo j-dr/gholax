@@ -1,0 +1,78 @@
+likelihood:
+  Nx2PTAngularPowerSpectrumTraining:
+    use_boltzmann: True
+    analytic_marginalization: False
+    linear_params_filename: /global/cfs/cdirs/cosmosim/slac/jderose/DESIxDES_private/likelihood_configs/buzzard_v2.0/linear_params_all_wcdm_c_dd-c_dk-c_kk_cleft_l0_kmb0.4_nla_spline_s0_spline_N_1_spline_D_0.6_byk_k2_pade_baryon_spline_N_2_spline_D_2.0_kmm1.0_lcto0_ferr05__no_am.yaml
+    data_vector:
+      data_vector_info_filename: /global/cfs/projectdirs/cosmosim/slac/jderose/DESIxDES_private/mocks/buzzard_desi/spectra_mean_bgs_lrgs_bspline_ckk_cov.yaml
+      spectrum_info: 
+        {'c_dd': {'bins0': [0], 'bins1': [0], 'use_cross': False}, 'c_dk': {'bins0': [0], 'bins1': [0]}, 'c_kk': {'bins0': [0], 'bins1': [0]}}
+      scale_cuts :
+        {'c_dd': {'0_0': [50, 134]}, 'c_dk': {'0_0': [50, 134]}, 'c_kk': {'0_0': [50, 87.0]}}
+    params: 
+      {'As': {'prior': {'dist': 'uniform', 'min': 1.1010031202900001, 'max': 3.10100312029}, 'ref': 2.10731559362, 'proposal': 0.4001, 'latex': 'A_s'}, 'ns': {'prior': {'dist': 'uniform', 'min': 0.93, 'max': 1.01}, 'ref': 0.96824, 'proposal': 0.04, 'latex': 'n_s'}, 'omch2': {'prior': {'dist': 'uniform', 'min': 0.08, 'max': 0.16}, 'ref': 0.11923, 'proposal': 0.01, 'latex': '\omega_{c}'}, 'ombh2': {'prior': {'dist': 'uniform', 'min': 0.0173, 'max': 0.0272}, 'ref': 0.022447, 'proposal': 0.005, 'latex': '\omega_{b}'}, 'H0': {'prior': {'dist': 'uniform', 'min': 52.0, 'max': 82.0}, 'ref': 67.7, 'proposal': 10.0, 'latex': 'H_0'}, 'w': {'prior': {'dist': 'uniform', 'min': -1.56, 'max': -0.44}, 'ref': -1.0, 'proposal': 0.5, 'latex': 'w'}, 'logmnu': {'prior': {'dist': 'uniform', 'min': -2.0, 'max': -0.3010299956639812}, 'ref': -2.0, 'proposal': 0.5, 'latex': '\log \sum m_{\nu}'}, 'mnu': {'derived': "lambda logmnu: 10**logmnu", 'latex': '\Sum m_{\nu}'}}
+
+theory:
+  LinearPowerSpectrum:
+    use_emulator: False
+    use_boltzmann: True
+    kmax: 10
+
+  ExpansionHistory:
+    use_emulator: False
+    emulator_file_names: 
+      chi_z: aemulus_nu_tier1_cosmo_only_heft_chiz_emu
+      e_z: aemulus_nu_tier1_cosmo_only_heft_ez_emu
+
+  LinearGrowth:
+    use_emulator: False
+    use_boltzmann: True
+
+  RealSpaceBiasedTracerSpectra:
+    bias_model: cleft #as opposed to CLEFT/linear bias
+    use_emulator: False
+    emulator_file_names: emu_config_cleft.yaml
+
+  DensityShapeIA:
+    use_emulator: False
+    heft_nla: False
+    emulator_file_names: 'emu_density_shape.yaml'
+
+  ShapeShapeIA:
+    use_emulator: False
+    heft_nla: False
+    emulator_file_names: 
+     - emu_shape_shape_m0.yaml
+     - emu_shape_shape_m1.yaml 
+     - emu_shape_shape_m2.yaml
+ 
+projection:
+  k_cutoff: 1.0
+  LensingCounterterm:
+    lensing_counterterm_order: 0
+    mean_model: dmo
+
+  Limber:
+    k_cutoff: None
+
+sampler:
+  {'NUTS': {'n_steps_warmup': 500, 'n_incr': 50, 'target_r_minus_one': 0.1, 'random_start': False, 'minimize_and_sample': True, 'n_steps_min': 2000}}
+
+emulate:
+  likelihood: 
+    Nx2PTAngularPowerSpectrumTraining: ['p_ij_real_space_bias_grid', 'p_mij_real_space_shape_shape_grid', 'p_ij_real_space_density_shape_grid', 'sigma8_z']
+  design_scheme: 'qrs'
+  nend: 16384
+  output_filename: /pscratch/sd/j/jderose/jaxeft/training/rs_bias_ia_data_v2.h5  
+
+#  NUTS:
+#    n_steps_warmup: 1000
+#    n_steps: 10000
+#    random_start: True
+
+output_file: /pscratch/sd/j/jderose/jaxeft/training//spectra_mean_bgs_lrgs_bspline_ckk_cov_all_wcdm_c_dd-c_dk-c_kk_cleft_l0_kmb0.4_nla_spline_s0_spline_N_1_spline_D_0.6_byk_k2_pade_baryon_spline_N_2_spline_D_2.0_kmm1.0_lcto0_ferr05__no_am_NUTS.txt
+  
+
+
+
+    

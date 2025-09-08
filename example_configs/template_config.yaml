@@ -1,0 +1,72 @@
+likelihood:
+  Nx2PTAngularPowerSpectrum:
+    analytic_marginalization: False
+    linear_params_filename: /global/cfs/projectdirs/cosmosim/slac/jderose/jaxeft/configs/linear_params_all_lcdm_fixednu_c_kk-c_dk-c_dd_heft_l0-1-2-3-4-5_kmb0.4_no_ia_spline_s0-1-2-3_spline_N_3_spline_D_0.6_kmm1.0_no_am.yaml
+    data_vector:
+      data_vector_info_filename: /global/cfs/projectdirs/cosmosim/slac/jderose/DESIxDES_private/mocks/buzzard_desi/spectra_mean_bgs_lrgs_bspline_ckk_cov.yaml
+      spectrum_info: 
+        {'c_kk': {'bins0': [0, 1, 2, 3], 'bins1': [0, 1, 2, 3]}, 'c_dk': {'bins0': [0, 1, 2, 3, 4, 5], 'bins1': [0, 1, 2, 3]}, 'c_dd': {'bins0': [0, 1, 2, 3, 4, 5], 'bins1': [0, 1, 2, 3, 4, 5], 'use_cross': False}}
+      scale_cuts :
+        {'c_kk': {'0_0': [50, 300], '0_1': [50, 300], '0_2': [50, 300], '0_3': [50, 300], '1_1': [50, 300], '1_2': [50, 300], '1_3': [50, 300], '2_2': [50, 300], '2_3': [50, 300], '3_3': [50, 300]}, 'c_dk': {'0_0': [50, 134], '0_1': [50, 134], '0_2': [50, 134], '0_3': [50, 134], '1_0': [50, 267], '1_1': [50, 267], '1_2': [50, 267], '1_3': [50, 267], '2_0': [50, 400], '2_1': [50, 400], '2_2': [50, 400], '2_3': [50, 400], '3_0': [50, 533], '3_1': [50, 533], '3_2': [50, 533], '3_3': [50, 533], '4_0': [50, 667], '4_1': [50, 667], '4_2': [50, 667], '4_3': [50, 667], '5_0': [50, 767], '5_1': [50, 767], '5_2': [50, 767], '5_3': [50, 767]}, 'c_dd': {'0_0': [50, 134], '1_1': [50, 267], '2_2': [50, 400], '3_3': [50, 533], '4_4': [50, 667], '5_5': [50, 767]}}
+    params: 
+      {'As': {'prior': {'dist': 'uniform', 'min': 1.1010031202900001, 'max': 3.10100312029}, 'ref': 2.10731559362, 'proposal': 0.4001, 'latex': 'A_s'}, 'ns': {'prior': {'dist': 'uniform', 'min': 0.93, 'max': 1.01}, 'ref': 0.96824, 'proposal': 0.04, 'latex': 'n_s'}, 'omch2': {'prior': {'dist': 'uniform', 'min': 0.08, 'max': 0.16}, 'ref': 0.11923, 'proposal': 0.01, 'latex': '\omega_{c}'}, 'ombh2': {'prior': {'dist': 'uniform', 'min': 0.0173, 'max': 0.0272}, 'ref': 0.022447, 'proposal': 0.005, 'latex': '\omega_{b}'}, 'H0': {'prior': {'dist': 'uniform', 'min': 52.0, 'max': 82.0}, 'ref': 67.7, 'proposal': 10.0, 'latex': 'H_0'}, 'w': {'value': -1.0, 'latex': 'w'}, 'logmnu': {'value': -2.0, 'latex': '\log \sum m_{\nu}'}, 'mnu': {'derived': "lambda params: 10**params['logmnu']", 'latex': '\Sum m_{\nu}'}, 'r_pade': {'value': 2.0}, 'c_s_0': {'value': 0.0}, 'c_s_1': {'value': 0.0}, 'c_s_2': {'value': 0.0}, 'c_ds_0': {'value': 0.0}, 'c_ds_1': {'value': 0.0}, 'c_ds_2': {'value': 0.0}, 'c_s2_0': {'value': 0.0}, 'c_s2_1': {'value': 0.0}, 'c_s2_2': {'value': 0.0}, 'c_L2_0': {'value': 0.0}, 'c_L2_1': {'value': 0.0}, 'c_L2_2': {'value': 0.0}, 'c_3_0': {'value': 0.0}, 'c_3_1': {'value': 0.0}, 'c_3_2': {'value': 0.0}, 'c_dt_0': {'value': 0.0}, 'c_dt_1': {'value': 0.0}, 'c_dt_2': {'value': 0.0}, 'alpha_s_0': {'value': 0.0}, 'alpha_s_1': {'value': 0.0}, 'alpha_s_2': {'value': 0.0}, 'b_1_0': {'prior': {'dist': 'uniform', 'min': 0.5, 'max': 4}, 'ref': 1.15, 'proposal': 0.1, 'latex': 'b_1^0'}, 'b_1_1': {'prior': {'dist': 'uniform', 'min': 0.5, 'max': 4}, 'ref': 1.4, 'proposal': 0.1, 'latex': 'b_1^1'}, 'b_1_2': {'prior': {'dist': 'uniform', 'min': 0.5, 'max': 4}, 'ref': 1.8, 'proposal': 0.1, 'latex': 'b_1^2'}, 'b_1_3': {'prior': {'dist': 'uniform', 'min': 0.5, 'max': 4}, 'ref': 2.0, 'proposal': 0.1, 'latex': 'b_1^3'}, 'b_1_4': {'prior': {'dist': 'uniform', 'min': 0.5, 'max': 4}, 'ref': 2.2, 'proposal': 0.1, 'latex': 'b_1^4'}, 'b_1_5': {'prior': {'dist': 'uniform', 'min': 0.5, 'max': 4}, 'ref': 2.4, 'proposal': 0.1, 'latex': 'b_1^5'}, 'b_2_0': {'prior': {'dist': 'norm', 'loc': 0, 'scale': 1.0}, 'ref': 0.0, 'proposal': 0.5, 'latex': 'b_2^0'}, 'b_2_1': {'prior': {'dist': 'norm', 'loc': 0, 'scale': 1.0}, 'ref': 0.0, 'proposal': 0.5, 'latex': 'b_2^1'}, 'b_2_2': {'prior': {'dist': 'norm', 'loc': 0, 'scale': 1.0}, 'ref': 0.0, 'proposal': 0.5, 'latex': 'b_2^2'}, 'b_2_3': {'prior': {'dist': 'norm', 'loc': 0, 'scale': 1.0}, 'ref': 0.0, 'proposal': 0.5, 'latex': 'b_2^3'}, 'b_2_4': {'prior': {'dist': 'norm', 'loc': 0, 'scale': 1.0}, 'ref': 0.0, 'proposal': 0.5, 'latex': 'b_2^4'}, 'b_2_5': {'prior': {'dist': 'norm', 'loc': 0, 'scale': 1.0}, 'ref': 0.0, 'proposal': 0.5, 'latex': 'b_2^5'}, 'b_s_0': {'prior': {'dist': 'norm', 'loc': 0, 'scale': 1.0}, 'ref': 0.0, 'proposal': 0.5, 'latex': 'b_s^0'}, 'b_s_1': {'prior': {'dist': 'norm', 'loc': 0, 'scale': 1.0}, 'ref': 0.0, 'proposal': 0.5, 'latex': 'b_s^1'}, 'b_s_2': {'prior': {'dist': 'norm', 'loc': 0, 'scale': 1.0}, 'ref': 0.0, 'proposal': 0.5, 'latex': 'b_s^2'}, 'b_s_3': {'prior': {'dist': 'norm', 'loc': 0, 'scale': 1.0}, 'ref': 0.0, 'proposal': 0.5, 'latex': 'b_s^3'}, 'b_s_4': {'prior': {'dist': 'norm', 'loc': 0, 'scale': 1.0}, 'ref': 0.0, 'proposal': 0.5, 'latex': 'b_s^4'}, 'b_s_5': {'prior': {'dist': 'norm', 'loc': 0, 'scale': 1.0}, 'ref': 0.0, 'proposal': 0.5, 'latex': 'b_s^5'}, 'b_3_0': {'value': 0.0}, 'b_3_1': {'value': 0.0}, 'b_3_2': {'value': 0.0}, 'b_3_3': {'value': 0.0}, 'b_3_4': {'value': 0.0}, 'b_3_5': {'value': 0.0}, 'b_ka_0': {'prior': {'dist': 'norm', 'loc': 0.0, 'scale': 0.2}, 'ref': 0.0, 'proposal': 0.1, 'latex': 'b_{\nabla^2\, a}^0'}, 'b_ka_1': {'prior': {'dist': 'norm', 'loc': 0.0, 'scale': 0.2}, 'ref': 0.0, 'proposal': 0.1, 'latex': 'b_{\nabla^2\, a}^1'}, 'b_ka_2': {'prior': {'dist': 'norm', 'loc': 0.0, 'scale': 0.2}, 'ref': 0.0, 'proposal': 0.1, 'latex': 'b_{\nabla^2\, a}^2'}, 'b_ka_3': {'prior': {'dist': 'norm', 'loc': 0.0, 'scale': 0.2}, 'ref': 0.0, 'proposal': 0.1, 'latex': 'b_{\nabla^2\, a}^3'}, 'b_ka_4': {'prior': {'dist': 'norm', 'loc': 0.0, 'scale': 0.2}, 'ref': 0.0, 'proposal': 0.1, 'latex': 'b_{\nabla^2\, a}^4'}, 'b_ka_5': {'prior': {'dist': 'norm', 'loc': 0.0, 'scale': 0.2}, 'ref': 0.0, 'proposal': 0.1, 'latex': 'b_{\nabla^2\, a}^5'}, 'b_kx_0': {'prior': {'dist': 'norm', 'loc': 0.0, 'scale': 0.2}, 'ref': 0.0, 'proposal': 0.1, 'latex': 'b_{\nabla^2\, x}^0'}, 'b_kx_1': {'prior': {'dist': 'norm', 'loc': 0.0, 'scale': 0.2}, 'ref': 0.0, 'proposal': 0.1, 'latex': 'b_{\nabla^2\, x}^1'}, 'b_kx_2': {'prior': {'dist': 'norm', 'loc': 0.0, 'scale': 0.2}, 'ref': 0.0, 'proposal': 0.1, 'latex': 'b_{\nabla^2\, x}^2'}, 'b_kx_3': {'prior': {'dist': 'norm', 'loc': 0.0, 'scale': 0.2}, 'ref': 0.0, 'proposal': 0.1, 'latex': 'b_{\nabla^2\, x}^3'}, 'b_kx_4': {'prior': {'dist': 'norm', 'loc': 0.0, 'scale': 0.2}, 'ref': 0.0, 'proposal': 0.1, 'latex': 'b_{\nabla^2\, x}^4'}, 'b_kx_5': {'prior': {'dist': 'norm', 'loc': 0.0, 'scale': 0.2}, 'ref': 0.0, 'proposal': 0.1, 'latex': 'b_{\nabla^2\, x}^5'}, 'sn_0': {'prior': {'dist': 'norm', 'loc': 90, 'scale': 27}, 'ref': 90.0, 'proposal': 1000.0, 'latex': 'SN^0'}, 'sn_1': {'prior': {'dist': 'norm', 'loc': 430, 'scale': 129}, 'ref': 430.0, 'proposal': 1000.0, 'latex': 'SN^1'}, 'sn_2': {'prior': {'dist': 'norm', 'loc': 2835.0, 'scale': 850.0}, 'ref': 2835.0, 'proposal': 1000.0, 'latex': 'SN^2'}, 'sn_3': {'prior': {'dist': 'norm', 'loc': 2600.0, 'scale': 780.0}, 'ref': 2600.0, 'proposal': 1000.0, 'latex': 'SN^3'}, 'sn_4': {'prior': {'dist': 'norm', 'loc': 3350.0, 'scale': 1005.0}, 'ref': 3350.0, 'proposal': 1000.0, 'latex': 'SN^4'}, 'sn_5': {'prior': {'dist': 'norm', 'loc': 5295.0, 'scale': 1590.0}, 'ref': 5295.0, 'proposal': 1000.0, 'latex': 'SN^5'}, 'smag_0': {'prior': {'dist': 'uniform', 'min': 0.71, 'max': 0.81}, 'ref': 0.81, 'proposal': 0.1, 'latex': '\alpha_{\mu}^0'}, 'smag_1': {'prior': {'dist': 'uniform', 'min': 0.7, 'max': 0.9}, 'ref': 0.8, 'proposal': 0.1, 'latex': '\alpha_{\mu}^1'}, 'smag_2': {'prior': {'dist': 'uniform', 'min': 0.858, 'max': 1.058}, 'ref': 0.958, 'proposal': 0.1, 'latex': '\alpha_{\mu}^2'}, 'smag_3': {'prior': {'dist': 'uniform', 'min': 0.939, 'max': 1.139}, 'ref': 1.039, 'proposal': 0.1, 'latex': '\alpha_{\mu}^3'}, 'smag_4': {'prior': {'dist': 'uniform', 'min': 0.878, 'max': 1.078}, 'ref': 0.978, 'proposal': 0.1, 'latex': '\alpha_{\mu}^4'}, 'smag_5': {'prior': {'dist': 'uniform', 'min': 0.876, 'max': 1.076}, 'ref': 0.976, 'proposal': 0.1, 'latex': '\alpha_{\mu}^5'}, 'delta_z_source_0': {'prior': {'dist': 'norm', 'loc': 0.0, 'scale': 0.018}, 'ref': 0.0, 'proposal': 0.01, 'latex': '\Delta z_s^0'}, 'delta_z_source_1': {'prior': {'dist': 'norm', 'loc': 0.0, 'scale': 0.015}, 'ref': 0.0, 'proposal': 0.01, 'latex': '\Delta z_s^1'}, 'delta_z_source_2': {'prior': {'dist': 'norm', 'loc': 0.0, 'scale': 0.011}, 'ref': 0.0, 'proposal': 0.01, 'latex': '\Delta z_s^2'}, 'delta_z_source_3': {'prior': {'dist': 'norm', 'loc': 0.0, 'scale': 0.017}, 'ref': 0.0, 'proposal': 0.01, 'latex': '\Delta z_s^3'}, 'm_bias_0': {'prior': {'dist': 'norm', 'loc': 0.0, 'scale': 0.009}, 'ref': 0.0, 'proposal': 0.008, 'latex': 'm^0'}, 'm_bias_1': {'prior': {'dist': 'norm', 'loc': 0.0, 'scale': 0.008}, 'ref': 0.0, 'proposal': 0.008, 'latex': 'm^1'}, 'm_bias_2': {'prior': {'dist': 'norm', 'loc': 0.0, 'scale': 0.008}, 'ref': 0.0, 'proposal': 0.008, 'latex': 'm^2'}, 'm_bias_3': {'prior': {'dist': 'norm', 'loc': 0.0, 'scale': 0.008}, 'ref': 0.0, 'proposal': 0.008, 'latex': 'm^3'}, 'b_kma': {'prior': {'dist': 'norm', 'loc': 0.0, 'scale': 0.5}, 'ref': 0.0, 'proposal': 0.2, 'latex': 'b_{\nabla^2\, m}'}, 'sigma_2_0': {'prior': {'dist': 'norm', 'loc': 0.0, 'scale': 0.4}, 'ref': 0.0, 'proposal': 1, 'latex': '\sigma_{20}'}, 'sigma_3_0': {'prior': {'dist': 'norm', 'loc': 0.0, 'scale': 0.4}, 'ref': 0.0, 'proposal': 1, 'latex': '\sigma_{30}'}, 'sigma_3_1': {'prior': {'dist': 'norm', 'loc': 0.0, 'scale': 0.4}, 'ref': 0.0, 'proposal': 1, 'latex': '\sigma_{31}'}, 'sigma_4_0': {'prior': {'dist': 'norm', 'loc': 0.0, 'scale': 0.4}, 'ref': 0.0, 'proposal': 1, 'latex': '\sigma_{40}'}, 'sigma_4_1': {'prior': {'dist': 'norm', 'loc': 0.0, 'scale': 0.4}, 'ref': 0.0, 'proposal': 1, 'latex': '\sigma_{41}'}, 'sigma_4_2': {'prior': {'dist': 'norm', 'loc': 0.0, 'scale': 0.4}, 'ref': 0.0, 'proposal': 1, 'latex': '\sigma_{42}'}}
+
+theory:
+  ExpansionHistory:
+    use_emulator: False
+    emulator_file_names: 
+      chi_z: aemulus_nu_tier1_cosmo_only_heft_chiz_emu
+      e_z: aemulus_nu_tier1_cosmo_only_heft_ez_emu
+
+  LinearGrowth:
+    use_emulator: True
+    emulator_file_name: 'aemulus_nu_tier1_cosmo_only_heft_sigma8z_emu'
+
+  RealSpaceMatterPowerSpectrum:
+    use_emulator: True
+    emulator_file_names: emu_config_4layers.yaml
+
+  RealSpaceBiasedTracerSpectra:
+    bias_model: heft #as opposed to CLEFT/linear bias
+    use_emulator: True
+    emulator_file_names: emu_config_4layers.yaml
+
+  RealSpaceBiasExpansion:
+    bias_model: heft
+    scale_by_s8z: True
+  
+  DensityShapeIA:
+    use_emulator: True
+    emulator_file_names: 'emu_density_shape.yaml'
+
+  ShapeShapeIA:
+    use_emulator: True
+    emulator_file_names: 
+     - emu_shape_shape_m0.yaml
+     - emu_shape_shape_m1.yaml 
+     - emu_shape_shape_m2.yaml
+
+  RealSpaceIAExpansion:
+    z_evolution_model : spline
+    spline_N: 3
+    spline_Delta: 0.6
+    scale_by_s8z: True
+    include_magnification_x_ia: True
+    no_ia: True
+  
+projection:
+  LensingCounterterm:
+    lensing_counterterm_order: 3
+
+sampler:
+  NUTS:
+    n_steps_warmup: 1000
+    n_steps: 10000
+    random_start: True
+
+output_file: /pscratch/sd/j/jderose/DESIxDES/chains/buzzard_desi//spectra_mean_bgs_lrgs_bspline_ckk_cov_all_lcdm_fixednu_c_kk-c_dk-c_dd_heft_l0-1-2-3-4-5_kmb0.4_no_ia_spline_s0-1-2-3_spline_N_3_spline_D_0.6_kmm1.0_no_am.txt
+  
+
+
+
+    
