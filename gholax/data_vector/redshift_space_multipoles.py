@@ -125,10 +125,10 @@ class RedshiftSpaceMultipoles(DataVector):
         self.spectra = []
         for t in self.spectrum_types:
             n_bins0_tot = len(
-                np.unique(spectra[spectra["spectrum_type"] == t]["zbin0"])
+                np.unique(spectra[spectra["spectrum_type"] == t.encode('utf-8')]["zbin0"])
             )
             n_bins1_tot = len(
-                np.unique(spectra[spectra["spectrum_type"] == t]["zbin1"])
+                np.unique(spectra[spectra["spectrum_type"] == t.encode('utf-8')]["zbin1"])
             )
             if "use_cross" not in self.spectrum_info[t]:
                 self.spectrum_info[t]["use_cross"] = True
@@ -139,7 +139,7 @@ class RedshiftSpaceMultipoles(DataVector):
                     UserWarning,
                 )
                 self.spectrum_info[t]["bins0"] = np.unique(
-                    spectra[spectra["spectrum_type"] == t]["zbin0"]
+                    spectra[spectra["spectrum_type"] == t.encode('utf-8')]["zbin0"]
                 )
 
             if "bins1" not in self.spectrum_info[t]:
@@ -148,7 +148,7 @@ class RedshiftSpaceMultipoles(DataVector):
                     UserWarning,
                 )
                 self.spectrum_info[t]["bins1"] = np.unique(
-                    spectra[spectra["spectrum_type"] == t]["zbin1"]
+                    spectra[spectra["spectrum_type"] == t.encode('utf-8')]["zbin1"]
                 )
 
             if not self.spectrum_info[t]["use_cross"]:
@@ -159,7 +159,7 @@ class RedshiftSpaceMultipoles(DataVector):
             # get rid of bins we don't want
             if self.spectrum_info[t]["use_cross"]:
                 idx = (
-                    (spectra["spectrum_type"] == t)
+                    (spectra["spectrum_type"] == t.encode('utf-8'))
                     & (np.in1d(spectra["zbin0"], self.spectrum_info[t]["bins0"]))
                     & (np.in1d(spectra["zbin1"], self.spectrum_info[t]["bins1"]))
                 )
@@ -168,13 +168,13 @@ class RedshiftSpaceMultipoles(DataVector):
                 for ii, i in enumerate(self.spectrum_info[t]["bins0"]):
                     if ii == 0:
                         idx = (
-                            (spectra["spectrum_type"] == t)
+                            (spectra["spectrum_type"] == t.encode('utf-8'))
                             & (spectra["zbin0"] == i)
                             & (spectra["zbin1"] == i)
                         )
                     else:
                         idx |= (
-                            (spectra["spectrum_type"] == t)
+                            (spectra["spectrum_type"] == t.encode('utf-8'))
                             & (spectra["zbin0"] == i)
                             & (spectra["zbin1"] == i)
                         )
@@ -186,7 +186,7 @@ class RedshiftSpaceMultipoles(DataVector):
                 if self.spectrum_info[t]["use_cross"]:
                     for j in self.spectrum_info[t]["bins1"]:
                         idx = (
-                            (spectra["spectrum_type"] == t)
+                            (spectra["spectrum_type"] == t.encode('utf-8'))
                             & (spectra["zbin0"] == i)
                             & (spectra["zbin1"] == j)
                         )
@@ -195,14 +195,14 @@ class RedshiftSpaceMultipoles(DataVector):
                 else:
                     j = i
                     idx = (
-                        (spectra["spectrum_type"] == t)
+                        (spectra["spectrum_type"] == t.encode('utf-8'))
                         & (spectra["zbin0"] == i)
                         & (spectra["zbin1"] == j)
                     )
                     if np.sum(idx) > 0:
                         self.spectrum_info[t]["bin_pairs"].append((i, j))
 
-            idx = spectra["spectrum_type"] == t
+            idx = spectra["spectrum_type"] == t.encode('utf-8')
             z0 = spectra["zbin0"][idx][0]
             z1 = spectra["zbin1"][idx][0]
             idx &= (spectra["zbin0"] == z0) & (spectra["zbin1"] == z1)
@@ -351,7 +351,7 @@ class RedshiftSpaceMultipoles(DataVector):
                             continue
 
                         idxi = np.where(
-                            (self.spectra["spectrum_type"] == t0)
+                            (self.spectra["spectrum_type"] == t0.encode('utf-8'))
                             & (self.spectra["zbin0"] == zb0)
                             & (self.spectra["zbin1"] == zb1)
                             & (self.spectra["ell"] == ell)
