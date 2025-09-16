@@ -1,12 +1,12 @@
-from .data_vector import DataVector
-from jax.scipy.interpolate import RegularGridInterpolator
-from jax.scipy.integrate import trapezoid
-from glob import glob
+import warnings
+
+import h5py as h5
 import jax.numpy as jnp
 import numpy as np
-import warnings
-import yaml
+from jax.scipy.integrate import trapezoid
+from jax.scipy.interpolate import RegularGridInterpolator
 
+from .data_vector import DataVector
 
 datavector_requires = {
     "c_cmbkcmbk": [],
@@ -272,28 +272,10 @@ class TwoPointSpectrum(DataVector):
     def load_data_vector(self):
         """Loads the required data."""
 
-        with open(self.data_vector_info_filename, "r") as fp:
-            self.data_vector_info = yaml.load(fp, Loader=yaml.SafeLoader)
+        self.data_vector_info = h5.File(self.data_vector_info_filename, "r")
 
         if not self.generate_data_vector:
-            # must specify a file with the actual correlation functions
-            # in it. Should have the following columns: datavector type
-            # (e.g. p0), redshift bin number for each sample being
-            # correlated, separation values (e.g. k, ell, etc.), and
-            # actual values for the spectra/correlation functions
-            dt = np.dtype(
-                [
-                    ("spectrum_type", "U10"),
-                    ("zbin0", int),
-                    ("zbin1", int),
-                    ("separation", float),
-                    ("value", float),
-                ]
-            )
-
-            spectra = np.genfromtxt(
-                self.data_vector_info["spectra_filename"], names=True, dtype=dt
-            )
+            spectra = self.data_vector_info["spectra"][:]
         else:
             spectra = self.generate_data()
 
@@ -309,7 +291,7 @@ class TwoPointSpectrum(DataVector):
                 elif t == "c_dcmbk":
                     requirements.append("nz_d_dcmbk")
             for r in requirements:
-                nz_ = np.genfromtxt(self.data_vector_info[r], dtype=None, names=None)
+                nz_ = self.data_vector_info[r][:]
                 nbins = nz_.shape[1] - 1
                 nz = jnp.zeros((nbins, len(self.z)))
 
@@ -338,24 +320,8 @@ class TwoPointSpectrum(DataVector):
                     continue
 
                 self.cW[k] = {}
-
-                if isinstance(window_matrix_files[k], dict):
-                    # want per bin windows here
-                    for ij in list(window_matrix_files[k].keys()):
-                        i = int(ij.split("_")[0])
-                        j = int(ij.split("_")[1])
-
-                        self.cW[k][ij] = np.loadtxt(window_matrix_files[k][ij])
-                else:
-                    basefile = window_matrix_files[k]
-                    all_window_files = glob(basefile)
-                    spbasefile = basefile.split("*")
-                    ijs = [
-                        f.split(spbasefile[0])[-1].split(spbasefile[1])[0]
-                        for f in all_window_files
-                    ]
-                    for i, ij in enumerate(ijs):
-                        self.cW[k][ij] = np.loadtxt(all_window_files[i])
+                for ij in list(window_matrix_files[k].keys()):
+                    self.cW[k][ij] = window_matrix_files[k][ij][:]
 
     def setup_scale_cuts(self):
         # make scale cut mask
@@ -427,7 +393,7 @@ class TwoPointSpectrum(DataVector):
 
                     try:
                         start_idx = np.min(idxi)
-                    except ValueError as e:
+                    except ValueError:
                         continue
 
                     # mask scales
@@ -452,21 +418,8 @@ class TwoPointSpectrum(DataVector):
         # with columns specifying the two data vector types, and four redshift
         # bin indices for each element, as well as a column for the elements
         # themselves
-        dt = np.dtype(
-            [
-                ("spectrum_type0", "U10"),
-                ("spectrum_type1", "U10"),
-                ("zbin00", int),
-                ("zbin01", int),
-                ("zbin10", int),
-                ("zbin11", int),
-                ("separation0", float),
-                ("separation1", float),
-                ("value", float),
-            ]
-        )
 
-        cov_raw = np.loadtxt(self.data_vector_info["covariance_filename"], dtype=dt)
+        cov_raw = self.data_vector_info["covariance"][:]
         cov_raw = cov_raw.reshape(
             int(cov_raw.shape[0] ** 0.5), int(cov_raw.shape[0] ** 0.5)
         )

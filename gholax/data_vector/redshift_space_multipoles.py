@@ -3,8 +3,13 @@ from jax.scipy.interpolate import RegularGridInterpolator
 from jax.scipy.integrate import trapezoid
 import jax.numpy as jnp
 import numpy as np
+import h5py as h5
 import warnings
-import yaml
+
+covariance_field_types = {
+    "p_gg_ell": ["drsd", "drsd"],
+}
+
 
 
 datavector_requires = {
@@ -224,29 +229,10 @@ class RedshiftSpaceMultipoles(DataVector):
     def load_data_vector(self):
         """Loads the required data."""
 
-        with open(self.data_vector_info_filename, "r") as fp:
-            self.data_vector_info = yaml.load(fp, Loader=yaml.SafeLoader)
+        self.data_vector_info = h5.File(self.data_vector_info_filename, "r")
 
         if not self.generate_data_vector:
-            # must specify a file with the actual correlation functions
-            # in it. Should have the following columns: datavector type
-            # (e.g. p0), redshift bin number for each sample being
-            # correlated, separation values (e.g. k, ell, etc.), and
-            # actual values for the spectra/correlation functions
-            dt = np.dtype(
-                [
-                    ("spectrum_type", "U10"),
-                    ("zbin0", int),
-                    ("zbin1", int),
-                    ("ell", int),
-                    ("separation", float),
-                    ("value", float),
-                ]
-            )
-
-            spectra = np.genfromtxt(
-                self.data_vector_info["spectra_filename"], names=True, dtype=dt
-            )
+            spectra = self.data_vector_info['spectra'][:]
         else:
             spectra = self.generate_data()
 
@@ -258,11 +244,10 @@ class RedshiftSpaceMultipoles(DataVector):
             requirements = datavector_requires[t]
             for r in requirements:
                 if r in ["z_fid", "chiz_fid", "hz_fid"]:
-                    self.spectrum_info[t][r] = jnp.array(self.data_vector_info[r])
+                    self.spectrum_info[t][r] = jnp.array(self.data_vector_info[r][:])
                 elif "nz" in r:
-                    nz_ = np.genfromtxt(
-                        self.data_vector_info[r], dtype=None, names=None
-                    )
+                    nz_ = self.data_vector_info[r][:]
+
                     nbins = nz_.shape[1] - 1
                     nz = jnp.zeros((nbins, len(self.z)))
 
@@ -287,19 +272,14 @@ class RedshiftSpaceMultipoles(DataVector):
             assert "kth_rsd" in self.data_vector_info.keys()
             assert "ko_rsd" in self.data_vector_info.keys()
 
-            kth_file = self.data_vector_info["kth_rsd"]
-            ko_file = self.data_vector_info["ko_rsd"]
+            self.kth = self.data_vector_info["kth_rsd"][:]
+            self.ko_eff = self.data_vector_info["ko_rsd"][:]
 
             self.W = {}
             # want per bin windows here
             for ij in list(window_matrix_files.keys()):
-                i = int(ij.split("_")[0])
-                j = int(ij.split("_")[1])
+                self.W[ij] = window_matrix_files[ij]
 
-                self.W[ij] = np.loadtxt(window_matrix_files[ij])
-
-            self.kth = np.loadtxt(kth_file)
-            self.ko_eff = np.loadtxt(ko_file)
 
     def setup_scale_cuts(self):
         # make scale cut mask
@@ -404,23 +384,8 @@ class RedshiftSpaceMultipoles(DataVector):
         # with columns specifying the two data vector types, and four redshift
         # bin indices for each element, as well as a column for the elements
         # themselves
-        dt = np.dtype(
-            [
-                ("spectrum_type0", "U10"),
-                ("spectrum_type1", "U10"),
-                ("zbin00", np.int32),
-                ("zbin01", np.int32),
-                ("zbin10", np.int32),
-                ("zbin11", np.int32),
-                ("ell0", int),
-                ("ell1", int),
-                ("separation0", np.float64),
-                ("separation1", np.float64),
-                ("value", np.float64),
-            ]
-        )
 
-        cov_raw = np.loadtxt(self.data_vector_info["covariance_filename"], dtype=dt)
+        cov_raw = self.data_vector_info['covariance'][:]
         cov_raw = cov_raw.reshape(
             int(cov_raw.shape[0] ** 0.5), int(cov_raw.shape[0] ** 0.5)
         )
@@ -443,7 +408,7 @@ class RedshiftSpaceMultipoles(DataVector):
             elif len(idx) < 1:
                 raise (
                     ValueError(
-                        "No matching cov entry for {}, {}, {}, {}".format(
+                        "No matching cov entry for {}, {}, {}, {}, {}".format(
                             self.spectra[i]["spectrum_type"],
                             self.spectra[i]["zbin0"],
                             self.spectra[i]["zbin1"],
