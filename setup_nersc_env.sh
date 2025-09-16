@@ -1,6 +1,6 @@
 #!/bin/bash
 module load python
-mamba create gholax --clone base
+mamba create -n gholax --clone base
 source activate gholax
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
 pip install --upgrade "jax[cuda12]==0.4.38"
