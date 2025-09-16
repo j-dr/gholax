@@ -1,6 +1,6 @@
-import json
 import os
 
+import h5py as h5
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -40,12 +40,12 @@ class NNPowerSpectrumInterpolator(object):
 def activation(x, alpha, beta):
     """
     Swish-like activation function with learnable parameters.
-    
+
     Args:
         x: Input array
         alpha: Scaling parameter for sigmoid
         beta: Beta parameter controlling the activation shape
-    
+
     Returns:
         Activated output array
     """
@@ -71,21 +71,20 @@ class Emulator(object):
         self.k = jnp.logspace(jnp.log10(kmin), jnp.log10(kmax), self.nk)
 
     def load(self, filebase):
-        with open("{}.json".format(filebase), "r") as fp:
-            weights = json.load(fp)
-
+        with h5.File("{}.h5".format(filebase), "r") as weights:
             for k in weights:
                 if k in ["W", "b", "alphas", "betas"]:
+                    w = []
                     for i, wi in enumerate(weights[k]):
-                        weights[k][i] = jnp.array(wi).astype(jnp.float32)
+                        w.append(jnp.array(weights[k][wi]))
                 elif k in ["param_mean", "param_sigmas"]:
+                    w = jnp.array(weights[k][f'{k}_0']).astype(jnp.float32)
                     if self.scale_As:
-                        weights[k][0] *= 1e9
-                    weights[k] = jnp.array(weights[k]).astype(jnp.float32)
+                        w = w.at[0].set(w[0] * 1e9)
                 else:
-                    weights[k] = jnp.array(weights[k]).astype(jnp.float32)
+                    w = jnp.array(weights[k][f'{k}_0']).astype(jnp.float32)
 
-                setattr(self, k, weights[k])
+                setattr(self, k, w)
 
     def predict(self, parameters):
         x = (parameters - self.param_mean) / self.param_sigmas
@@ -171,11 +170,11 @@ class MultiSpectrumEmulator(object):
         self.param_order_d = cfg["param_order_d"]
         if input_param_order is None:
             input_param_order = self.param_order_spec
-            
+
         self.param_idx_spec = [
             self.param_order_spec.index(p) for p in input_param_order
         ]
-        
+
         self.input_param_order = input_param_order
 
         if s8_tvar is None:
@@ -223,33 +222,33 @@ class MultiSpectrumEmulator(object):
         self.k = jnp.logspace(jnp.log10(kmin), jnp.log10(kmax), self.nk)
 
     def load_spec(self, filebase):
-        with open("{}.json".format(filebase), "r") as fp:
-            weights = json.load(fp)
-
+        with h5.File("{}.h5".format(filebase), "r") as weights:
             for k in weights:
                 if k in ["W", "b", "alphas", "betas"]:
+                    w = []
                     for i, wi in enumerate(weights[k]):
-                        weights[k][i] = np.array(wi).astype(np.float32)
+                        w.append(weights[k][wi][:].astype(np.float32))
                         if (self.param_order_spec is not None) & (i == 0) & (k == "W"):
-                            assert weights[k][i].shape[0] == len(self.param_order_spec)
-                            weights[k][i] = weights[k][i][self.param_idx_spec, :]
-                        weights[k][i] = jnp.array(weights[k][i]).astype(jnp.float32)
+                            assert w[i].shape[0] == len(self.param_order_spec)
+                            w[i] = w[i][self.param_idx_spec, :]
+                        w[i] = jnp.array(w[i]).astype(jnp.float32)
 
                 elif k in ["param_mean", "param_sigmas"]:
+                    w = np.array(weights[k][f'{k}_0']).astype(np.float32)
                     if self.scale_As_spec:
                         if self.param_order_spec is not None:
-                            weights[k][self.param_order_spec.index("As")] *= 1e9
+                            w[self.param_order_spec.index("As")] *= 1e9
                         else:
-                            weights[k][0] *= 1e9
+                            w[0] *= 1e9
                     if self.input_param_order is not None:
-                        weights[k] = np.array(weights[k])[self.param_idx_spec]
+                        w = w[self.param_idx_spec]
 
-                    weights[k] = jnp.array(weights[k]).astype(jnp.float32)
+                    w = jnp.array(w).astype(jnp.float32)
 
                 else:
-                    weights[k] = jnp.array(weights[k]).astype(jnp.float32)
+                    w = jnp.array(weights[k][f'{k}_0']).astype(jnp.float32)
 
-                setattr(self, k, weights[k])
+                setattr(self, k, w)
 
     def predict(self, parameters):
         if self.s8_tvar:
@@ -323,94 +322,33 @@ class ScalarEmulator(object):
                 ]
             )
 
-        with open("{}.json".format(emu_abspath), "r") as fp:
-            weights = json.load(fp)
-
+        with h5.File("{}.h5".format(emu_abspath), "r") as weights:
             for k in weights:
                 if k in ["W", "b", "alphas", "betas"]:
+                    w = []
                     for i, wi in enumerate(weights[k]):
-                        weights[k][i] = np.array(wi).astype(np.float32)
+                        w.append(weights[k][wi][:].astype(np.float32))
                         if (self.input_param_order is not None) & (i == 0) & (k == "W"):
-                            assert weights[k][i].shape[0] == len(self.input_param_order)
-                            weights[k][i] = weights[k][i][self.param_idx, :]
-                        weights[k][i] = jnp.array(weights[k][i]).astype(jnp.float32)
+                            assert w[i].shape[0] == len(self.input_param_order)
+                            w[i] = w[i][self.param_idx, :]
+                        w[i] = jnp.array(w[i]).astype(jnp.float32)
 
                 elif k in ["param_mean", "param_sigmas"]:
+                    w = np.array(weights[k][f'{k}_0']).astype(np.float32)
                     if self.scale_As:
                         if self.weight_param_order is not None:
-                            weights[k][self.weight_param_order.index("As")] *= 1e9
+                            w[self.weight_param_order.index("As")] *= 1e9
                         else:
-                            weights[k][0] *= 1e9
+                            w[0] *= 1e9
                     if self.input_param_order is not None:
-                        weights[k] = np.array(weights[k])[self.param_idx]
+                        w = w[self.param_idx]
 
-                    weights[k] = jnp.array(weights[k]).astype(jnp.float32)
-
-                else:
-                    weights[k] = jnp.array(weights[k]).astype(jnp.float32)
-
-                setattr(self, k, weights[k])
-
-    def predict(self, parameters):
-        x = (parameters - self.param_mean) / self.param_sigmas
-
-        for i in range(self.n_layers - 1):
-            # linear network operation
-            x = x @ self.W[i] + self.b[i]
-
-            # non-linear activation function
-            x = activation(x, self.alphas[i], self.betas[i])
-
-        # linear output layer
-        x = ((x @ self.W[-1]) + self.b[-1]) * self.pc_sigmas + self.pc_mean
-
-        return x
-
-
-class OldScalarEmulator(object):
-    def __init__(self, filebase, scale_As=True, data_dir=None):
-        super(ScalarEmulator, self).__init__()
-        self.scale_As = scale_As
-        self.load(filebase, data_dir=data_dir)
-
-        self.n_parameters = self.W[0].shape[0]
-        self.n_components = self.W[-1].shape[-1]
-        self.n_layers = len(self.W)
-
-    def load(self, filebase, data_dir=None):
-        if data_dir is None:
-            emu_abspath = "/".join(
-                [
-                    os.path.dirname(os.path.realpath(__file__)),
-                    "emu_weights",
-                    filebase,
-                ]
-            )
-        else:
-            emu_abspath = "/".join(
-                [
-                    data_dir,
-                    filebase,
-                ]
-            )
-
-        with open("{}.json".format(emu_abspath), "r") as fp:
-            weights = json.load(fp)
-
-            for k in weights:
-                if k in ["W", "b", "alphas", "betas"]:
-                    for i, wi in enumerate(weights[k]):
-                        weights[k][i] = jnp.array(wi).astype(jnp.float32)
-
-                elif k in ["param_mean", "param_sigmas"]:
-                    if self.scale_As:
-                        weights[k][0] *= 1e9
-                    weights[k] = jnp.array(weights[k]).astype(jnp.float32)
+                    w = jnp.array(w).astype(jnp.float32)
 
                 else:
-                    weights[k] = jnp.array(weights[k]).astype(jnp.float32)
+                    w = jnp.array(weights[k][f'{k}_0']).astype(jnp.float32)
 
-                setattr(self, k, weights[k])
+                setattr(self, k, w)
 
     def predict(self, parameters):
         x = (parameters - self.param_mean) / self.param_sigmas
@@ -518,11 +456,11 @@ class PijEmulator(object):
 def predict_scan(parameters, xs):
     """
     Neural network prediction function for scanning over parameters.
-    
+
     Args:
         parameters: Input parameter array
         xs: Tuple containing all neural network weights, biases, and normalization constants
-    
+
     Returns:
         Tuple of (parameters, predictions) where predictions are the NN outputs
     """
