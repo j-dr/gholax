@@ -1,10 +1,10 @@
 #!/bin/bash
 module load python
 mamba create -n gholax --clone base
-source activate gholax
+mamba activate gholax
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
 pip install --upgrade "jax[cuda12]==0.4.38"
-mamba install numpy scipy pyyaml setuptools ipython jupyter cython gsl matplotlib h5py
+mamba install numpy scipy pyyaml setuptools ipython jupyter cython gsl matplotlib h5py emcee --yes
 pip install interpax==0.3.8 optax==0.2.4
 pip install git+https://github.com/blackjax-devs/blackjax.git
 pip install git+https://github.com/sfschen/spinosaurus.git 
