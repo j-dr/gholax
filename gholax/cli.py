@@ -1,15 +1,15 @@
 #!/usr/bin/python3
 import yaml
 import sys
-from gholax import likelihood
-from gholax import sampler
-from gholax.util import Model
+from . import sampler
+from .util import Model
 import jax
-from copy import copy
 import numpy as np
+import os
 jax.config.update("jax_default_matmul_precision", "float32")
+os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"]=".25"
 
-if __name__ == '__main__':
+def main():
 
     with open(sys.argv[1], 'r') as fp:
         cfg = yaml.load(fp, Loader=yaml.SafeLoader)

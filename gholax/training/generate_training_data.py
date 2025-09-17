@@ -6,9 +6,8 @@ import yaml
 from mpi4py import MPI
 from yaml import Loader
 
-from gholax.util.model import Model
-from gholax.training.design import Design
-
+from ..util.model import Model
+from .design import Design
 
 comm = MPI.COMM_WORLD 
 rank = comm.Get_rank() 
@@ -159,7 +158,7 @@ def generate_models(
                     )
 
 
-if __name__ == "__main__":
+def generate_training_data():
 
     info_txt = sys.argv[1]
     with open(info_txt, "rb") as fp:

@@ -24,3 +24,7 @@ packages = ["gholax"]
 gholax = [
     "theory/emu_weights/**/*",
 ]
+
+[project.scripts]
+run-gholax = "gholax.cli:main"
+generate-training-data = "gholax.training.generate_training_data:generate_training_data"
