@@ -17,3 +17,13 @@ class DataVector(metaclass=abc.ABCMeta):
     @abc.abstractmethod
     def load_covariance_matrix(self):
         pass
+
+    @abc.abstractmethod
+    def save_data_vector(self, model, filename):
+        """Saves the model to a file.
+
+        Args:
+            model (array-like): The model data to be saved.
+            filename (str): The name of the file where the model will be saved.
+        """
+        pass

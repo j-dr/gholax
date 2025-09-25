@@ -309,7 +309,7 @@ class LensingCounterterm(LikelihoodModule):
                             else:
                                 w_j_n = jnp.tile(w_j_n, (n_i, 1))
 
-                        if self.mean_model == "dmo":
+                        if (self.mean_model == "dmo"):
                             c_l_uv = jnp.einsum(
                                 "in,im,No,Nl->ilNnmo",
                                 w_i_n,
@@ -317,6 +317,15 @@ class LensingCounterterm(LikelihoodModule):
                                 sigma_N_o_emu * sigma_N_o,
                                 ell_N,
                             )
+                        elif (self.mean_model == "ct"):
+                            print("CT mean model should only be used for illustrative purposes.", flush=True)
+                            c_l_uv = jnp.einsum(
+                                "in,im,No,Nl->ilNnmo",
+                                w_i_n,
+                                w_j_n,
+                                sigma_N_o_emu * sigma_N_o,
+                                ell_N,
+                            )                        
                         elif self.mean_model == "zero":
                             c_l_uv = jnp.einsum(
                                 "in,im,No,Nl->ilNnmo",

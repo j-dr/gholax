@@ -2,6 +2,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import yaml
+import sys
 
 from gholax import likelihood
 from gholax.sampler.priors import Prior
@@ -142,3 +143,34 @@ class Model:
         }
         like = self.likelihoods[likelihood_name]
         return like.generate_training_data(params_like)
+
+
+def save_model_pred():
+
+    with open(sys.argv[1], 'r') as fp:
+        cfg = yaml.load(fp, Loader=yaml.SafeLoader)
+        
+    if len(sys.argv) > 2:
+        output_base = sys.argv[2]
+    else:
+        output_base = cfg['output_file'].replace('.txt', '.h5')
+        
+    model = Model(cfg)
+    params = model.prior.get_reference_point()
+    
+    for lname in model.likelihoods:
+        like = model.likelihoods[lname]
+        params_am = like.linear_params_means
+        params_like = {k: params[k] for k in model.likelihoods[lname].sampled_params}
+
+        pred = like.predict_model(
+            params_like,
+            params_am,
+            return_state=False,
+            apply_scale_mask=False,
+        )        
+        output_file = f"{output_base}.{lname}"
+                    
+        like.observed_data_vector.save_data_vector(output_file, pred)
+        print(f"Saved model prediction for {lname} to {output_file}")
+    

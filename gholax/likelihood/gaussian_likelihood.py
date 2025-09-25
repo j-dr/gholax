@@ -315,3 +315,9 @@ class GaussianLikelihood(metaclass=abc.ABCMeta):
             lnL = self.compute_noam(params)
 
         return lnL
+
+    def save_model(self, filename, params, params_am):
+        model = self.predict_model(params, params_am, apply_scale_mask=False)
+        self.observed_data_vector.save_data_vector(filename, model)
+        
+

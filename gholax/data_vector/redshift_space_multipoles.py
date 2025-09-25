@@ -52,6 +52,39 @@ class RedshiftSpaceMultipoles(DataVector):
             self.load_covariance_matrix()
         else:
             self.cinv = None
+            
+    def save_data_vector(self, filename, model):
+        with h5.File(filename, "w") as f:
+            dt = np.dtype(
+                [
+                    ("spectrum_type", "S10"),
+                    ("zbin0", int),
+                    ("zbin1", int),
+                    ("ell", int),
+                    ("separation", float),
+                    ("value", float),
+                ]
+            )
+            data = np.zeros(len(model), dtype=dt)
+            data["spectrum_type"] = self.spectra["spectrum_type"]
+            data["zbin0"] = self.spectra["zbin0"]
+            data["zbin1"] = self.spectra["zbin1"]
+            data["ell"] = self.spectra["ell"]
+            data["separation"] = self.spectra["separation"]
+            data["value"] = model
+
+            f.create_dataset("spectra", data=data)
+            f.create_dataset("covariance", data=self.cov)
+            
+            for k_i in self.data_vector_info.keys():
+                if k_i in ["spectra", "covariance"]:
+                    continue
+                elif 'window' in k_i:
+                    grp = f.create_group(k_i)
+                    for k_j in self.data_vector_info[k_i].keys():
+                        grp.create_dataset(k_j, data=self.data_vector_info[k_i][k_j][:])
+                else:
+                    f.create_dataset(k_i, data=self.data_vector_info[k_i][:])
 
     def generate_data(self):
         required_spectra = []
@@ -94,7 +127,7 @@ class RedshiftSpaceMultipoles(DataVector):
 
         dt = np.dtype(
             [
-                ("spectrum_type", "U10"),
+                ("spectrum_type", "S10"),
                 ("zbin0", int),
                 ("zbin1", int),
                 ("ell", int),
@@ -509,8 +542,8 @@ class RedshiftSpaceMultipoles(DataVector):
     def gaussian_covariance(self):
         dt = np.dtype(
             [
-                ("spectrum_type0", "U10"),
-                ("spectrum_type1", "U10"),
+                ("spectrum_type0", "S10"),
+                ("spectrum_type1", "S10"),
                 ("zbin00", np.int32),
                 ("zbin01", np.int32),
                 ("zbin10", np.int32),

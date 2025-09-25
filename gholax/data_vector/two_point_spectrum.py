@@ -144,7 +144,7 @@ class TwoPointSpectrum(DataVector):
 
         dt = np.dtype(
             [
-                ("spectrum_type", "U10"),
+                ("spectrum_type", "S10"),
                 ("zbin0", int),
                 ("zbin1", int),
                 ("separation", float),
@@ -280,6 +280,39 @@ class TwoPointSpectrum(DataVector):
             spectra = self.generate_data()
 
         self.process_spectrum_info(spectra)
+        
+    def save_data_vector(self, filename, model):
+        with h5.File(filename, "w") as f:
+            dt = np.dtype(
+                [
+                    ("spectrum_type", "S10"),
+                    ("zbin0", int),
+                    ("zbin1", int),
+                    ("separation", float),
+                    ("value", float),
+                ]
+            )
+            data = np.zeros(len(model), dtype=dt)
+            data["spectrum_type"] = self.spectra["spectrum_type"]
+            data["zbin0"] = self.spectra["zbin0"]
+            data["zbin1"] = self.spectra["zbin1"]
+            data["separation"] = self.spectra["separation"]
+            data["value"] = model
+
+            f.create_dataset("spectra", data=data)
+            f.create_dataset("covariance", data=self.cov.flatten())
+            
+            for k_i in self.data_vector_info.keys():
+                if k_i in ["spectra", "covariance"]:
+                    continue
+                elif 'window' in k_i:
+                    grp = f.create_group(k_i)
+                    for k_j in self.data_vector_info[k_i].keys():
+                        grpp = grp.create_group(k_j)
+                        for k_k in self.data_vector_info[k_i][k_j].keys():
+                            grpp.create_dataset(k_k, data=self.data_vector_info[k_i][k_j][k_k][:])
+                else:
+                    f.create_dataset(k_i, data=self.data_vector_info[k_i][:])
 
     def load_requirements(self):
         requirements = []
@@ -537,8 +570,8 @@ class TwoPointSpectrum(DataVector):
     def gaussian_covariance(self):
         dt = np.dtype(
             [
-                ("spectrum_type0", "U10"),
-                ("spectrum_type1", "U10"),
+                ("spectrum_type0", "S10"),
+                ("spectrum_type1", "S10"),
                 ("zbin00", int),
                 ("zbin01", int),
                 ("zbin10", int),
@@ -604,3 +637,4 @@ class TwoPointSpectrum(DataVector):
                 counter_i += n_ell_i
 
         return cov
+
