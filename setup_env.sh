@@ -1,0 +1,19 @@
+#!/bin/bash
+#module load python
+mamba create -n gholax
+source activate gholax
+mamba install numpy scipy pyyaml setuptools ipython jupyter cython gsl matplotlib h5py pip
+pip install --upgrade "jax[cuda12]==0.4.38"
+pip install interpax==0.3.8 optax==0.2.4
+pip install git+https://github.com/blackjax-devs/blackjax.git
+pip install git+https://github.com/sfschen/spinosaurus.git 
+pip install git+https://github.com/sfschen/velocileptors.git
+pip install git+https://github.com/AemulusProject/aemulus_heft.git
+python -m pip cache purge
+pip install classy
+pip install getdist --upgrade-strategy only-if-needed
+pip install emcee
+#cp -r /pscratch/sd/j/jderose/emu_weights gholax/theory/emu_weights
+#pip install .
+
+#python3 -m ipykernel install --user --name gholax --display-name gholax
