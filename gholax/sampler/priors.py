@@ -140,9 +140,7 @@ class Prior(object):
         proposal_std = []
         for p in self.prior_info:
             pi = self.prior_info[p]
-            if "proposal" in pi:
-                proposal_std.append(pi["proposal"])
-            elif pi["dist"] == "uniform":
+            if pi["dist"] == "uniform":
                 proposal_std.append((pi["max"] - pi["min"]))
             elif pi["dist"] == "norm":
                 proposal_std.append(pi["scale"])

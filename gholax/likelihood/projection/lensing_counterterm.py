@@ -3,10 +3,11 @@ import warnings
 import jax.numpy as jnp
 import numpy as np
 from interpax import interp1d, interp2d
-from jax import jacobian, vmap
-from jax.lax import scan, switch
+from jax import jacobian, vmap, grad
+from jax.lax import scan, switch, select_n
 from jax.scipy.integrate import trapezoid
 from jax.scipy.special import factorial
+from functools import partial, reduce
 
 from ...util.likelihood_module import LikelihoodModule
 from .limber import required_components
@@ -31,6 +32,7 @@ class LensingCounterterm(LikelihoodModule):
         mean_model="dmo",
         n_ell=200,
         l_max=3001,
+        findiff_order=1,
         **config,
     ):
         self.observed_data_vector = observed_data_vector
@@ -48,6 +50,7 @@ class LensingCounterterm(LikelihoodModule):
         self.ell = jnp.logspace(1, jnp.log10(self.l_max), self.n_ell)
         self.hubble_radius = 2997.925
         self.k_cutoff = k_cutoff
+        self.findiff_order = findiff_order
         self.mean_model = mean_model
         self.magnification_x_ia = config.get("include_magnification_x_ia", False)
         self.lensing_counterterm_order = config.get("lensing_counterterm_order", 0)
@@ -151,7 +154,7 @@ class LensingCounterterm(LikelihoodModule):
                 * D_z**2
             )
 
-        max_points = self.lensing_counterterm_order + 1
+        max_points = self.lensing_counterterm_order + self.findiff_order
         z_all = eps + jnp.arange(max_points) * dz
         pk_all = jnp.stack([compute_pk(z) for z in z_all])
 
@@ -178,7 +181,7 @@ class LensingCounterterm(LikelihoodModule):
         def scan_body(carry, o):
             sigma_N_o_current = carry
 
-            coeff_mask = (jnp.arange(max_points) <= o).astype(jnp.float32)
+            coeff_mask = (jnp.arange(max_points) < (o+self.findiff_order)).astype(jnp.float32)
             coeffs = fd_coeffs[o] * coeff_mask
 
             deriv_current = jnp.dot(coeffs, pk_all)
@@ -206,6 +209,18 @@ class LensingCounterterm(LikelihoodModule):
         return sigma_N_o_final
 
     def w_n(self, w, state):
+        def dzn(n):
+            return select_n(
+                n,
+                1 / self.hubble_radius,
+                1.5 * state["omegam"] / self.hubble_radius**2,
+                3 * state["omegam"] / self.hubble_radius**3,
+                3
+                * state["omegam"]
+                * (1 + 1.5 * state["omegam"])
+                / self.hubble_radius**4,
+                )
+            
         def f_n(n, xs):
             w_i_n = switch(
                 n,
@@ -213,10 +228,9 @@ class LensingCounterterm(LikelihoodModule):
                     lambda n: jnp.ones_like(state[f"chi_inv_eff_{w}"]),
                     lambda n: 1 / self.hubble_radius - state[f"chi_inv_eff_{w}"],
                     lambda n: (
-                        1.5 * state["omegam"] / self.hubble_radius**2
-                        - (n) * state[f"chi_inv_eff_{w}"] / self.hubble_radius
+                        dzn(n - 1) - (n) * state[f"chi_inv_eff_{w}"] * dzn(n - 2)
                     )
-                    / factorial(n),
+                    / factorial(n), #n gets clamped to last value so for n>=2 we get this result
                 ],
                 n,
             )
@@ -309,7 +323,7 @@ class LensingCounterterm(LikelihoodModule):
                             else:
                                 w_j_n = jnp.tile(w_j_n, (n_i, 1))
 
-                        if (self.mean_model == "dmo"):
+                        if self.mean_model == "dmo":
                             c_l_uv = jnp.einsum(
                                 "in,im,No,Nl->ilNnmo",
                                 w_i_n,
@@ -317,15 +331,18 @@ class LensingCounterterm(LikelihoodModule):
                                 sigma_N_o_emu * sigma_N_o,
                                 ell_N,
                             )
-                        elif (self.mean_model == "ct"):
-                            print("CT mean model should only be used for illustrative purposes.", flush=True)
+                        elif self.mean_model == "ct":
+                            print(
+                                "CT mean model should only be used for illustrative purposes.",
+                                flush=True,
+                            )
                             c_l_uv = jnp.einsum(
                                 "in,im,No,Nl->ilNnmo",
                                 w_i_n,
                                 w_j_n,
                                 sigma_N_o_emu * sigma_N_o,
                                 ell_N,
-                            )                        
+                            )
                         elif self.mean_model == "zero":
                             c_l_uv = jnp.einsum(
                                 "in,im,No,Nl->ilNnmo",

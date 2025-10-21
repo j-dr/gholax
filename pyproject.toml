@@ -28,3 +28,4 @@ gholax = [
 [project.scripts]
 run-gholax = "gholax.cli:main"
 generate-training-data = "gholax.training.generate_training_data:generate_training_data"
+save-model = "gholax.util.model:save_model_pred"

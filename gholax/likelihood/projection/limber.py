@@ -154,7 +154,7 @@ class Limber(LikelihoodModule):
             if self.k_cutoff is not None:
                 mask = k < self.k_cutoff
             else:
-                mask = np.ones(len(k))
+                mask = jnp.ones_like(k)
 
             c_l_chi = w_i * w_j * p_ij / state["chi_z_limber"][None, :] ** 2 * mask
 

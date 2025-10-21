@@ -22,7 +22,7 @@ class NUTS(object):
         self.restart = c.get("restart", False)
         self.diagonal_mass_matrix = c.get("diagonal_mass_matrix", True)
         self.minimize_and_sample = c.get("minimize_and_sample", False)
-        self.pathfinder_adaptation = c.get('pathfinder_adaptation', False)
+        self.pathfinder_adaptation = c.get("pathfinder_adaptation", False)
 
     def run(self, model, output_file):
         rng_key = jax.random.key(int(datetime.now().strftime("%Y%m%d%s")))
@@ -61,7 +61,9 @@ class NUTS(object):
             if os.path.exists(f"{output_file}.samples_chk.npy"):
                 samples = np.load(f"{output_file}.samples_chk.npy")
                 log_density = np.load(f"{output_file}.logposterior_chk.npy")
-                initial_state = samples[:, -1, :]
+                initial_state = (samples[:, -1, :] - reference[None, :]) / sigmas[
+                    None, :
+                ]
             else:
                 samples = None
                 log_density = None
@@ -106,16 +108,16 @@ class NUTS(object):
 
             if self.pathfinder_adaptation:
                 print("Running pathfinder adaptation", flush=True)
-                    
+
                 warmup = blackjax.pathfinder_adaptation(
                     blackjax.nuts,
                     jlp,
-                    #is_mass_matrix_diagonal=self.diagonal_mass_matrix,
-                    #progress_bar=False,
+                    # is_mass_matrix_diagonal=self.diagonal_mass_matrix,
+                    # progress_bar=False,
                 )
             else:
                 print("Running window adaptation", flush=True)
-                
+
                 warmup = blackjax.window_adaptation(
                     blackjax.nuts,
                     jlp,
