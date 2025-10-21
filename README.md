@@ -1,5 +1,5 @@
 # gholax
-Differentiable likelihood through surrogate models (gholas).
+![Differentiable likelihood through surrogate models (gholas).](https://github.com/j-dr/gholax/blob/main/gholax_logo.png?raw=true)
 
 ## Installation
 ### Dependencies
