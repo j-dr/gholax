@@ -1,5 +1,9 @@
 # gholax
-![Differentiable likelihood through surrogate models (gholas).](https://github.com/j-dr/gholax/blob/main/gholax_logo.png?raw=true)
+<p align="center">
+<img src="gholax_logo.png" alt="drawing" width="400"/>
+</p>
+
+Differentiable likelihoods through surrogate models (gholas).
 
 Neural network surrogate models and data from https://arxiv.org/abs/XXXX.XXXX will be made available upon acceptance of this work. For early access, please contact jderose@bnl.gov.
 
