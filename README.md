@@ -3,7 +3,7 @@
 <img src="gholax_logo.png" alt="drawing" width="400"/>
 </p>
 
-Differentiable likelihoods through surrogate models (gholas).
+Differentiable likelihoods through surrogate models. Our logo represents a neural network surrogate model ([ghola](https://dune.fandom.com/wiki/Ghola)) for a theory model (velocileptors in this case).
 
 Neural network surrogate models and data from https://arxiv.org/abs/XXXX.XXXX will be made available upon acceptance of this work. For early access, please contact jderose@bnl.gov.
 
