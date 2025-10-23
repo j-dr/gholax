@@ -5,7 +5,7 @@
 
 Differentiable likelihoods through surrogate models. Our logo represents a neural network surrogate model ([ghola](https://dune.fandom.com/wiki/Ghola)) for a theory model ([velocileptors](https://github.com/sfschen/velocileptors) in this case).
 
-Neural network surrogate models and data from https://arxiv.org/abs/XXXX.XXXX will be made available upon acceptance of this work. For early access, please contact jderose@bnl.gov.
+Neural network surrogate models and data from https://arxiv.org/abs/2510.18981 will be made available upon acceptance of this work. For early access, please contact jderose@bnl.gov.
 
 ## Installation
 ### Dependencies
