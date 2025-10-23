@@ -29,6 +29,6 @@ This is equipped with a jupyter kernel named `gholax` that you can use with NERS
 
 ### Local Installation 
 Analogously, assuming you have `mamba` installed, you can run `sh setup_env.sh` and it will build a functioning environment with `gholax` installed. 
-environment can then be activated by calling `mamba activate gholax`. 
+The environment can then be activated by calling `mamba activate gholax`. 
 
 
