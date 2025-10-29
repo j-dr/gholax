@@ -432,6 +432,7 @@ class RealSpaceBiasExpansion(LikelihoodModule):
         self.bias_model = config.get("bias_model", "heft")
         self.fractional_b1_counterterm = config.get("fractional_b1_counterterm", True)
         self.scale_by_s8z = config.get("scale_by_s8z", True)
+        self.baryon_ct_s8z_scaling = config.get("baryon_ct_s8z_scaling", False)
         self.baryon_z_evolution_model = config.get(
             "baryon_z_evolution_model", "constant_bias"
         )
@@ -619,6 +620,11 @@ class RealSpaceBiasExpansion(LikelihoodModule):
             mask = self.k < self.k_cutoff
         else:
             mask = np.ones_like(self.k)
+            
+        if self.baryon_ct_s8z_scaling:
+            s8z = state["sigma8_z"] / self.sigma8_fid
+        else:
+            s8z = jnp.ones(state["sigma8_z"].shape[0])
 
         k_b = 0.4 / np.sqrt(
             0.1
@@ -631,7 +637,7 @@ class RealSpaceBiasExpansion(LikelihoodModule):
             ct_n = ct_n + bk2i * (r_pade_n * self.k[:, None] / k_b) ** (2 * i)
             ct_d = ct_d + bk2i * (r_pade_d * self.k[:, None] / k_b) ** (2 * i)
 
-        p = p_11 * (1 - ct_n / ct_d * mask[:, None])
+        p = p_11 * (1 - (ct_n / ct_d * mask[:, None])/s8z**2)
 
         return p
 

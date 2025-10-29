@@ -103,7 +103,7 @@ class NUTS(object):
                     initial_positions[jnp.argmin(res.state.value)], n_devices
                 ).reshape(n_devices, -1)
                 initial_positions = jnp.where(
-                    chi2_ratio[:, None] > 2, initial_positions_min, initial_positions
+                    (chi2_ratio[:, None] -1) > 1e-4, initial_positions_min, initial_positions
                 )
 
             if self.pathfinder_adaptation:

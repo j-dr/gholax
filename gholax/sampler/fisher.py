@@ -9,6 +9,7 @@ class Fisher(object):
         c = config["sampler"]["Fisher"]
         self.include_prior = c.get("include_prior", True)
         self.n_samples = c.get("n_samples", 20000)
+        self.s8_module_index = c.get("s8_module_index", 1)
 
     def run(self, model, output_file=None):
 
@@ -57,7 +58,7 @@ class Fisher(object):
         labels.extend([r'\Omega_m', r'\sigma_8', r'S_8'])
         like = model.likelihoods[list(model.likelihoods.keys())[0]]
         om = (samples_i[:, param_names.index('omch2')]+samples_i[:, param_names.index('ombh2')])/(samples_i[:, param_names.index('H0')]/100)**2
-        sigma8 = like.likelihood_pipeline[1].emulator.predict(x.T)
+        sigma8 = like.likelihood_pipeline[self.s8_module_index].emulator.predict(x.T)
         s8 = sigma8[:,0] * np.sqrt(om/0.3)    
         samples = np.hstack([samples_i, om[:,None], sigma8, s8[:,None]])
         pnames = copy(param_names)

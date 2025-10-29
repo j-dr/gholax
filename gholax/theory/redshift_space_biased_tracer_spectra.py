@@ -112,7 +112,7 @@ class RedshiftSpaceBiasedTracerSpectra(LikelihoodModule):
         chi_z = state["chi_z_limber"]
         h_z_eff = jnp.interp(self.zeff, state["z_limber"], h_z)
         chi_z_eff = jnp.interp(self.zeff, state["z_limber"], chi_z)
-        apar, aperp = self.hz_fid / h_z_eff, self.chiz_fid / chi_z_eff
+        apar, aperp = self.hz_fid / h_z_eff, chi_z_eff / self.chiz_fid
 
         pkell_true = interp1d(
             self.zeff,
@@ -266,7 +266,7 @@ class RedshiftSpaceBiasedTracerSpectra(LikelihoodModule):
             for i, z in enumerate(self.zeff):
                 apar, aperp = (
                     self.hz_fid[i] / h_z_eff[i],
-                    self.chiz_fid[i] / chi_z_eff[i],
+                    chi_z_eff[i] /self.chiz_fid[i],
                 )
                 model_lpt = LPT_RSD(
                     k_lin,
@@ -449,6 +449,10 @@ class RedshiftSpaceBiasExpansion(LikelihoodModule):
         self.bias_model = config.get("bias_model", "lpt")
         self.fractional_b1_counterterm = config.get("fractional_b1_counterterm", True)
         self.scale_by_s8z = config.get("scale_by_s8z", True)
+        self.scale_by_aap = config.get("scale_by_aap", True)
+        self.det_bias_aap = config.get("det_bias_aap", False)
+        self.hz_fid =  jnp.array(spectrum_info["p_gg_ell"]["hz_fid"])
+        self.chiz_fid = jnp.array(spectrum_info["p_gg_ell"]["chiz_fid"])
 
         self.output_requirements = {}
         self.sigma8_fid = 0.81
@@ -546,10 +550,13 @@ class RedshiftSpaceBiasExpansion(LikelihoodModule):
         for s in self.indexed_params:
             self.indexed_params["p_gg_ell"] = np.array(self.indexed_params["p_gg_ell"])
 
-    def compute_p_gg_ell(self, state, bias_params, p_ij, s8, f):
+    def compute_p_gg_ell(self, state, bias_params, p_ij, s8, f, aap):
         if not self.scale_by_s8z:
             s8 = 1
-
+        
+        if not self.scale_by_aap:
+            aap = 1
+            
         if self.bias_model == "lpt":
             p = combine_lpt_redshift_space_spectra(
                 p_ij.T,
@@ -558,6 +565,8 @@ class RedshiftSpaceBiasExpansion(LikelihoodModule):
                 s8=s8,
                 f=f,
                 b1e=True,
+                aap=aap,
+                det_bias_aap=self.det_bias_aap
             )
 
         return p
@@ -593,24 +602,29 @@ class RedshiftSpaceBiasExpansion(LikelihoodModule):
                     / self.sigma8_fid
                 )
                 fz = jnp.interp(self.z, state["z_pk"], state["f_z"])
+                ez = jnp.interp(self.z, state["z_limber"], state["e_z_limber"])
+                chiz = jnp.interp(self.z, state["z_limber"], state["chi_z_limber"])
+                apar, aperp = self.hz_fid / ez, chiz / self.chiz_fid
+                aap = 1 / (aperp**2 * apar)
 
             def f(carry, xs):
-                bias_params, p_ij, s8, f = xs
-                p = computer(state, bias_params, p_ij, s8, f)
+                bias_params, p_ij, s8, f, aap = xs
+                p = computer(state, bias_params, p_ij, s8, f, aap)
                 carry += 1
                 return carry, p
 
             _, state[s] = scan(
                 f,
                 0,
-                [bias_params, state["p_ij_ell_redshift_space_bias_grid"].T, s8z, fz],
+                [bias_params, state["p_ij_ell_redshift_space_bias_grid"].T, s8z, fz, aap],
             )
 
         return state
 
 
 def combine_lpt_redshift_space_spectra(
-    spectra, bias_params, fracb1_counterterm=False, s8=None, f=None, b1e=False
+    spectra, bias_params, fracb1_counterterm=False, s8=None, f=None, b1e=False, aap=None, 
+    det_bias_aap=False,
 ):
     """
     Combine LPT-based redshift space power spectra with bias parameters.
@@ -626,28 +640,45 @@ def combine_lpt_redshift_space_spectra(
     Returns:
         Combined redshift space power spectrum
     """
-    b1, b2, bs, b3, alpha0p, alpha2p, alpha4p, alpha6p, sn, sn2, sn4 = bias_params
+    b1, b2, bs, b3, alpha0p, alpha2p, alpha4p, alpha6p, snp, sn2p, sn4p = bias_params
+    
+    if aap is not None:
+        if det_bias_aap:
+            sqaap = jnp.sqrt(aap)
+        else:
+            sqaap = 1.0
+    else:
+        aap = 1.0
+        sqaap = 1.0
+        
+    if s8 is None:
+        s8 = 1
 
-    if s8 is not None:
-        b1 = b1 / s8
-        b2 = b2 / s8**2
-        bs = bs / s8**2
-        b3 = b3 / s8**3
-        if not fracb1_counterterm:
-            alpha0 = alpha0p / s8**2
-            alpha2 = alpha2p / s8**2
-            alpha4 = alpha4p / s8**2
-            alpha6 = alpha6p / s8**2
+
+    b1 = b1 / s8 / sqaap
+    b2 = b2 / s8**2 / sqaap
+    bs = bs / s8**2 / sqaap
+    b3 = b3 / s8**3 / sqaap
+    
+    if not fracb1_counterterm:
+        alpha0 = alpha0p / s8**2 / aap
+        alpha2 = alpha2p / s8**2 / aap 
+        alpha4 = alpha4p / s8**2 / aap 
+        alpha6 = alpha6p / s8**2 / aap
+        
+    sn = snp / aap
+    sn2 = sn2p / aap
+    sn4 = sn4p / aap        
 
     if b1e:
         b1 = b1 - 1
 
     if fracb1_counterterm:
         alpha0 = (1 + b1) ** 2 * alpha0p / 0.2**2
-        alpha2 = f * (1 + b1) * (alpha0p + alpha2p) / 0.2**2
-        alpha4 = f * (f * alpha2p + (1 + b1) * alpha4p) / 0.2**2
-        alpha6 = f**2 * alpha6p / 0.2**2
-
+        alpha2 = f * (1 + b1) * (alpha0p * sqaap + alpha2p / sqaap) / 0.2**2
+        alpha4 = f * (f * alpha2p / aap + (1 + b1) * alpha4p / sqaap) / 0.2**2
+        alpha6 = f**2 * alpha4p / 0.2**2 / aap
+            
     bias_monomials = jnp.array(
         [
             1,

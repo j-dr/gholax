@@ -38,15 +38,18 @@ def load_samples_checkpoint_nuts(output_file, model, likelihood_name, s8_module_
     with open(f'{output_file}.minimization_results.json', 'r') as fp:
         opt = json.load(fp)
     samples_i = np.array(opt['x_opt'])*sigmas + reference
+    cosmo_params = ['As', 'ns', 'H0', 'w', 'ombh2', 'omch2', 'logmnu']
+    samps = []
+    like = model.likelihoods[likelihood_name]
+
+    for p in cosmo_params:
+        if p in names:
+            samps.append(samples_i[:, names.index(p)])
+        else:
+            samps.append(np.ones(len(samples_i)) * like.fixed_params[p])
     
-    x =  jnp.array([samples_i[:,names.index('As')], 
-                    samples_i[:,names.index('ns')],
-                    samples_i[:,names.index('H0')],
-                    -np.ones_like(samples_i[:,names.index('As')]),
-                    samples_i[:,names.index('ombh2')],
-                    samples_i[:, names.index('omch2')],
-                    np.ones_like(samples_i[:, names.index('As')])*-2,
-                    np.zeros_like(samples_i[:, names.index('As')])])
+    samps.append(np.zeros(len(samples_i)))
+    x =  jnp.array(samps)
     
     om_bf = (samples_i[:, names.index('omch2')]+samples_i[:, names.index('ombh2')])/(samples_i[:, names.index('H0')]/100)**2
     sigma8_bf = like.likelihood_pipeline[s8_module_index].emulator.predict(x.T)
@@ -55,16 +58,17 @@ def load_samples_checkpoint_nuts(output_file, model, likelihood_name, s8_module_
     for i in range(samples.shape[0]):
         if i in ignore_chains: continue
         samples_i = samples[i,:,:]
-        x =  jnp.array([samples_i[:,names.index('As')], 
-                        samples_i[:,names.index('ns')],
-                        samples_i[:,names.index('H0')],
-                        -np.ones_like(samples_i[:,names.index('As')]),
-                        samples_i[:,names.index('ombh2')],
-                        samples_i[:, names.index('omch2')],
-                        np.ones_like(samples_i[:, names.index('As')])*-2,
-                        np.zeros_like(samples_i[:, names.index('As')])])
+        samps = []
+        for p in cosmo_params:
+            if p in names:
+                samps.append(samples_i[:, names.index(p)])
+            else:
+                samps.append(np.ones(len(samples_i)) * like.fixed_params[p])
+        
+        samps.append(np.zeros(len(samples_i)))
+        x =  jnp.array(samps)
         om = (samples_i[:, names.index('omch2')]+samples_i[:, names.index('ombh2')])/(samples_i[:, names.index('H0')]/100)**2
-        sigma8 = like.likelihood_pipeline[1].emulator.predict(x.T)
+        sigma8 = like.likelihood_pipeline[s8_module_index].emulator.predict(x.T)
         s8 = sigma8[:,0] * np.sqrt(om/0.3)
         log_post.append(log_posterior[i,:])
         samples_i = np.hstack([samples_i, om[:,None], sigma8, s8[:,None]])
