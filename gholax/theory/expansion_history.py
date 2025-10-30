@@ -1,8 +1,7 @@
 from .emulator import ScalarEmulator
 from ..util.likelihood_module import LikelihoodModule
 import jax.numpy as jnp
-from jax import lax
-from interpax import interp1d
+from scipy.special import roots_legendre
 
 
 class ExpansionHistory(LikelihoodModule):
@@ -11,6 +10,10 @@ class ExpansionHistory(LikelihoodModule):
 
         self.use_emulator = bool(config.get("use_emulator", False))
         self.use_boltzmann = bool(config.get("use_boltzmann", False))
+        self.integration_method = config.get("integration_method", "gl_quad")
+        if self.integration_method == "gl_quad":
+            self.nodes, self.weights = roots_legendre(nz)
+
         self.output_requirements = {}
         if self.use_emulator:
             self.output_requirements["chi_z"] = [
@@ -131,9 +134,19 @@ class ExpansionHistory(LikelihoodModule):
         state["chi_z"] = chi_z
         state["e_z"] = e_z
 
-        chi_z_proj = jnp.linspace(jnp.min(chi_z) + 1e-5, jnp.max(chi_z), chi_z.shape[0])
-        z_limber = jnp.interp(chi_z_proj, chi_z, self.z)  # , extrap=True)
-        e_z_limber = jnp.interp(z_limber, self.z, e_z)  # , extrap=True)
+        if self.integration_method == "gl_quad":
+            chi_min = jnp.min(chi_z) + 1e-5
+            chi_max = jnp.max(chi_z)
+            chi_z_proj = 0.5 * (chi_max - chi_min) * (self.nodes + 1) + chi_min
+            gl_scaled_weights = 0.5 * (chi_max - chi_min) * self.weights
+            state["gl_scaled_weights"] = gl_scaled_weights
+        else:
+            chi_z_proj = jnp.linspace(
+                jnp.min(chi_z) + 1e-5, jnp.max(chi_z), chi_z.shape[0]
+            )
+
+        z_limber = jnp.interp(chi_z_proj, chi_z, self.z)
+        e_z_limber = jnp.interp(z_limber, self.z, e_z)
         state["chi_z_limber"] = chi_z_proj
         state["z_limber"] = z_limber
         state["e_z_limber"] = e_z_limber

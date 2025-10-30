@@ -1,9 +1,10 @@
-from ...util.likelihood_module import LikelihoodModule
-from jax.scipy.integrate import trapezoid
-from interpax import interp2d
-from jax.lax import scan
 import jax.numpy as jnp
 import numpy as np
+from interpax import interp2d
+from jax.lax import scan
+from jax.scipy.integrate import trapezoid
+
+from ...util.likelihood_module import LikelihoodModule
 
 required_components = {
     "c_dd": [
@@ -81,7 +82,9 @@ class Limber(LikelihoodModule):
         self.n_ell = n_ell
         self.l_max = l_max
         self.ell = jnp.logspace(1, jnp.log10(self.l_max), self.n_ell)
-        self.k_cutoff = config.get('k_cutoff', None)
+        self.k_cutoff = config.get("k_cutoff", None)
+        self.integration_method = config.get("integration_method", "gl_quad")
+
         if self.k_cutoff == "None":
             self.k_cutoff = None
 
@@ -232,7 +235,14 @@ class Limber(LikelihoodModule):
             else:
                 state[spec_type] = c_l_chi_w_i_w_j
 
-        state[spec_type] = trapezoid(state[spec_type], x=state["chi_z_limber"], axis=-1)
+        if self.integration_method == "trapezoid":
+            state[spec_type] = trapezoid(
+                state[spec_type], x=state["chi_z_limber"], axis=-1
+            )
+        elif self.integration_method == "gl_quad":
+            state[spec_type] = jnp.sum(
+                state[spec_type] * state["gl_scaled_weights"][None, :], axis=-1
+            )
 
         return state
 

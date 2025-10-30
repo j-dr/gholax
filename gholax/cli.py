@@ -8,6 +8,7 @@ import numpy as np
 import os
 jax.config.update("jax_default_matmul_precision", "float32")
 os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"]=".25"
+#jax.config.update("jax_log_compiles", True)
 
 def main():
 

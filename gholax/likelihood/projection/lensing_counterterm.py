@@ -8,7 +8,7 @@ from jax.lax import scan, switch, select_n
 from jax.scipy.integrate import trapezoid
 from jax.scipy.special import factorial
 from functools import partial, reduce
-
+from scipy.special import roots_legendre
 from ...util.likelihood_module import LikelihoodModule
 from .limber import required_components
 
@@ -32,15 +32,14 @@ class LensingCounterterm(LikelihoodModule):
         mean_model="dmo",
         n_ell=200,
         l_max=3001,
-        findiff_order=1,
         **config,
     ):
         self.observed_data_vector = observed_data_vector
         self.spectrum_types = spectrum_types
         self.spectrum_info = spectrum_info
-        self.kmax_emu = config.get("kmax_emu", 4.0)
+        self.kmax_emu = kmax #config.get("kmax_emu", 4.0)
         self.k = jnp.logspace(jnp.log10(kmin), jnp.log10(self.kmax_emu), nk)
-        self.logk = jnp.linspace(jnp.log10(kmin), jnp.log10(kmax), nk)
+        self.logk = jnp.linspace(jnp.log10(kmin), jnp.log10(self.kmax_emu), nk)
         self.z_proj = jnp.linspace(zmin_proj, zmax_proj, nz_proj)
         self.z_pk = jnp.linspace(zmin_pk, zmax_pk, nz_pk)
         self.nz_proj = nz_proj
@@ -50,12 +49,18 @@ class LensingCounterterm(LikelihoodModule):
         self.ell = jnp.logspace(1, jnp.log10(self.l_max), self.n_ell)
         self.hubble_radius = 2997.925
         self.k_cutoff = k_cutoff
-        self.findiff_order = findiff_order
         self.mean_model = mean_model
         self.magnification_x_ia = config.get("include_magnification_x_ia", False)
         self.lensing_counterterm_order = config.get("lensing_counterterm_order", 0)
         self.analytic_zchi_derivatives = config.get("analytic_zchi_derivatives", True)
         self.power_law_extrapolation = config.get("power_law_extrapolation", 0)
+        self.integration_method = config.get("integration_method", "gl_quad")
+        if self.integration_method == "gl_quad":
+            nk_gl = config.get("nk_gl", 50)
+            nodes, weights = roots_legendre(nk_gl)
+            self.k_nodes = 0.5 * (self.kmax_emu - self.k_cutoff) * (nodes + 1) + self.k_cutoff
+            self.quad_weights = 0.5 * (self.kmax_emu - self.k_cutoff) * weights
+            
         if type(self.power_law_extrapolation) is not bool:
             try:
                 self.power_law_extrapolation = float(self.power_law_extrapolation)
@@ -124,7 +129,10 @@ class LensingCounterterm(LikelihoodModule):
 
     def sigma_N_o(self, state, lk):
         k = 10**lk
-        mask = (self.k_cutoff < k) * (k <= self.kmax_emu)
+        if self.integration_method == "gl_quad":
+            mask = jnp.ones_like(k)
+        else:
+            mask = (self.k_cutoff < k) * (k <= self.kmax_emu)
 
         dz = 0.01
         eps = 0.001
@@ -154,7 +162,7 @@ class LensingCounterterm(LikelihoodModule):
                 * D_z**2
             )
 
-        max_points = self.lensing_counterterm_order + self.findiff_order
+        max_points = self.lensing_counterterm_order
         z_all = eps + jnp.arange(max_points) * dz
         pk_all = jnp.stack([compute_pk(z) for z in z_all])
 
@@ -176,12 +184,16 @@ class LensingCounterterm(LikelihoodModule):
 
         N_all = jnp.arange(2, 2 + self.lensing_counterterm_order)
         k_powers_all = jnp.array([k ** (-N) for N in N_all])
-        vtrapezoid = vmap(lambda integrand: trapezoid(integrand, x=k))
+        
+        if self.integration_method == "trapezoid":
+            vint = vmap(lambda integrand: trapezoid(integrand, x=k))
+        else:
+            vint = vmap(lambda integrand: jnp.sum(integrand * self.quad_weights))
 
         def scan_body(carry, o):
             sigma_N_o_current = carry
 
-            coeff_mask = (jnp.arange(max_points) < (o+self.findiff_order)).astype(jnp.float32)
+            coeff_mask = (jnp.arange(max_points) < (o)).astype(jnp.float32)
             coeffs = fd_coeffs[o] * coeff_mask
 
             deriv_current = jnp.dot(coeffs, pk_all)
@@ -191,7 +203,7 @@ class LensingCounterterm(LikelihoodModule):
 
             integrand_base = deriv_current / factorials[o] * mask
             integrands = k_powers_all * integrand_base[jnp.newaxis, :]
-            sigma_values = vtrapezoid(integrands)
+            sigma_values = vint(integrands)
 
             valid_mask = (N_all >= (2 + o)).astype(jnp.float32)
             sigma_values = sigma_values * valid_mask
@@ -283,7 +295,10 @@ class LensingCounterterm(LikelihoodModule):
             return (carry + 1, (ell + 0.5) ** (carry + 1))
 
         if self.lensing_counterterm_order > 0:
-            log_kval = jnp.log10(self.k)
+            if self.integration_method == "gl_quad":
+                log_kval = jnp.log10(self.k_nodes)
+            else:
+                log_kval = jnp.log10(self.k)
             sigma_N_o_emu = self.sigma_N_o(state, log_kval)
             state["sigma_N_o_emu"] = sigma_N_o_emu
             sigma_N_o = param_vec[self.param_indices["all"]]
