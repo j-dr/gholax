@@ -103,7 +103,7 @@ class NUTS(object):
                     initial_positions[jnp.argmin(res.state.value)], n_devices
                 ).reshape(n_devices, -1)
                 initial_positions = jnp.where(
-                    (chi2_ratio[:, None] -1) > 1e-4, initial_positions_min, initial_positions
+                    (chi2_ratio[:, None] -1) > 0, initial_positions_min, initial_positions
                 )
 
             if self.pathfinder_adaptation:
@@ -137,6 +137,12 @@ class NUTS(object):
             inverse_mass_matrix = jnp.median(parameters["inverse_mass_matrix"], axis=0)
             step_size = jnp.median(parameters["step_size"], axis=0)
 
+            with open(f"{output_file}.nuts_inverse_mass_matrix.json", "w") as fp:
+                json.dump(parameters["inverse_mass_matrix"].tolist(), fp)
+                
+            with open(f"{output_file}.nuts_step_size.json", "w") as fp:
+                json.dump(parameters["step_size"].tolist(), fp)
+                                
             warmup_parameters = {
                 "inverse_mass_matrix": inverse_mass_matrix.tolist(),
                 "step_size": step_size.tolist(),

@@ -1,11 +1,9 @@
 from ..util.likelihood_module import LikelihoodModule
-from .emulator import NNPowerSpectrumInterpolator, PijEmulator
+from .emulator import PijEmulator
 from .spline import spline_func_vec
 from ..data_vector.two_point_spectrum import field_types
-from jax.scipy.interpolate import RegularGridInterpolator
 from scipy.interpolate import interp1d as scipy_interp1d
 from interpax import interp1d, Interpolator2D
-from functools import partial
 from jax.lax import cond, scan
 import jax.numpy as jnp
 import numpy as np
@@ -521,13 +519,13 @@ class RealSpaceBiasExpansion(LikelihoodModule):
                             self.dbins.append(j)
                         if (s == "p_gg") & (self.spectrum_info[spec_type]["use_cross"]):
                             self.all_spectra[s].append((i, j))
-                            self.output_requirements[f"p_gg"].extend(
+                            self.output_requirements["p_gg"].extend(
                                 [p.format(i=i) for p in self.spectrum_params[s]]
                             )
-                            self.output_requirements[f"p_gg"].extend(
+                            self.output_requirements["p_gg"].extend(
                                 [p.format(i=j) for p in self.spectrum_params[s]]
                             )
-                            self.output_requirements[f"p_gg"].append(
+                            self.output_requirements["p_gg"].append(
                                 self.spectrum_basis[s]
                             )
                             self.compute_p_gg_cross = True
@@ -705,7 +703,7 @@ class RealSpaceBiasExpansion(LikelihoodModule):
 
         for s in self.all_spectra:
             if (s == "p_gg") & self.compute_p_gg_cross:
-                computer = getattr(self, f"compute_cross_p_gg")
+                computer = getattr(self, "compute_cross_p_gg")
             else:
                 computer = getattr(self, f"compute_{s}")
 

@@ -162,7 +162,7 @@ class LensingCounterterm(LikelihoodModule):
                 * D_z**2
             )
 
-        max_points = self.lensing_counterterm_order
+        max_points = self.lensing_counterterm_order + 1
         z_all = eps + jnp.arange(max_points) * dz
         pk_all = jnp.stack([compute_pk(z) for z in z_all])
 
@@ -193,7 +193,7 @@ class LensingCounterterm(LikelihoodModule):
         def scan_body(carry, o):
             sigma_N_o_current = carry
 
-            coeff_mask = (jnp.arange(max_points) < (o)).astype(jnp.float32)
+            coeff_mask = (jnp.arange(max_points) < (o+1)).astype(jnp.float32)
             coeffs = fd_coeffs[o] * coeff_mask
 
             deriv_current = jnp.dot(coeffs, pk_all)
