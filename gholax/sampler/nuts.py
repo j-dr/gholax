@@ -23,6 +23,9 @@ class NUTS(object):
         self.diagonal_mass_matrix = c.get("diagonal_mass_matrix", True)
         self.minimize_and_sample = c.get("minimize_and_sample", False)
         self.pathfinder_adaptation = c.get("pathfinder_adaptation", False)
+        self.target_acceptance_rate = c.get("target_acceptance_rate", 0.65)
+        self.step_size_init = c.get("step_size_init", 0.05)
+        self.parallel_warmup = c.get("parallel_warmup", False)
 
     def run(self, model, output_file):
         rng_key = jax.random.key(int(datetime.now().strftime("%Y%m%d%s")))
@@ -74,8 +77,6 @@ class NUTS(object):
             )
             init_pmap = jax.pmap(nuts.init, in_axes=(0))
             states = init_pmap(initial_state)
-            #            print(initial_state, flush=True)
-            #            print(initial_state.shape, flush=True)
             kernel = nuts.step
 
         else:
@@ -103,7 +104,9 @@ class NUTS(object):
                     initial_positions[jnp.argmin(res.state.value)], n_devices
                 ).reshape(n_devices, -1)
                 initial_positions = jnp.where(
-                    (chi2_ratio[:, None] -1) > 0, initial_positions_min, initial_positions
+                    (chi2_ratio[:, None] - 1) > 0,
+                    initial_positions_min,
+                    initial_positions,
                 )
 
             if self.pathfinder_adaptation:
@@ -123,26 +126,45 @@ class NUTS(object):
                     jlp,
                     is_mass_matrix_diagonal=self.diagonal_mass_matrix,
                     progress_bar=False,
+                    initial_step_size=self.step_size_init,
+                    target_acceptance_rate=self.target_acceptance_rate,
                 )
-            warmup_pmap = jax.pmap(
-                warmup.run, in_axes=(0, 0, None), static_broadcasted_argnums=2
-            )
-            keys = jax.random.split(rng_key, 1 + n_devices)
-            rng_key = keys[0]
-            warmup_keys = keys[1:]
-            (states, parameters), _ = warmup_pmap(
-                warmup_keys, initial_positions, self.n_steps_warmup
-            )
+            if self.parallel_warmup:
+                warmup_pmap = jax.pmap(
+                    warmup.run, in_axes=(0, 0, None), static_broadcasted_argnums=2
+                )
+                keys = jax.random.split(rng_key, 1 + n_devices)
+                rng_key = keys[0]
+                warmup_keys = keys[1:]
+                (states, parameters), _ = warmup_pmap(
+                    warmup_keys, initial_positions, self.n_steps_warmup
+                )
+                inverse_mass_matrix = jnp.median(
+                    parameters["inverse_mass_matrix"], axis=0
+                )
+                step_size = jnp.median(parameters["step_size"], axis=0)
 
-            inverse_mass_matrix = jnp.median(parameters["inverse_mass_matrix"], axis=0)
-            step_size = jnp.median(parameters["step_size"], axis=0)
+                with open(f"{output_file}.nuts_inverse_mass_matrix.json", "w") as fp:
+                    json.dump(parameters["inverse_mass_matrix"].tolist(), fp)
 
-            with open(f"{output_file}.nuts_inverse_mass_matrix.json", "w") as fp:
-                json.dump(parameters["inverse_mass_matrix"].tolist(), fp)
-                
-            with open(f"{output_file}.nuts_step_size.json", "w") as fp:
-                json.dump(parameters["step_size"].tolist(), fp)
-                                
+                with open(f"{output_file}.nuts_step_size.json", "w") as fp:
+                    json.dump(parameters["step_size"].tolist(), fp)
+            else:
+                keys = jax.random.split(rng_key, 2)
+                (state, parameters), _ = warmup.run(
+                    keys[0],
+                    initial_positions[0],
+                    self.n_steps_warmup,
+                )
+                inverse_mass_matrix = parameters["inverse_mass_matrix"]
+                step_size = parameters["step_size"]
+                states = jnp.tile(state.position, (n_devices, 1))
+                nuts = blackjax.nuts(
+                    jlp, inverse_mass_matrix=inverse_mass_matrix, step_size=step_size
+                )
+                init_pmap = jax.pmap(nuts.init, in_axes=(0))
+                states = init_pmap(states)
+
             warmup_parameters = {
                 "inverse_mass_matrix": inverse_mass_matrix.tolist(),
                 "step_size": step_size.tolist(),
@@ -151,6 +173,7 @@ class NUTS(object):
 
             with open(f"{output_file}.nuts_warmup_parameters.json", "w") as fp:
                 json.dump(warmup_parameters, fp)
+
             nuts = blackjax.nuts(
                 jlp, inverse_mass_matrix=inverse_mass_matrix, step_size=step_size
             )

@@ -3,11 +3,10 @@ import warnings
 import jax.numpy as jnp
 import numpy as np
 from interpax import interp1d, interp2d
-from jax import jacobian, vmap, grad
+from jax import jacobian, vmap
 from jax.lax import scan, switch, select_n
 from jax.scipy.integrate import trapezoid
 from jax.scipy.special import factorial
-from functools import partial, reduce
 from scipy.special import roots_legendre
 from ...util.likelihood_module import LikelihoodModule
 from .limber import required_components

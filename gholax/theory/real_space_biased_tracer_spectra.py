@@ -408,7 +408,7 @@ class RealSpaceBiasExpansion(LikelihoodModule):
         k_cutoff=2.0,
         **config,
     ):
-        """Combine 3d basis spectra into p_mm, p_gm and p_gg 
+        """Combine 3d basis spectra into p_mm, p_gm and p_gg
         for each tracer that is requested.
 
         Args:
@@ -618,7 +618,7 @@ class RealSpaceBiasExpansion(LikelihoodModule):
             mask = self.k < self.k_cutoff
         else:
             mask = np.ones_like(self.k)
-            
+
         if self.baryon_ct_s8z_scaling:
             s8z = state["sigma8_z"] / self.sigma8_fid
         else:
@@ -635,7 +635,7 @@ class RealSpaceBiasExpansion(LikelihoodModule):
             ct_n = ct_n + bk2i * (r_pade_n * self.k[:, None] / k_b) ** (2 * i)
             ct_d = ct_d + bk2i * (r_pade_d * self.k[:, None] / k_b) ** (2 * i)
 
-        p = p_11 * (1 - (ct_n / ct_d * mask[:, None])/s8z**2)
+        p = p_11 * (1 - (ct_n / ct_d * mask[:, None]) / s8z**2)
 
         return p
 
@@ -734,7 +734,7 @@ def combine_real_space_spectra(
 ):
     """
     Combine real space power spectra with bias parameters.
-    
+
     Args:
         k: Wavenumber array
         spectra: basis spectra components, shape (n_spec, n_k, n_z)
@@ -743,7 +743,7 @@ def combine_real_space_spectra(
         cross: Flag for cross-spectrum computation (default: False)
         s8z: Optional sigma8(z) normalization factor
         b1e: Optional flag for eulerian bias (default: False)
-    
+
     Returns:
         Combined real space power spectrum
     """
@@ -841,7 +841,7 @@ def combine_real_space_gg_cross_spectra(
 ):
     """
     Combine real space galaxy-galaxy cross power spectra with bias parameters.
-    
+
     Args:
         k: Wavenumber array
         spectra: Basis spectra, shape (n_spec, n_k, n_z)
@@ -849,7 +849,7 @@ def combine_real_space_gg_cross_spectra(
         fracb1_counterterm: Flag for fractional b1 counterterm treatment (default: False)
         s8z: Optional sigma8(z) normalization factor
         b1e: Optional flag for eulerian b1 (default: False)
-    
+
     Returns:
         Combined real space galaxy-galaxy cross power spectrum
     """
