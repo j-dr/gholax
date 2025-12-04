@@ -1,7 +1,8 @@
 #!/bin/bash
 module load python
-mamba create --prefix /global/common/software/cosmosim/gholax --clone base
-mamba activate /global/common/software/cosmosim/gholax
+#mamba create --prefix /global/common/software/cosmosim/gholax --clone base
+mamba create gholax --clone base
+mamba activate gholax
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
 pip install --upgrade "jax[cuda12]==0.6.2"
 pip install blackjax
