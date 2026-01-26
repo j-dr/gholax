@@ -54,6 +54,8 @@ class LensingCounterterm(LikelihoodModule):
         self.analytic_zchi_derivatives = config.get("analytic_zchi_derivatives", True)
         self.power_law_extrapolation = config.get("power_law_extrapolation", 0)
         self.integration_method = config.get("integration_method", "gl_quad")
+        self.non_parametric_growth = config.get("non_parametric_growth", False)
+        
         if self.integration_method == "gl_quad":
             nk_gl = config.get("nk_gl", 50)
             nodes, weights = roots_legendre(nk_gl)
@@ -71,9 +73,9 @@ class LensingCounterterm(LikelihoodModule):
         self.all_spectra = {}
         if not self.magnification_x_ia:
             required_components["c_dk"] = [
-                (("w_d_dk", "w_k"), "p_gm", "zeff_w_d"),
-                (("w_mag_dk", "w_k"), "p_mm", "z_limber"),
-                (("w_d_dk", "w_ia"), "p_gi", "zeff_w_d"),
+                (("w_d_dk", "w_k"), ("p_gm",0), "zeff_w_d"),
+                (("w_mag_dk", "w_k"), ("p_mm",0), "z_limber"),
+                (("w_d_dk", "w_ia"), ("p_gi",0), "zeff_w_d"),
             ]
 
         self.lensing_kernels = ["w_mag", "w_mag_dk", "w_mag_dcmbk", "w_k", "w_cmbk"]
@@ -93,7 +95,7 @@ class LensingCounterterm(LikelihoodModule):
 
         for t in self.spectrum_types:
             self.output_requirements[f"{t}_w_lensing_ct"] = []
-            for (w_i, w_j), p, _ in required_components[t]:
+            for (w_i, w_j), (p, td_), zfield_ in required_components[t]:
                 if (w_i in self.lensing_kernels) & (w_j in self.lensing_kernels):
                     self.output_requirements[f"{t}_w_lensing_ct"].extend(
                         self.lensing_counterterms
@@ -136,6 +138,8 @@ class LensingCounterterm(LikelihoodModule):
         dz = 0.01
         eps = 0.001
         D_grid = state["sigma8_z"] / state["sigma8_z"][0]
+    
+
 
         if self.mean_model == "dmo":
             p_mm = state["p_11_real_space_bias_grid"]
@@ -147,6 +151,10 @@ class LensingCounterterm(LikelihoodModule):
 
         def compute_pk(z):
             D_z = interp1d(z, self.z_pk, D_grid, extrap=0)
+            
+            if self.non_parametric_growth:
+                D_z = D_z * jnp.interp(z, state['z_limber'], state['A_growth_chi'])
+                
             return (
                 jnp.exp(
                     interp2d(

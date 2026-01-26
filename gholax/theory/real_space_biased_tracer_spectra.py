@@ -656,6 +656,15 @@ class RealSpaceBiasExpansion(LikelihoodModule):
                 s8z=s8z,
                 b1e=True,
             )
+        elif self.bias_model == 'linear':
+            p = combine_real_space_spectra_linear_bias(
+                10**self.logk,
+                p_ij,
+                bias_params,
+                cross=True,
+                s8z=s8z,
+                b1e=True,
+            )
 
         return p
 
@@ -673,6 +682,15 @@ class RealSpaceBiasExpansion(LikelihoodModule):
                 bias_params,
                 cross=False,
                 fracb1_counterterm=self.fractional_b1_counterterm,
+                s8z=s8z,
+                b1e=True,
+            )
+        elif self.bias_model == 'linear':
+            p = combine_real_space_spectra_linear_bias(
+                10**self.logk,
+                p_ij,
+                bias_params,
+                cross=False,
                 s8z=s8z,
                 b1e=True,
             )
@@ -832,6 +850,43 @@ def combine_real_space_spectra(
     else:
         bterms_hh = jnp.array(bterms_hh)
         p = jnp.einsum("bz, bkz->kz", bterms_hh, pkvec) + sn
+
+    return p
+
+
+def combine_real_space_spectra_linear_bias(
+    k, spectra, bias_params, fracb1_counterterm=False, cross=False, s8z=None, b1e=False
+):
+    """
+    Combine real space power spectra with bias parameters.
+
+    Args:
+        k: Wavenumber array
+        spectra: basis spectra components, shape (n_spec, n_k, n_z)
+        bias_params: List of bias parameters [b1, b2, bs, b3, bk2, sn]
+        fracb1_counterterm: Flag for fractional b1 counterterm treatment (default: False)
+        cross: Flag for cross-spectrum computation (default: False)
+        s8z: Optional sigma8(z) normalization factor
+        b1e: Optional flag for eulerian bias (default: False)
+
+    Returns:
+        Combined real space power spectrum
+    """
+    pkvec = jnp.zeros((19, spectra.shape[1], spectra.shape[2]))
+    pkvec = pkvec.at[:15, ...].set(spectra)
+
+    b1, b2, bs, b3, bk2, sn = bias_params
+    # normalize counterterm at kmax=0.4
+    if s8z is not None:
+        b1 = b1 / s8z
+
+    if not b1e:
+        b1 = b1 + 1
+
+    if cross:
+        p = b1 * pkvec[1, :, :]
+    else:
+        p = b1**2 * pkvec[3, :, :] + sn
 
     return p
 

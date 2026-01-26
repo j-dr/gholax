@@ -538,19 +538,19 @@ class TwoPointSpectrum(DataVector):
         ):
             if (za, zb) in self.spectrum_info[spec]["bin_pairs"]:
                 c_w_n = self.spectra["value"][
-                    (self.spectra["spectrum_type"] == spec)
+                    (self.spectra["spectrum_type"] == spec.encode('utf-8'))
                     & (self.spectra["zbin0"] == za)
                     & (self.spectra["zbin1"] == zb)
                 ] + float(self.covariance_info[spec][f"{za}_{zb}"]["noise"])
             elif covariance_field_types[spec][0] == covariance_field_types[spec][1]:
                 c_w_n = self.spectra["value"][
-                    (self.spectra["spectrum_type"] == spec)
+                    (self.spectra["spectrum_type"] == spec.encode('utf-8'))
                     & (self.spectra["zbin0"] == zb)
                     & (self.spectra["zbin1"] == za)
                 ] + float(self.covariance_info[spec][f"{zb}_{za}"]["noise"])
             elif f1 == "d":
                 c_w_n = self.spectra["value"][
-                    (self.spectra["spectrum_type"] == spec)
+                    (self.spectra["spectrum_type"] == spec.encode('utf-8'))
                     & (self.spectra["zbin0"] == zb)
                     & (self.spectra["zbin1"] == za)
                 ] + float(self.covariance_info[spec][f"{zb}_{za}"]["noise"])

@@ -11,6 +11,7 @@ from ..theory.ia import DensityShapeIA, ShapeShapeIA, RealSpaceIAExpansion
 from .projection.limber import Limber
 from .projection.kernels import ProjectionKernels
 from .projection.delta_z import DeltaZ
+from .projection.smail_outlier import SmailOutlier
 from .projection.lensing_counterterm import LensingCounterterm
 from .window.angular_power_spectrum_window import AngularPowerSpectrumWindow
 from .shear_systematics.multiplicative_bias import ShearMultiplicativeBias
@@ -34,6 +35,7 @@ class Nx2PTAngularPowerSpectrum(GaussianLikelihood):
         self.kmax = c.get("kmax", 3.9355007545577743)
         self.nk = c.get("nk", 200)
         self.use_boltzmann = c.get("use_boltzmann", False)
+        self.redshift_uncertainty = c.get('redshift_uncertainty', 'delta_z')
 
         self.observed_data_vector = TwoPointSpectrum(
             zmin=self.zmin_proj,
@@ -64,7 +66,29 @@ class Nx2PTAngularPowerSpectrum(GaussianLikelihood):
             ]
         else:
             self.likelihood_pipeline = []
-
+            
+        if self.redshift_uncertainty == 'delta_z':
+            dz_mod =  DeltaZ(
+                    self.observed_data_vector,
+                    zmin=self.zmin_proj,
+                    zmax=self.zmax_proj,
+                    nz=self.nz_proj,
+                    param_name="delta_z_source",
+                    nz_name="nz_s",
+                    **config_proj.get("DeltaZ", {}),
+                )
+        elif self.redshift_uncertainty == 'smail_outlier':
+            dz_mod = SmailOutlier(
+                    self.observed_data_vector, 
+                    zmin=self.zmin_proj,
+                    zmax=self.zmax_proj,
+                    nz=self.nz_proj,
+                    param_name='source',
+                    nz_name='nz_s',
+                    **config_proj.get('SmailOutlier', {}),
+                )
+        
+            
         self.likelihood_pipeline.extend(
             [
                 ExpansionHistory(
@@ -79,15 +103,7 @@ class Nx2PTAngularPowerSpectrum(GaussianLikelihood):
                     nz=self.nz_pk,
                     **config_theory.get("LinearGrowth", {}),
                 ),
-                DeltaZ(
-                    self.observed_data_vector,
-                    zmin=self.zmin_proj,
-                    zmax=self.zmax_proj,
-                    nz=self.nz_proj,
-                    param_name="delta_z_source",
-                    nz_name="nz_s",
-                    **config_proj.get("DeltaZ", {}),
-                ),
+                dz_mod,
                 ProjectionKernels(
                     self.observed_data_vector,
                     zmin=self.zmin_proj,

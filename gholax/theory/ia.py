@@ -1,6 +1,8 @@
 import jax.numpy as jnp
 import numpy as np
+import h5py as h5
 from interpax import interp1d
+from scipy.interpolate import interp1d as scipy_interp1d
 from jax.lax import scan
 from spinosaurus.density_shape_correlators_fftw import DensityShapeCorrelators
 from spinosaurus.shape_shape_correlators_fftw import ShapeShapeCorrelators
@@ -307,6 +309,12 @@ class RealSpaceIAExpansion(LikelihoodModule):
         self.logk = jnp.linspace(jnp.log10(kmin), jnp.log10(kmax), nk)
         self.k = jnp.logspace(jnp.log10(kmin), jnp.log10(kmax), nk)
         self.z_evolution_model = config.get("z_evolution_model", "spline")
+        if self.z_evolution_model == 'tabulated':
+            c_z_file = config.get("c_z_file", None)
+            c_z = h5.File(c_z_file, "r")["c_z"][:]
+            z_c_z = h5.File(c_z_file, "r")["z"][:]
+            self.c_z = scipy_interp1d(z_c_z, c_z, axis=-1, fill_value="extrapolate")(self.z)
+            
         self.spline_N = config.get("spline_N", 3)
         self.spline_Delta = config.get("spline_Delta", 0.6)
         self.spline_min = config.get("spline_min", 0.0)
@@ -439,7 +447,11 @@ class RealSpaceIAExpansion(LikelihoodModule):
                 for i in range(self.observed_data_vector.nz_s.shape[0]):
                     pars = self.required_spectrum_params("c_kk", "p_mi", i, 0)[(i,)]
                     if len(pars) > 0:
-                        self.indexed_params[s][1].append(pars[0])
+                        if (i!=0) | (self.z_evolution_model != "per_source_bin_spline"):
+                            self.indexed_params[s][1].append(pars[0])
+                        else:
+                            self.indexed_params[s][1].append(pars[1])
+
                     else:
                         self.indexed_params[s][1].append([])
 
@@ -679,6 +691,28 @@ class RealSpaceIAExpansion(LikelihoodModule):
                         for n in range(self.spline_N)
                     ]
                 )
+                
+        elif self.z_evolution_model == "tabulated":
+
+            if p_type == "p_mi":
+                s_idx = (i,)
+                pars[s_idx] = []
+                if c_type == "c_kk":
+                    s_idx = (j,)
+                    pars[s_idx] = []
+            elif p_type == "p_gi":
+                s_idx = (i, j)
+                pars[s_idx] = []               
+                pars[s_idx].append(
+                    [
+                        f"{p}_{i}" if i in self.dbins else "NA"
+                        for p in self.spectrum_params[p_type][0]
+                    ]
+                )                
+                pars[s_idx].append([])
+            else:
+                s_idx = (i, j)
+                pars[s_idx] = []
 
         return pars
 
@@ -705,6 +739,10 @@ class RealSpaceIAExpansion(LikelihoodModule):
             c_vec = (
                 param_indices[:, 0] * ((1 + self.z) / (1 + zeff)) ** param_indices[:, 1]
             )
+        elif z_evolution_model == "tabulated":
+            c_vec = None
+            s8z_i = s8z / self.sigma8_fid
+            
 
         return c_vec, s8z_i
 
@@ -822,7 +860,7 @@ class RealSpaceIAExpansion(LikelihoodModule):
         s8z = state["sigma8_z"] / self.sigma8_fid
 
         pmi = combine_density_shape_spectra(
-            self.k, p_ij[0, ...], jnp.array(bvec), cvec, s8z_d=None, s8z_s=s8z, b1e=True
+            self.k, p_ij[...], jnp.array(bvec), cvec, s8z_d=None, s8z_s=s8z, b1e=True
         )
 
         return 3 * pmi / 4
@@ -838,7 +876,7 @@ class RealSpaceIAExpansion(LikelihoodModule):
         p_ij = state["p_ij_real_space_density_shape_grid"]
 
         pgi = combine_density_shape_spectra(
-            self.k, p_ij[0, ...], bvec, cvec, s8z_d=s8z_d, s8z_s=s8z_s, b1e=True
+            self.k, p_ij[...], bvec, cvec, s8z_d=s8z_d, s8z_s=s8z_s, b1e=True
         )
 
         return 3 * pgi / 4
@@ -856,11 +894,11 @@ class RealSpaceIAExpansion(LikelihoodModule):
                 return carry, p
 
             if s == "p_mi":
-
+                
                 def f(carry, x):
                     p_idx, s8z = x
-                    return carry, self.set_cs(
-                        param_vec, p_idx, None, s8z, self.z_evolution_model
+                    return carry+1, self.set_cs(
+                        param_vec, p_idx, None, s8z, self.z_evolution_model,
                     )
 
                 _, xs = scan(
@@ -873,6 +911,9 @@ class RealSpaceIAExpansion(LikelihoodModule):
                         ),
                     ),
                 )
+                if self.z_evolution_model == 'tabulated':
+                    xs = [self.c_z, xs[1]]
+                    
                 _, p = scan(fspec, None, xs)
                 state[s] = p
 
@@ -880,14 +921,14 @@ class RealSpaceIAExpansion(LikelihoodModule):
 
                 def f_i(carry, x):
                     p_idx, zeff, s8z = x
-                    return carry, self.set_cs(
-                        param_vec, p_idx, zeff, s8z, "scalar_bias"
+                    return carry+1, self.set_cs(
+                        param_vec, p_idx, zeff, s8z, "scalar_bias", 
                     )
 
                 def f_j(carry, x):
                     p_idx, zeff, s8z = x
-                    return carry, self.set_cs(
-                        param_vec, p_idx, zeff, s8z, self.z_evolution_model
+                    return carry+1, self.set_cs(
+                        param_vec, p_idx, zeff, s8z, self.z_evolution_model,  
                     )
 
                 _, (bias_params_i, s8z_i) = scan(
@@ -901,6 +942,7 @@ class RealSpaceIAExpansion(LikelihoodModule):
                         ).reshape(len(self.param_indices[s][0]), -1),
                     ),
                 )
+
                 _, (bias_params_j, s8z_j) = scan(
                     f_j,
                     0,
@@ -912,6 +954,8 @@ class RealSpaceIAExpansion(LikelihoodModule):
                         ).reshape(len(self.param_indices[s][0]), -1),
                     ),
                 )
+                if self.z_evolution_model == 'tabulated':
+                    bias_params_j = jnp.tile(self.c_z, (n_dbins_tot, 1, 1))
 
                 xs = [bias_params_i, bias_params_j, s8z_i, s8z_j]
                 _, p = scan(fspec, None, xs)
@@ -921,10 +965,9 @@ class RealSpaceIAExpansion(LikelihoodModule):
 
                 def f_i(carry, x):
                     p_idx, zeff, s8z = x
-                    return carry, self.set_cs(
-                        param_vec, p_idx, zeff, s8z, self.z_evolution_model
+                    return carry+1, self.set_cs(
+                        param_vec, p_idx, zeff, s8z, self.z_evolution_model 
                     )
-
                 _, (bias_params_i, s8z_i) = scan(
                     f_i,
                     0,
@@ -947,6 +990,9 @@ class RealSpaceIAExpansion(LikelihoodModule):
                         ).reshape(len(self.param_indices[s][1]), -1),
                     ),
                 )
+                if self.z_evolution_model == 'tabulated':
+                    bias_params_i = jnp.repeat(self.c_z, n_sbins_tot, 0)
+                    bias_params_j = jnp.tile(self.c_z, (n_sbins_tot, 1, 1))
 
                 xs = [bias_params_i, bias_params_j, s8z_i, s8z_j]
                 _, p = scan(fspec, None, xs)

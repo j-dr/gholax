@@ -24,7 +24,7 @@ class Prior(object):
         self.get_prior_sigmas()
         self.get_reference_values()
 
-    def uniform(self, x, x_l, x_r, L=50):
+    def uniform(self, x, x_l, x_r, L=10):
         delta = (x_r - x_l)
         return jnp.log(0.5 * (jax.lax.erf(L * (x - x_l)/delta) - jax.lax.erf(L * (x - x_r)/delta)))
 
