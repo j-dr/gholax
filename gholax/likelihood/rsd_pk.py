@@ -143,3 +143,24 @@ class RSDPK(GaussianLikelihood):
         model = jnp.hstack(model)
 
         return model
+
+    def get_model_from_state_no_window(self, state):
+        self.k_no_window = jnp.linspace(0, 0.6, 600)
+        window_module = self.likelihood_pipeline[-1]
+        k_theory = window_module.k
+        model = []
+        for t in self.observed_data_vector.spectrum_types:
+            pl_pre = state[f"{t}{window_module.pl_tag}"]
+
+            def f(carry, pl):
+                # pl shape: (n_ell_multipoles, nk)
+                def interp_one(carry2, pl_single):
+                    return (carry2, jnp.interp(self.k_no_window, k_theory, pl_single))
+                _, pl_interp = scan(interp_one, 0, pl)
+                return (carry, pl_interp.flatten())
+
+            _, pl_interp = scan(f, 0, pl_pre[self.all_spectra[t]])
+            model.append(pl_interp.flatten())
+
+        model = jnp.hstack(model)
+        return model

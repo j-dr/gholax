@@ -262,3 +262,20 @@ class Nx2PTAngularPowerSpectrum(GaussianLikelihood):
         model = jnp.hstack(model)
 
         return model
+
+    def get_model_from_state_no_window(self, state):
+        self.ell_no_window = jnp.arange(6144)
+        window_module = self.likelihood_pipeline[-1]
+        ell_theory = window_module.ell
+        model = []
+        for t in self.observed_data_vector.spectrum_types:
+            cl_pre = state[f"{t}_mbias"]
+
+            def f(carry, cl):
+                return (carry, jnp.interp(self.ell_no_window, ell_theory, cl))
+
+            _, cl_interp = scan(f, 0, cl_pre[self.all_spectra[t]])
+            model.append(cl_interp.flatten())
+
+        model = jnp.hstack(model)
+        return model

@@ -3,6 +3,7 @@ import jax.numpy as jnp
 import numpy as np
 import yaml
 import sys
+import h5py as h5
 
 from gholax import likelihood
 from gholax.sampler.priors import Prior
@@ -147,30 +148,122 @@ class Model:
 
 def save_model_pred():
 
-    with open(sys.argv[1], 'r') as fp:
+    args = sys.argv[1:]
+    no_window = '--no-window' in args
+    if no_window:
+        args.remove('--no-window')
+
+    with open(args[0], 'r') as fp:
         cfg = yaml.load(fp, Loader=yaml.SafeLoader)
-        
-    if len(sys.argv) > 2:
-        output_base = sys.argv[2]
+
+    if len(args) > 1:
+        output_base = args[1]
     else:
         output_base = cfg['output_file'].replace('.txt', '.h5')
-        
+
     model = Model(cfg)
     params = model.prior.get_reference_point()
-    
+
     for lname in model.likelihoods:
         like = model.likelihoods[lname]
         params_am = like.linear_params_means
         params_like = {k: params[k] for k in model.likelihoods[lname].sampled_params}
 
-        pred = like.predict_model(
-            params_like,
-            params_am,
-            return_state=False,
-            apply_scale_mask=False,
-        )        
-        output_file = f"{output_base}.{lname}"
-                    
-        like.observed_data_vector.save_data_vector(output_file, pred)
-        print(f"Saved model prediction for {lname} to {output_file}")
+        if no_window:
+            pred, state = like.predict_model(
+                params_like,
+                params_am,
+                return_state=True,
+                apply_scale_mask=False,
+                apply_window=False,
+            )
+            output_file = f"{output_base}.{lname}.no_window"
+            _save_no_window(like, pred, output_file)
+            print(f"Saved no-window model prediction for {lname} to {output_file}")
+        else:
+            pred = like.predict_model(
+                params_like,
+                params_am,
+                return_state=False,
+                apply_scale_mask=False,
+            )
+            output_file = f"{output_base}.{lname}"
+            like.observed_data_vector.save_data_vector(output_file, pred)
+            print(f"Saved model prediction for {lname} to {output_file}")
+
+
+def _save_no_window(like, pred, filename):
+    from gholax.likelihood.nx2pt_aps import Nx2PTAngularPowerSpectrum
+    from gholax.likelihood.rsd_pk import RSDPK
+
+    dv = like.observed_data_vector
+    spectrum_info = dv.spectrum_info
+
+    if isinstance(like, Nx2PTAngularPowerSpectrum):
+        sep_grid = np.array(like.ell_no_window)
+        sep_name = "separation"
+    elif isinstance(like, RSDPK):
+        sep_grid = np.array(like.k_no_window)
+        sep_name = "separation"
+    else:
+        raise NotImplementedError(
+            f"No-window saving not implemented for {like.__class__.__name__}"
+        )
+
+    rows = []
+    offset = 0
+    for t in dv.spectrum_types:
+        bin_pairs = []
+        for ii, i in enumerate(spectrum_info[t]["bins0"]):
+            if spectrum_info[t]["use_cross"]:
+                from gholax.data_vector.two_point_spectrum import field_types as ft_2pt
+                from gholax.data_vector.redshift_space_multipoles import field_types as ft_rsd
+                ft = ft_rsd if isinstance(like, RSDPK) else ft_2pt
+                if ft[t][0] == ft[t][1]:
+                    bins1 = spectrum_info[t]["bins1"][ii:]
+                else:
+                    bins1 = spectrum_info[t]["bins1"][:]
+                for j in bins1:
+                    bin_pairs.append((i, j))
+            else:
+                bin_pairs.append((i, i))
+
+        if isinstance(like, RSDPK):
+            n_ell_multipoles = like.likelihood_pipeline[-1].n_ell
+            n_sep = len(sep_grid)
+            for (b0, b1) in bin_pairs:
+                for ell_idx in range(n_ell_multipoles):
+                    for si, sep_val in enumerate(sep_grid):
+                        rows.append((t, b0, b1, ell_idx * 2, sep_val,
+                                     float(pred[offset])))
+                        offset += 1
+        else:
+            n_sep = len(sep_grid)
+            for (b0, b1) in bin_pairs:
+                for si, sep_val in enumerate(sep_grid):
+                    rows.append((t, b0, b1, sep_val,
+                                 float(pred[offset])))
+                    offset += 1
+
+    if isinstance(like, RSDPK):
+        dt = np.dtype([
+            ("spectrum_type", "S10"),
+            ("zbin0", int),
+            ("zbin1", int),
+            ("ell", int),
+            (sep_name, float),
+            ("value", float),
+        ])
+    else:
+        dt = np.dtype([
+            ("spectrum_type", "S10"),
+            ("zbin0", int),
+            ("zbin1", int),
+            (sep_name, float),
+            ("value", float),
+        ])
+
+    data = np.array(rows, dtype=dt)
+    with h5.File(filename, "w") as f:
+        f.create_dataset("spectra", data=data)
     

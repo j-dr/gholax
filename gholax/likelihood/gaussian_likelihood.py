@@ -214,18 +214,23 @@ class GaussianLikelihood(metaclass=abc.ABCMeta):
         return state, param_dict
 
     def predict_model(
-        self, params, params_am, return_state=False, apply_scale_mask=True
+        self, params, params_am, return_state=False, apply_scale_mask=True,
+        apply_window=True,
     ):
         params_all = params.copy()
         params_all.update(params_am)
         state, params_dict = self.setup_state_params(params_all)
 
-        for module in self.likelihood_pipeline:
+        pipeline = self.likelihood_pipeline if apply_window else self.likelihood_pipeline[:-1]
+        for module in pipeline:
             state = module.compute(state, params_dict)
 
-        model = self.get_model_from_state(state)
+        if apply_window:
+            model = self.get_model_from_state(state)
+        else:
+            model = self.get_model_from_state_no_window(state)
 
-        if apply_scale_mask:
+        if apply_scale_mask and apply_window:
             model = model[self.observed_data_vector.scale_mask]
 
         if return_state:
@@ -248,6 +253,11 @@ class GaussianLikelihood(metaclass=abc.ABCMeta):
         state,
     ):
         return
+
+    def get_model_from_state_no_window(self, state):
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not implement get_model_from_state_no_window"
+        )
 
     def compute_am(self, params):
         params_am = self.linear_params_means
