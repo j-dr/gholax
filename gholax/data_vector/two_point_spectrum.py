@@ -300,8 +300,11 @@ class TwoPointSpectrum(DataVector):
             data["value"] = model
 
             f.create_dataset("spectra", data=data)
-            f.create_dataset("covariance", data=self.cov.flatten())
-            
+            try:
+                f.create_dataset("covariance", data=self.cov.flatten())
+            except AttributeError:
+                print("No covariance matrix to save.")
+
             for k_i in self.data_vector_info.keys():
                 if k_i in ["spectra", "covariance"]:
                     continue
