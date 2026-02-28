@@ -1,3 +1,4 @@
+import argparse
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -175,25 +176,39 @@ def _minimize(model, output_base):
 
 def save_model_pred():
 
-    args = sys.argv[1:]
-    no_window = '--no-window' in args
-    if no_window:
-        args.remove('--no-window')
-    minimize = '--minimize' in args
-    if minimize:
-        args.remove('--minimize')
+    parser = argparse.ArgumentParser(
+        prog='save-model',
+        description='Save model predictions at a given parameter point.',
+    )
+    parser.add_argument('config', help='YAML config file')
+    parser.add_argument('output', nargs='?', default=None,
+                        help='Output file base name (default: derived from config)')
+    parser.add_argument('--no-window', action='store_true',
+                        help='Save pre-window (unconvolved) theory predictions')
+    parser.add_argument('--minimize', action='store_true',
+                        help='Run LBFGS minimizer to find best-fit parameters')
+    parser.add_argument('--params', metavar='FILE',
+                        help='Load best-fit parameters from an HDF5 file')
+    args = parser.parse_args()
 
-    with open(args[0], 'r') as fp:
+    with open(args.config, 'r') as fp:
         cfg = yaml.load(fp, Loader=yaml.SafeLoader)
 
-    if len(args) > 1:
-        output_base = args[1]
+    if args.output is not None:
+        output_base = args.output
     else:
         output_base = cfg['output_file'].replace('.txt', '.h5')
 
     model = Model(cfg)
 
-    if minimize:
+    if args.params is not None:
+        params = _load_params_from_h5(args.params)
+        ref = model.prior.get_reference_point()
+        for p in ref:
+            if p not in params:
+                params[p] = ref[p]
+        print(f"Loaded parameters from {args.params}")
+    elif args.minimize:
         params = _minimize(model, output_base)
     else:
         params = model.prior.get_reference_point()
@@ -203,7 +218,7 @@ def save_model_pred():
         params_am = like.linear_params_means
         params_like = {k: params[k] for k in model.likelihoods[lname].sampled_params}
 
-        if no_window:
+        if args.no_window:
             pred, state = like.predict_model(
                 params_like,
                 params_am,
@@ -225,7 +240,7 @@ def save_model_pred():
             like.observed_data_vector.save_data_vector(output_file, pred)
             print(f"Saved model prediction for {lname} to {output_file}")
 
-        if minimize:
+        if args.minimize or args.params is not None:
             _save_params_to_h5(output_file, params)
             print(f"Saved best-fit parameters to {output_file}")
 
@@ -235,6 +250,11 @@ def _save_params_to_h5(filename, params):
         grp = f.create_group("best_fit_params")
         for name, val in params.items():
             grp.attrs[name] = float(val)
+
+
+def _load_params_from_h5(filename):
+    with h5.File(filename, "r") as f:
+        return {name: float(val) for name, val in f["best_fit_params"].attrs.items()}
 
 
 def _save_no_window(like, pred, filename):
