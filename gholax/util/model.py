@@ -146,12 +146,42 @@ class Model:
         return like.generate_training_data(params_like)
 
 
+def _minimize(model, output_base):
+    import jaxopt
+
+    prior = model.prior
+    sigmas = prior.get_prior_sigmas()
+    reference = prior.get_reference_values()
+    log_posterior = model.log_posterior_scaled_params
+
+    jnlp = jax.jit(lambda p: -log_posterior(p))
+    vgrad = jax.value_and_grad(jnlp)
+    solver = jaxopt.LBFGS(fun=vgrad, value_and_grad=True)
+
+    x0 = jnp.zeros(len(model.param_names))
+    print("Running minimization", flush=True)
+    res = solver.run(x0)
+
+    x_opt_scaled = res.params
+    x_opt = x_opt_scaled * sigmas + reference
+    params = dict(zip(model.param_names, x_opt))
+
+    print(f"Best-fit -logp = {float(res.state.value):.4f}", flush=True)
+    for p in params:
+        print(f"  {p} = {float(params[p]):.6g}", flush=True)
+
+    return params
+
+
 def save_model_pred():
 
     args = sys.argv[1:]
     no_window = '--no-window' in args
     if no_window:
         args.remove('--no-window')
+    minimize = '--minimize' in args
+    if minimize:
+        args.remove('--minimize')
 
     with open(args[0], 'r') as fp:
         cfg = yaml.load(fp, Loader=yaml.SafeLoader)
@@ -162,7 +192,11 @@ def save_model_pred():
         output_base = cfg['output_file'].replace('.txt', '.h5')
 
     model = Model(cfg)
-    params = model.prior.get_reference_point()
+
+    if minimize:
+        params = _minimize(model, output_base)
+    else:
+        params = model.prior.get_reference_point()
 
     for lname in model.likelihoods:
         like = model.likelihoods[lname]
@@ -190,6 +224,17 @@ def save_model_pred():
             output_file = f"{output_base}.{lname}"
             like.observed_data_vector.save_data_vector(output_file, pred)
             print(f"Saved model prediction for {lname} to {output_file}")
+
+        if minimize:
+            _save_params_to_h5(output_file, params)
+            print(f"Saved best-fit parameters to {output_file}")
+
+
+def _save_params_to_h5(filename, params):
+    with h5.File(filename, "a") as f:
+        grp = f.create_group("best_fit_params")
+        for name, val in params.items():
+            grp.attrs[name] = float(val)
 
 
 def _save_no_window(like, pred, filename):
@@ -234,7 +279,7 @@ def _save_no_window(like, pred, filename):
             for (b0, b1) in bin_pairs:
                 for ell_idx in range(n_ell_multipoles):
                     for si, sep_val in enumerate(sep_grid):
-                        rows.append((t, b0, b1, ell_idx * 2, sep_val,
+                        rows.append((t, b0, b1, ell_idx * n_ell_multipoles, sep_val,
                                      float(pred[offset])))
                         offset += 1
         else:
