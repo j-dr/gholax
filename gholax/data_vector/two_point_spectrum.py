@@ -504,7 +504,38 @@ class TwoPointSpectrum(DataVector):
     #        if jnp.any(jnp.linalg.eigvals(self.cinv) < 0):
     #            raise(ValueError('APS covariance matrix not PSD.'))
 
-    def gaussian_variance(self, si, sj, z00, z01, z10, z11):
+    def _ensure_covariance_info(self):
+        """Prompt interactively for any f_sky or noise terms missing from covariance_info."""
+        if self.covariance_info is None:
+            self.covariance_info = {}
+
+        if "f_sky" not in self.covariance_info:
+            val = input("f_sky not found in config. Enter f_sky: ")
+            self.covariance_info["f_sky"] = float(val)
+
+        for t in self.spectrum_info:
+            if t not in self.covariance_info:
+                self.covariance_info[t] = {}
+            for (b0, b1) in self.spectrum_info[t]["bin_pairs"]:
+                key = f"{b0}_{b1}"
+                entry = self.covariance_info[t].get(key, {})
+                if "noise" not in entry:
+                    val = input(
+                        f"noise for {t} bin pair ({b0}, {b1}) not found in config. Enter noise: "
+                    )
+                    entry["noise"] = float(val)
+                    self.covariance_info[t][key] = entry
+
+    def _lookup_spectrum(self, spec, za, zb, model_spectra):
+        if model_spectra is not None and (spec, za, zb) in model_spectra:
+            return model_spectra[(spec, za, zb)]
+        return self.spectra["value"][
+            (self.spectra["spectrum_type"] == spec.encode('utf-8'))
+            & (self.spectra["zbin0"] == za)
+            & (self.spectra["zbin1"] == zb)
+        ]
+
+    def gaussian_variance(self, si, sj, z00, z01, z10, z11, model_spectra=None):
         c0 = f"c_{covariance_field_types[si][0]}{covariance_field_types[sj][0]}"
         if c0 not in field_types:
             c0 = f"c_{covariance_field_types[sj][0]}{covariance_field_types[si][0]}"
@@ -540,23 +571,14 @@ class TwoPointSpectrum(DataVector):
             ],
         ):
             if (za, zb) in self.spectrum_info[spec]["bin_pairs"]:
-                c_w_n = self.spectra["value"][
-                    (self.spectra["spectrum_type"] == spec.encode('utf-8'))
-                    & (self.spectra["zbin0"] == za)
-                    & (self.spectra["zbin1"] == zb)
-                ] + float(self.covariance_info[spec][f"{za}_{zb}"]["noise"])
+                c_w_n = self._lookup_spectrum(spec, za, zb, model_spectra) \
+                        + float(self.covariance_info[spec][f"{za}_{zb}"]["noise"])
             elif covariance_field_types[spec][0] == covariance_field_types[spec][1]:
-                c_w_n = self.spectra["value"][
-                    (self.spectra["spectrum_type"] == spec.encode('utf-8'))
-                    & (self.spectra["zbin0"] == zb)
-                    & (self.spectra["zbin1"] == za)
-                ] + float(self.covariance_info[spec][f"{zb}_{za}"]["noise"])
+                c_w_n = self._lookup_spectrum(spec, zb, za, model_spectra) \
+                        + float(self.covariance_info[spec][f"{zb}_{za}"]["noise"])
             elif f1 == "d":
-                c_w_n = self.spectra["value"][
-                    (self.spectra["spectrum_type"] == spec.encode('utf-8'))
-                    & (self.spectra["zbin0"] == zb)
-                    & (self.spectra["zbin1"] == za)
-                ] + float(self.covariance_info[spec][f"{zb}_{za}"]["noise"])
+                c_w_n = self._lookup_spectrum(spec, zb, za, model_spectra) \
+                        + float(self.covariance_info[spec][f"{zb}_{za}"]["noise"])
             else:
                 raise (
                     ValueError(f"No spectrum {spec} with zbin comination {za}, {zb}")
@@ -570,7 +592,8 @@ class TwoPointSpectrum(DataVector):
 
         return var
 
-    def gaussian_covariance(self):
+    def gaussian_covariance(self, model_spectra=None):
+        self._ensure_covariance_info()
         dt = np.dtype(
             [
                 ("spectrum_type0", "S10"),
@@ -627,7 +650,8 @@ class TwoPointSpectrum(DataVector):
                             counter_j : counter_j + n_ell_j,
                         ]["separation1"] = self.spectrum_info[sj]["separation"][None, :]
 
-                        var = self.gaussian_variance(si, sj, z00, z01, z10, z11)
+                        var = self.gaussian_variance(si, sj, z00, z01, z10, z11,
+                                                    model_spectra=model_spectra)
                         np.fill_diagonal(
                             cov[
                                 counter_i : counter_i + n_ell_i,
@@ -640,4 +664,14 @@ class TwoPointSpectrum(DataVector):
                 counter_i += n_ell_i
 
         return cov
+
+    def spectra_dict_from_vector(self, model_vector):
+        d = {}
+        offset = 0
+        for t in self.spectrum_types:
+            n = self.spectrum_info[t]["n_dv_per_bin"]
+            for (b0, b1) in self.spectrum_info[t]["bin_pairs"]:
+                d[(t, b0, b1)] = np.asarray(model_vector[offset:offset + n])
+                offset += n
+        return d
 

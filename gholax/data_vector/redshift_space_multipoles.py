@@ -28,6 +28,7 @@ class RedshiftSpaceMultipoles(DataVector):
         spectrum_info,
         ells=(0, 2, 4),
         scale_cuts=None,
+        covariance_info=None,
         dummy_cov=False,
         generate_data_vector=False,
         zmin=0,
@@ -38,6 +39,7 @@ class RedshiftSpaceMultipoles(DataVector):
         self.spectrum_info = spectrum_info
         self.scale_cuts = scale_cuts
         self.spectrum_types = list(self.spectrum_info.keys())
+        self.covariance_info = covariance_info
         self.dummy_cov = dummy_cov
         self.generate_data_vector = generate_data_vector
         self.ells = ells
@@ -466,6 +468,28 @@ class RedshiftSpaceMultipoles(DataVector):
             )
         )
 
+    def _ensure_covariance_info(self):
+        """Prompt interactively for any f_sky or noise terms missing from covariance_info."""
+        if self.covariance_info is None:
+            self.covariance_info = {}
+
+        if "f_sky" not in self.covariance_info:
+            val = input("f_sky not found in config. Enter f_sky: ")
+            self.covariance_info["f_sky"] = float(val)
+
+        for t in self.spectrum_info:
+            if t not in self.covariance_info:
+                self.covariance_info[t] = {}
+            for (b0, b1) in self.spectrum_info[t]["bin_pairs"]:
+                key = f"{b0}_{b1}"
+                entry = self.covariance_info[t].get(key, {})
+                if "noise" not in entry:
+                    val = input(
+                        f"noise for {t} bin pair ({b0}, {b1}) not found in config. Enter noise: "
+                    )
+                    entry["noise"] = float(val)
+                    self.covariance_info[t][key] = entry
+
     def gaussian_variance(self, si, sj, z00, z01, z10, z11):
         c0 = f"c_{covariance_field_types[si][0]}{covariance_field_types[sj][0]}"
         if c0 not in field_types:
@@ -540,6 +564,7 @@ class RedshiftSpaceMultipoles(DataVector):
         return var
 
     def gaussian_covariance(self):
+        self._ensure_covariance_info()
         dt = np.dtype(
             [
                 ("spectrum_type0", "S10"),

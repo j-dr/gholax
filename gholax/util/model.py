@@ -168,10 +168,32 @@ def _minimize(model, output_base):
     params = dict(zip(model.param_names, x_opt))
 
     print(f"Best-fit -logp = {float(res.state.value):.4f}", flush=True)
-    for p in params:
-        print(f"  {p} = {float(params[p]):.6g}", flush=True)
+    #for p in params:
+    #    print(f"  {p} = {float(params[p]):.6g}", flush=True)
 
     return params
+
+
+def _apply_gaussian_covariance(like, pred):
+    """Replace the likelihood's covariance with a Gaussian covariance computed
+    from the full (unmasked) model prediction vector *pred*."""
+    from gholax.data_vector.two_point_spectrum import TwoPointSpectrum
+
+    dv = like.observed_data_vector
+    pred_np = np.asarray(pred)
+
+    if isinstance(dv, TwoPointSpectrum):
+        model_spectra = dv.spectra_dict_from_vector(pred_np)
+        cov = dv.gaussian_covariance(model_spectra=model_spectra)
+    else:
+        cov = dv.gaussian_covariance()
+
+    dv.cov = cov
+    cov_mask_i, cov_mask_j = np.meshgrid(dv.scale_mask, dv.scale_mask, indexing="ij")
+    dv.cinv = jnp.linalg.inv(
+        dv.cov["value"][cov_mask_i, cov_mask_j].reshape(dv.n_dv_masked, dv.n_dv_masked)
+    )
+    print("  Applied model-predicted Gaussian covariance.", flush=True)
 
 
 def save_model_pred():
@@ -189,6 +211,9 @@ def save_model_pred():
                         help='Run LBFGS minimizer to find best-fit parameters')
     parser.add_argument('--params', metavar='FILE',
                         help='Load best-fit parameters from an HDF5 file')
+    parser.add_argument('--gauss-cov', action='store_true',
+                        help='Replace covariance with a Gaussian covariance evaluated '
+                             'at the reference parameter point, then run best-fit minimization')
     args = parser.parse_args()
 
     with open(args.config, 'r') as fp:
@@ -201,7 +226,20 @@ def save_model_pred():
 
     model = Model(cfg)
 
-    if args.params is not None:
+    if args.gauss_cov:
+        ref_params = model.prior.get_reference_point()
+        print("Computing model prediction at reference parameters for Gaussian covariance...",
+              flush=True)
+        for lname in model.likelihoods:
+            like = model.likelihoods[lname]
+            params_am = like.linear_params_means
+            params_like = {k: ref_params[k] for k in like.sampled_params}
+            pred_ref = like.predict_model(
+                params_like, params_am, return_state=False, apply_scale_mask=False
+            )
+            _apply_gaussian_covariance(like, pred_ref)
+        params = _minimize(model, output_base)
+    elif args.params is not None:
         params = _load_params_from_h5(args.params)
         ref = model.prior.get_reference_point()
         for p in ref:
@@ -240,7 +278,7 @@ def save_model_pred():
             like.observed_data_vector.save_data_vector(output_file, pred)
             print(f"Saved model prediction for {lname} to {output_file}")
 
-        if args.minimize or args.params is not None:
+        if args.minimize or args.params is not None or args.gauss_cov:
             _save_params_to_h5(output_file, params)
             print(f"Saved best-fit parameters to {output_file}")
 
