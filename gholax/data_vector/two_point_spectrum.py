@@ -72,6 +72,32 @@ class TwoPointSpectrum(DataVector):
 
     #        print(self.cW, flush=True)
 
+    def _compute_ell_binning(self):
+        """Compute the bandpower ell_eff and delta_ell arrays and store them as
+        instance attributes.  Returns the bpws index array so callers that also
+        need to build a window matrix can reuse it."""
+        ells = np.arange(3 * 2048, dtype="int32")
+        bpws = np.zeros_like(ells) - 1
+
+        i = 0
+        counter = 25  # ell_start
+        delta_ell = int(3 * np.sqrt(counter))
+        bpw_widths = [delta_ell]
+
+        while counter + delta_ell < ells.shape[0]:
+            bpws[counter : counter + delta_ell] = i
+            counter = counter + delta_ell
+            delta_ell = int(3 * np.sqrt(ells[counter]))
+            bpw_widths.append(delta_ell)
+            i += 1
+
+        self.delta_ell = np.array(bpw_widths)[:-1]
+        ell_eff = np.bincount(bpws + 1, weights=ells * (2 * ells + 1)) / np.bincount(
+            bpws + 1, weights=(2 * ells + 1)
+        )
+        self.ell_eff = ell_eff[1:]
+        return bpws
+
     def generate_data(self):
         required_spectra = []
         for si in self.spectrum_info:
@@ -113,32 +139,9 @@ class TwoPointSpectrum(DataVector):
                     bin_pairs[t].append((i, j))
                     n_bins += 1
 
-        ells = np.arange(3 * 2048, dtype="int32")  # Array of multipoles
-        weights = np.zeros(len(ells))  # Array of weights
-        bpws = np.zeros_like(ells) - 1  # Array of bandpower indices
-        ell_start = 25
-        delta_ell = 30
-
-        i = 0
-        counter = ell_start
-        delta_ell = int(3 * np.sqrt(ell_start))
-        bpw_widths = [delta_ell]
-
-        while counter + delta_ell < ells.shape[0]:
-            bpws[counter : counter + delta_ell] = i
-            weights[counter : counter + delta_ell] = 1 / float(delta_ell)
-            counter = counter + delta_ell
-            delta_ell = int(3 * np.sqrt(ells[counter]))
-            bpw_widths.append(delta_ell)
-            i += 1
-
-        self.delta_ell = np.array(bpw_widths)[:-1]
-        ell_eff = np.bincount(bpws + 1, weights=ells * (2 * ells + 1)) / np.bincount(
-            bpws + 1, weights=(2 * ells + 1)
-        )
-        ell_eff = ell_eff[1:]
-        window = np.zeros((len(ell_eff), len(ells)))
-        self.ell_eff = ell_eff
+        bpws = self._compute_ell_binning()
+        ell_eff = self.ell_eff
+        window = np.zeros((len(ell_eff), 3 * 2048))
         for i, ell in enumerate(ell_eff):
             window[i, bpws == i] = 1 / float(self.delta_ell[i])
 
@@ -505,7 +508,11 @@ class TwoPointSpectrum(DataVector):
     #            raise(ValueError('APS covariance matrix not PSD.'))
 
     def _ensure_covariance_info(self):
-        """Prompt interactively for any f_sky or noise terms missing from covariance_info."""
+        """Prompt interactively for any f_sky or noise terms missing from covariance_info.
+        Also ensures ell_eff and delta_ell are computed if not already set."""
+        if not hasattr(self, 'ell_eff') or self.ell_eff is None:
+            self._compute_ell_binning()
+
         if self.covariance_info is None:
             self.covariance_info = {}
 
