@@ -634,3 +634,115 @@ class RedshiftSpaceMultipoles(DataVector):
                 counter_i += n_ell_i
 
         return cov
+
+    def plot_spectra_vs_model(self, model_pred):
+        """Plot measured spectra vs model predictions for every spectrum type.
+
+        One figure is created per spectrum type.  Each figure has a grid of
+        (data panel, residual panel) pairs — one column per bin pair.
+        Different multipole orders (ell = 0, 2, 4, …) are overlaid in each
+        panel with distinct colours.  Regions excluded by scale cuts are shaded
+        using the cuts for the first multipole order.
+
+        Parameters
+        ----------
+        model_pred : array_like
+            Full (unmasked) model prediction in the same ordering as
+            ``self.spectra`` (i.e. ``apply_scale_mask=False``).
+
+        Returns
+        -------
+        dict[str, matplotlib.figure.Figure]
+            Keys are spectrum type strings (e.g. ``'p_gg_ell'``).
+        """
+        import matplotlib.pyplot as plt
+
+        model_pred = np.asarray(model_pred)
+        figs = {}
+
+        for t in self.spectrum_types:
+            bin_pairs = self.spectrum_info[t]["bin_pairs"]
+            sep = self.spectrum_info[t]["separation"]
+            n_pairs = len(bin_pairs)
+            n_cols = max(1, int(np.ceil(np.sqrt(n_pairs))))
+            n_rows = max(1, int(np.ceil(n_pairs / n_cols)))
+
+            fig, axes = plt.subplots(
+                2 * n_rows, n_cols,
+                sharex=True,
+                gridspec_kw={'height_ratios': [3, 1] * n_rows},
+                squeeze=False,
+            )
+
+            for pair_idx, (b0, b1) in enumerate(bin_pairs):
+                row = pair_idx // n_cols
+                col = pair_idx % n_cols
+                ax_main = axes[2 * row, col]
+                ax_res  = axes[2 * row + 1, col]
+
+                for ell_idx, ell in enumerate(self.ells):
+                    idx = np.where(
+                        (self.spectra["spectrum_type"] == t.encode('utf-8'))
+                        & (self.spectra["zbin0"] == b0)
+                        & (self.spectra["zbin1"] == b1)
+                        & (self.spectra["ell"] == ell)
+                    )[0]
+
+                    data  = self.spectra["value"][idx]
+                    model = model_pred[idx]
+
+                    if hasattr(self, 'cov') and self.cov is not None:
+                        idxx, idxy = np.meshgrid(idx, idx, indexing='ij')
+                        err = np.sqrt(np.diag(self.cov["value"][idxx, idxy]))
+                    else:
+                        err = np.ones_like(data)
+
+                    color = f'C{ell_idx}'
+                    ax_main.errorbar(sep, sep * data, sep * err,
+                                     color=color, ls='', marker='o', ms=3,
+                                     capsize=3, label=rf'$\ell={ell}$')
+                    ax_main.plot(sep, sep * model, color=color)
+                    ax_res.plot(sep, (data - model) / err,
+                                color=color, ls='', marker='o', ms=3)
+
+                ax_res.axhline(0, color='k', lw=0.8)
+
+                # shade excluded scale ranges using the first multipole's cuts
+                first_ell = self.ells[0]
+                cut_key = f'{b0}_{b1}_{first_ell}'
+                has_cuts = (self.scale_cuts is not None
+                            and t in self.scale_cuts
+                            and cut_key in self.scale_cuts[t])
+                if has_cuts:
+                    k_min, k_max = self.scale_cuts[t][cut_key]
+                    x_max_plot = k_max * 1.5
+                    for ax in (ax_main, ax_res):
+                        ax.axvspan(0, k_min,
+                                   color='k', alpha=0.15, linewidth=0)
+                        ax.axvspan(k_max, x_max_plot * 2,
+                                   color='k', alpha=0.15, linewidth=0)
+                    ax_main.set_xlim(0, x_max_plot)
+
+                ax_main.set_title(f'({b0}, {b1})', fontsize=9)
+                ax_res.set_ylim(-4, 4)
+
+                if row == n_rows - 1:
+                    ax_res.set_xlabel(r'$k\,[h\,\mathrm{Mpc}^{-1}]$')
+                if col == 0:
+                    ax_main.set_ylabel(r'$k\,P_\ell(k)$')
+                    ax_res.set_ylabel(r'$(d-m)/\sigma$')
+                if pair_idx == 0:
+                    ax_main.legend(fontsize=7)
+
+            # hide unused subplots
+            for pair_idx in range(n_pairs, n_rows * n_cols):
+                row = pair_idx // n_cols
+                col = pair_idx % n_cols
+                axes[2 * row, col].axis('off')
+                axes[2 * row + 1, col].axis('off')
+
+            fig.set_size_inches(4 * n_cols, 5 * n_rows)
+            fig.tight_layout()
+            figs[t] = fig
+
+        return figs

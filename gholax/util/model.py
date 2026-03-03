@@ -214,6 +214,8 @@ def save_model_pred():
     parser.add_argument('--gauss-cov', action='store_true',
                         help='Replace covariance with a Gaussian covariance evaluated '
                              'at the reference parameter point, then run best-fit minimization')
+    parser.add_argument('--plot', action='store_true',
+                        help='Save PDF plots of the best-fit model vs data for each likelihood')
     args = parser.parse_args()
 
     with open(args.config, 'r') as fp:
@@ -277,6 +279,13 @@ def save_model_pred():
             output_file = f"{output_base}.{lname}"
             like.observed_data_vector.save_data_vector(output_file, pred)
             print(f"Saved model prediction for {lname} to {output_file}")
+
+            if args.plot:
+                figs = like.observed_data_vector.plot_spectra_vs_model(pred)
+                for spec_type, fig in figs.items():
+                    plot_file = f"{output_file}.{spec_type}.pdf"
+                    fig.savefig(plot_file, bbox_inches='tight')
+                    print(f"Saved plot for {spec_type} to {plot_file}")
 
         if args.minimize or args.params is not None or args.gauss_cov:
             _save_params_to_h5(output_file, params)
