@@ -7,12 +7,33 @@ import jaxopt
 
 
 class Minimize(object):
+    """L-BFGS minimizer for finding the maximum a posteriori (MAP) point.
+
+    Uses jaxopt L-BFGS with parallel starts across available JAX devices
+    to minimize the negative log-posterior in normalized parameter space.
+    """
+
     def __init__(self, config):
+        """Initialize the minimizer from config.
+
+        Args:
+            config: Full config dict containing 'sampler' -> 'Minimize' section.
+        """
         c = config["sampler"]["Minimize"]
 
         self.random_start = c.get("random_start", True)
 
     def run(self, model, output_file):
+        """Run L-BFGS minimization across parallel chains.
+
+        Args:
+            model: Model instance with log_posterior_scaled_params and prior.
+            output_file: Base path for output files (results saved as JSON).
+
+        Returns:
+            Tuple of (samples array with shape (n_devices, 1, n_params+1),
+            parameter names list).
+        """
         rng_key = jax.random.key(int(datetime.now().strftime("%Y%m%d%s")))
         param_names = model.prior.params
         prior = model.prior

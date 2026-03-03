@@ -14,7 +14,25 @@ from spinosaurus.cleft_fftw import CLEFT
 
 
 class RealSpaceBiasedTracerSpectra(LikelihoodModule):
+    """Compute real-space biased tracer P_ij basis spectra.
+
+    Supports emulator and analytic (CLEFT/HEFT) backends.
+    Writes 'p_ij_real_space_bias_grid' and/or 'p_11_real_space_bias_grid' to state.
+    """
+
     def __init__(self, zmin=0, zmax=2.0, nz=50, kmin=1e-3, kmax=3.95, nk=200, **config):
+        """Initialize the real-space biased tracer spectra module.
+
+        Args:
+            zmin: Minimum redshift.
+            zmax: Maximum redshift.
+            nz: Number of redshift bins.
+            kmin: Minimum wavenumber in h/Mpc.
+            kmax: Maximum wavenumber in h/Mpc.
+            nk: Number of wavenumber bins.
+            **config: Additional config (use_emulator, emulator_file_names,
+                bias_model, kIR, interpolation_order, contamination_ratio_file).
+        """
         self.nz = nz
         self.nk = nk
         self.z = jnp.linspace(zmin, zmax, nz)
@@ -92,6 +110,7 @@ class RealSpaceBiasedTracerSpectra(LikelihoodModule):
             self.nspec = 19
 
     def compute_cleft_analytic(self, state, params_values):
+        """Compute P_ij basis spectra using analytic CLEFT/HEFT perturbation theory."""
         spec_grid = jnp.zeros((self.nz, self.nspec, self.nk))
 
         s_m_map = {1: 0, 3: 1, 6: 3, 10: 6, 15: 10}
@@ -232,9 +251,11 @@ class RealSpaceBiasedTracerSpectra(LikelihoodModule):
         return state
 
     def compute_heft(self, state, params_values):
+        """Placeholder for HEFT-specific computation (currently a no-op)."""
         return state
 
     def compute_emulator(self, state, params_values):
+        """Compute P_ij basis spectra using the neural network emulator."""
         cosmo_params = jnp.array(
             [
                 params_values["As"],
@@ -316,6 +337,7 @@ class RealSpaceBiasedTracerSpectra(LikelihoodModule):
         return state
 
     def compute_p11_boltz_analytic(self, state, params_values):
+        """Compute the linear matter power spectrum P_11 from a CLASS Boltzmann result."""
         boltz = state["boltzmann_results"]
         h = params_values["H0"] / 100
 
@@ -344,6 +366,7 @@ class RealSpaceBiasedTracerSpectra(LikelihoodModule):
         return state
 
     def compute(self, state, params_values):
+        """Compute real-space biased tracer basis spectra and write to state."""
         if self.use_emulator:
             state = self.compute_emulator(state, params_values)
         else:
@@ -360,7 +383,10 @@ class RealSpaceBiasedTracerSpectra(LikelihoodModule):
 
 
 class RealSpaceMatterPowerSpectrum(RealSpaceBiasedTracerSpectra):
+    """Compute only the matter power spectrum P_11(k,z), without bias expansion."""
+
     def __init__(self, zmin=0, zmax=2, nz=50, kmin=0.001, kmax=3.95, nk=200, **config):
+        """Initialize the matter power spectrum module."""
         super().__init__(zmin, zmax, nz, kmin, kmax, nk, **config)
         self.save_p_11_separately = True
         self.save_p_ij = False
@@ -587,6 +613,16 @@ class RealSpaceBiasExpansion(LikelihoodModule):
             self.indexed_params[s] = np.array(self.indexed_params[s])
 
     def set_bs(self, param_vec, param_indices, z_evolution_model):
+        """Compute bias parameters with redshift evolution applied.
+
+        Args:
+            param_vec: Full parameter vector.
+            param_indices: Indices into param_vec for this spectrum.
+            z_evolution_model: Redshift evolution model ('constant_bias' or 'spline').
+
+        Returns:
+            Bias parameter vector (scalar or z-dependent).
+        """
         if z_evolution_model == "constant_bias":
             b_vec = param_vec[param_indices]
 
@@ -602,6 +638,7 @@ class RealSpaceBiasExpansion(LikelihoodModule):
         return b_vec
 
     def compute_p_mm(self, state, bias_params):
+        """Compute the matter-matter power spectrum with baryon counterterms."""
         p_11 = state["p_11_real_space_bias_grid"]
         b_kma = bias_params[0]
 
@@ -640,6 +677,7 @@ class RealSpaceBiasExpansion(LikelihoodModule):
         return p
 
     def compute_p_gm(self, state, bias_params):
+        """Compute the galaxy-matter cross power spectrum from bias expansion."""
         p_ij = state["p_ij_real_space_bias_grid"]
         if self.scale_by_s8z:
             s8z = state["sigma8_z"] / self.sigma8_fid
@@ -669,6 +707,7 @@ class RealSpaceBiasExpansion(LikelihoodModule):
         return p
 
     def compute_p_gg(self, state, bias_params):
+        """Compute the galaxy-galaxy auto power spectrum from bias expansion."""
         p_ij = state["p_ij_real_space_bias_grid"]
         if self.scale_by_s8z:
             s8z = state["sigma8_z"] / self.sigma8_fid
@@ -698,6 +737,7 @@ class RealSpaceBiasExpansion(LikelihoodModule):
         return p
 
     def compute_cross_p_gg(self, state, bias_params):
+        """Compute the galaxy-galaxy cross power spectrum between different tracers."""
         p_ij = state["p_ij_real_space_bias_grid"]
         if self.scale_by_s8z:
             s8z = state["sigma8_z"] / self.sigma8_fid
@@ -717,6 +757,7 @@ class RealSpaceBiasExpansion(LikelihoodModule):
         return p
 
     def compute(self, state, params_values):
+        """Compute all required real-space spectra (p_mm, p_gm, p_gg) and write to state."""
         param_vec = jnp.array(list(params_values.values()))
 
         for s in self.all_spectra:

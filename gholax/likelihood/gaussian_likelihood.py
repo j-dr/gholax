@@ -6,7 +6,20 @@ import yaml
 import abc
 
 class GaussianLikelihood(metaclass=abc.ABCMeta):
+    """Abstract base class for Gaussian likelihoods.
+
+    Manages a pipeline of LikelihoodModules, parameter classification
+    (sampled/fixed/derived), analytic marginalization over linear nuisance
+    parameters via the Woodbury identity, and dependency graph resolution.
+    """
+
     def __init__(self, config, shared_params={}):
+        """Initialize the Gaussian likelihood.
+
+        Args:
+            config: Likelihood configuration dict (from YAML).
+            shared_params: Parameters shared between likelihoods (e.g., cosmology).
+        """
         self.analytic_marginalization = config.get("analytic_marginalization", True)
         self.include_am_priors = config.get("include_am_priors", True)
         self.include_am_determinant = config.get("include_am_determinant", True)
@@ -75,7 +88,8 @@ class GaussianLikelihood(metaclass=abc.ABCMeta):
         self.build_dependency_graph()
 
     def setup_params(self):
-        #parse arguments to derived parameters 
+        """Parse derived parameters, build parameter index maps for pipeline modules."""
+        #parse arguments to derived parameters
         for p in self.derived_params:
             fstr = self.derived_params[p]
             args = fstr.split(':')[0].split('lambda')[1]
@@ -144,6 +158,7 @@ class GaussianLikelihood(metaclass=abc.ABCMeta):
                 module.param_indices = param_indices
 
     def build_dependency_graph(self):
+        """Resolve transitive dependencies across all pipeline modules."""
         state_dependencies = {}
         for module in self.likelihood_pipeline:
             state_dependencies.update(module.output_requirements)
@@ -155,6 +170,14 @@ class GaussianLikelihood(metaclass=abc.ABCMeta):
 
             
     def setup_training_requirements(self, required_data):
+        """Determine pipeline modules and parameters needed for training data generation.
+
+        Args:
+            required_data: List of state keys required for training.
+
+        Returns:
+            Tuple of (ordered list of required modules, list of required parameter names).
+        """
         required_modules = {}
 
         def get_module_dependencies_recursive(requirement, likelihood_pipeline):
@@ -193,6 +216,7 @@ class GaussianLikelihood(metaclass=abc.ABCMeta):
         return required_modules_all, required_params_all
 
     def setup_state_params(self, params_values):
+        """Merge fixed/derived params and sort, returning (state, param_dict)."""
         for p in self.fixed_params:
             params_values[p] = jnp.array(self.fixed_params[p])
         
@@ -217,6 +241,18 @@ class GaussianLikelihood(metaclass=abc.ABCMeta):
         self, params, params_am, return_state=False, apply_scale_mask=True,
         apply_window=True,
     ):
+        """Run the full pipeline and return the model prediction vector.
+
+        Args:
+            params: Dict of sampled parameter values.
+            params_am: Dict of analytically marginalized parameter values.
+            return_state: If True, also return the full pipeline state.
+            apply_scale_mask: If True, apply scale cuts to the prediction.
+            apply_window: If True, apply window function convolution.
+
+        Returns:
+            Model prediction vector, or (prediction, state) if return_state.
+        """
         params_all = params.copy()
         params_all.update(params_am)
         state, params_dict = self.setup_state_params(params_all)
@@ -239,6 +275,7 @@ class GaussianLikelihood(metaclass=abc.ABCMeta):
             return model
 
     def generate_training_data(self, params):
+        """Run the training pipeline and return the state with computed observables."""
         params_all = params.copy()
         state, params_dict = self.setup_state_params(params_all)
 
@@ -255,11 +292,22 @@ class GaussianLikelihood(metaclass=abc.ABCMeta):
         return
 
     def get_model_from_state_no_window(self, state):
+        """Extract the model prediction before window convolution (subclass override)."""
         raise NotImplementedError(
             f"{self.__class__.__name__} does not implement get_model_from_state_no_window"
         )
 
     def compute_am(self, params):
+        """Compute the log-likelihood with analytic marginalization over linear params.
+
+        Uses the Woodbury identity to marginalize over linear nuisance parameters.
+
+        Args:
+            params: Dict of sampled parameter values.
+
+        Returns:
+            Tuple of (log-likelihood, non-marginalized chi2, template Jacobian).
+        """
         params_am = self.linear_params_means
 
         @jit
@@ -303,6 +351,7 @@ class GaussianLikelihood(metaclass=abc.ABCMeta):
         return lnL, lnL_nonmarg, templates
 
     def compute_noam(self, params):
+        """Compute the log-likelihood without analytic marginalization."""
         params_am = {}
         model = self.predict_model(params, params_am)
 
@@ -319,6 +368,7 @@ class GaussianLikelihood(metaclass=abc.ABCMeta):
         return lnL
 
     def compute(self, params):
+        """Compute the log-likelihood, dispatching to AM or non-AM implementation."""
         if self.analytic_marginalization:
             lnL, lnL_nonmarg, templates = self.compute_am(params)
         else:
@@ -327,6 +377,7 @@ class GaussianLikelihood(metaclass=abc.ABCMeta):
         return lnL
 
     def save_model(self, filename, params, params_am):
+        """Save the model prediction to file via the data vector."""
         model = self.predict_model(params, params_am, apply_scale_mask=False)
         self.observed_data_vector.save_data_vector(filename, model)
         

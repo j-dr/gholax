@@ -159,7 +159,12 @@ def generate_models(
 
 
 def generate_training_data():
+    """CLI entry point for MPI-parallel emulator training data generation.
 
+    Reads a YAML config file from sys.argv[1], sets up the model and
+    parameter sampling design, then calls generate_models to evaluate
+    the model at each design point in parallel across MPI ranks.
+    """
     info_txt = sys.argv[1]
     with open(info_txt, "rb") as fp:
         info = yaml.load(fp, Loader=Loader)

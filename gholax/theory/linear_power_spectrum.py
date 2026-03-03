@@ -5,7 +5,22 @@ import numpy as np
 
 
 class LinearPowerSpectrum(LikelihoodModule):
+    """Compute the linear matter and CDM+baryon power spectra P_m(k,z) and P_cb(k,z).
+
+    Supports emulator and Boltzmann solver backends.
+    Writes 'Pm_lin_z', 'Pcb_lin_z', and 'k_lin' to the state.
+    """
+
     def __init__(self, zmin=0.0, zmax=2.0, nz=125, **config):
+        """Initialize the linear power spectrum module.
+
+        Args:
+            zmin: Minimum redshift.
+            zmax: Maximum redshift.
+            nz: Number of redshift bins.
+            **config: Additional config (use_emulator, use_boltzmann,
+                kmin, kmax, nk, emulator_file_name).
+        """
         self.nz = nz
         self.kmin = config.get("kmin", 1e-3)
         self.kmax = config.get("kmax", 10)
@@ -70,6 +85,7 @@ class LinearPowerSpectrum(LikelihoodModule):
             )
 
     def compute_emulator(self, state, params_values):
+        """Compute P_m and P_cb using the neural network emulator."""
         cosmo_params = jnp.array(
             [
                 params_values["As"],
@@ -95,6 +111,7 @@ class LinearPowerSpectrum(LikelihoodModule):
         return state
 
     def compute_boltzmann(self, state, params_values):
+        """Compute P_m and P_cb from a CLASS Boltzmann solver result."""
         boltz = state["boltzmann_results"]
         h = params_values["H0"] / 100
 
@@ -113,9 +130,11 @@ class LinearPowerSpectrum(LikelihoodModule):
         return state
 
     def compute_analytic(state, params_values):
+        """Compute P_lin analytically (not implemented)."""
         raise (NotImplementedError("Analytic Plin(k,z) calculation not implemented."))
 
     def compute(self, state, params_values):
+        """Compute linear power spectra and write to state."""
         if self.use_emulator:
             state = self.compute_emulator(state, params_values)
         elif self.use_boltzmann:

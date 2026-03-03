@@ -8,7 +8,18 @@ import yaml
 
 
 class NNPowerSpectrumInterpolator(object):
+    """Wrapper providing a P(z, k) interface around a spectrum emulator and sigma8(z) emulator."""
+
     def __init__(self, emu, sigma8z_emu, cosmo_params, nz_max=200, nonu=False):
+        """Initialize the interpolator.
+
+        Args:
+            emu: Emulator instance for the power spectrum.
+            sigma8z_emu: ScalarEmulator instance for sigma8(z).
+            cosmo_params: Array of cosmological parameters [As, ns, H0, w, ombh2, omch2, mnu].
+            nz_max: Maximum number of redshift bins to pre-allocate.
+            nonu: If True, skip log10 transform of neutrino mass parameter.
+        """
         self.emu = emu
         self.sigma8z_emu = sigma8z_emu
         self.cosmo_params = jnp.copy(cosmo_params)
@@ -25,6 +36,15 @@ class NNPowerSpectrumInterpolator(object):
         self.cparam_grid = self.cparam_grid.at[:, :-1].set(self.cosmo_params)
 
     def P(self, z, k):
+        """Evaluate the power spectrum at given redshifts and wavenumbers.
+
+        Args:
+            z: Array of redshift values.
+            k: Array of wavenumber values in h/Mpc.
+
+        Returns:
+            2D array of shape (len(k), len(z)) with P(k, z) values.
+        """
         self.cparam_grid = self.cparam_grid.at[: len(z), -1].set(z)
         sigma8z = self.sigma8z_emu.predict(self.cparam_grid[: len(z)])[:, 0]
         self.cparam_grid = self.cparam_grid.at[: len(z), -1].set(sigma8z)
@@ -59,7 +79,21 @@ def activation(x, alpha, beta):
 
 
 class Emulator(object):
+    """MLP emulator for single-spectrum power spectrum predictions.
+
+    Uses PCA-compressed output with sinh denormalization. Weights are
+    loaded from HDF5 files.
+    """
+
     def __init__(self, filebase, kmin=1e-3, kmax=0.5, scale_As=True):
+        """Initialize the emulator and load weights.
+
+        Args:
+            filebase: Path to the HDF5 weight file (without .h5 extension).
+            kmin: Minimum wavenumber for the k grid.
+            kmax: Maximum wavenumber for the k grid.
+            scale_As: If True, scale As by 1e9 in normalization parameters.
+        """
         super(Emulator, self).__init__()
         self.scale_As = scale_As
         self.load(filebase)
@@ -71,6 +105,11 @@ class Emulator(object):
         self.k = jnp.logspace(jnp.log10(kmin), jnp.log10(kmax), self.nk)
 
     def load(self, filebase):
+        """Load neural network weights from an HDF5 file.
+
+        Args:
+            filebase: Path to the weight file (without .h5 extension).
+        """
         with h5.File("{}.h5".format(filebase), "r") as weights:
             for k in weights:
                 if k in ["W", "b", "alphas", "betas"]:
@@ -87,6 +126,15 @@ class Emulator(object):
                 setattr(self, k, w)
 
     def predict(self, parameters):
+        """Run the MLP forward pass to predict the power spectrum.
+
+        Args:
+            parameters: Array of shape (n_samples, n_parameters) with cosmological
+                parameters.
+
+        Returns:
+            Array of predicted power spectrum values.
+        """
         x = (parameters - self.param_mean) / self.param_sigmas
 
         for i in range(self.n_layers - 1):
@@ -109,6 +157,12 @@ class Emulator(object):
 
 
 class MultiSpectrumEmulator(object):
+    """MLP emulator for multiple power spectrum components simultaneously.
+
+    Predicts n_spec spectra at once, optionally using sigma8(z) as a
+    transformed variable and scaling by sigma8(z)^2.
+    """
+
     def __init__(
         self,
         config,
@@ -120,6 +174,18 @@ class MultiSpectrumEmulator(object):
         scale_As_d=True,
         scale_by_s8zsq=True,
     ):
+        """Initialize the multi-spectrum emulator.
+
+        Args:
+            config: Path to a YAML config file or a config dict.
+            input_param_order: Ordering of input parameters (default: from config).
+            abspath: If True, treat config/weight paths as absolute.
+            data_dir: Directory containing emulator weight files.
+            s8_tvar: If True, replace the last parameter with sigma8(z).
+            scale_As_spec: If True, scale As by 1e9 for spectrum normalization.
+            scale_As_d: If True, scale As by 1e9 for sigma8(z) emulator.
+            scale_by_s8zsq: If True, multiply output by sigma8(z)^2.
+        """
         super(MultiSpectrumEmulator, self).__init__()
 
         if not abspath:
@@ -222,6 +288,11 @@ class MultiSpectrumEmulator(object):
         self.k = jnp.logspace(jnp.log10(kmin), jnp.log10(kmax), self.nk)
 
     def load_spec(self, filebase):
+        """Load spectrum emulator weights from an HDF5 file.
+
+        Args:
+            filebase: Path to the weight file (without .h5 extension).
+        """
         with h5.File("{}.h5".format(filebase), "r") as weights:
             for k in weights:
                 if k in ["W", "b", "alphas", "betas"]:
@@ -251,6 +322,14 @@ class MultiSpectrumEmulator(object):
                 setattr(self, k, w)
 
     def predict(self, parameters):
+        """Run the MLP forward pass to predict multiple spectra.
+
+        Args:
+            parameters: Array of shape (n_samples, n_parameters).
+
+        Returns:
+            Array of shape (n_samples, n_spec, nk) with predicted spectra.
+        """
         if self.s8_tvar:
             s8z = self.sigma8z_emu.predict(parameters)[:, 0]
             parameters = parameters.at[:, -1].set(s8z)
@@ -281,6 +360,8 @@ class MultiSpectrumEmulator(object):
 
 
 class ScalarEmulator(object):
+    """MLP emulator for scalar quantities (e.g., sigma8(z), chi(z), E(z))."""
+
     def __init__(
         self,
         filebase,
@@ -289,6 +370,15 @@ class ScalarEmulator(object):
         input_param_order=None,
         weight_param_order=None,
     ):
+        """Initialize the scalar emulator.
+
+        Args:
+            filebase: Name of the weight file (resolved relative to data_dir).
+            scale_As: If True, scale As by 1e9 in normalization parameters.
+            data_dir: Directory containing weight files (default: emu_weights/).
+            input_param_order: Ordering of input parameters at call time.
+            weight_param_order: Ordering of parameters used during training.
+        """
         super(ScalarEmulator, self).__init__()
         self.scale_As = scale_As
 
@@ -306,6 +396,12 @@ class ScalarEmulator(object):
         self.n_layers = len(self.W)
 
     def load(self, filebase, data_dir=None):
+        """Load neural network weights from an HDF5 file.
+
+        Args:
+            filebase: Name of the weight file (without .h5 extension).
+            data_dir: Directory containing weight files.
+        """
         if data_dir is None:
             emu_abspath = "/".join(
                 [
@@ -351,6 +447,14 @@ class ScalarEmulator(object):
                 setattr(self, k, w)
 
     def predict(self, parameters):
+        """Run the MLP forward pass to predict a scalar quantity.
+
+        Args:
+            parameters: Array of shape (n_samples, n_parameters).
+
+        Returns:
+            Array of predicted scalar values.
+        """
         x = (parameters - self.param_mean) / self.param_sigmas
 
         for i in range(self.n_layers - 1):
@@ -367,9 +471,24 @@ class ScalarEmulator(object):
 
 
 class PijEmulator(object):
+    """Emulator for P_ij basis spectra, composed of individual Emulator instances.
+
+    Wraps multiple single-spectrum Emulators, one per P_ij component,
+    with a shared sigma8(z) emulator.
+    """
+
     def __init__(
         self, config, abspath=False, data_dir=None, scale_As=True, s8_tvar=True
     ):
+        """Initialize the P_ij emulator.
+
+        Args:
+            config: Path to a YAML config file or a config dict.
+            abspath: If True, treat paths as absolute.
+            data_dir: Directory containing weight files.
+            scale_As: If True, scale As by 1e9 for normalization.
+            s8_tvar: If True, use sigma8(z) as a transformed variable.
+        """
         if not abspath:
             if data_dir is None:
                 data_dir = "/".join(
@@ -438,6 +557,14 @@ class PijEmulator(object):
             self.sigma8z_emu = ScalarEmulator(s8z_base, scale_As=scale_As)
 
     def predict(self, parameters):
+        """Predict all P_ij components for the given parameters.
+
+        Args:
+            parameters: Array of shape (n_samples, n_parameters).
+
+        Returns:
+            Array of shape (n_samples, n_spec, nk) with predicted P_ij spectra.
+        """
         if self.s8_tvar:
             s8z = self.sigma8z_emu.predict(parameters)[:, 0]
             parameters = parameters.at[:, -1].set(s8z)
@@ -487,6 +614,7 @@ def predict_scan(parameters, xs):
     x = activation(x, alphas[0], betas[0])
 
     def MLP(x, wandb):
+        """Single hidden layer step for use with jax.lax.scan."""
         W_i, b_i, alpha_i, beta_i = wandb
         x = x @ W_i + b_i
         x = activation(x, alpha_i, beta_i)

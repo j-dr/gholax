@@ -9,6 +9,12 @@ import jax
 
 
 class ProjectionKernels(LikelihoodModule):
+    """Compute projection kernels (lensing, galaxy, magnification, IA) for Limber integration.
+
+    Writes kernel arrays (w_d, w_k, w_mag, w_ia, etc.) and effective
+    redshifts to the state.
+    """
+
     def __init__(
         self,
         observed_data_vector,
@@ -117,6 +123,7 @@ class ProjectionKernels(LikelihoodModule):
             self.indexed_params[k] = np.array(self.indexed_params[k])[:, None]
 
     def compute_w_d(self, e_z, chi_z, omega_m, nz, smags, z, chi_star):
+        """Compute the galaxy/density projection kernel W_d(chi)."""
         w_d = jnp.zeros_like(nz)
 
         f = lambda carry, nz_i: (carry, nz_i * e_z)
@@ -129,12 +136,15 @@ class ProjectionKernels(LikelihoodModule):
         return w_d, zeff_d, jnp.zeros_like(zeff_d)
 
     def compute_w_d_dk(self, e_z, chi_z, omega_m, nz, smags, z, chi_star):
+        """Compute the galaxy kernel for density-shear cross correlations."""
         return self.compute_w_d(e_z, chi_z, omega_m, nz, smags, z, chi_star)
 
     def compute_w_d_dcmbk(self, e_z, chi_z, omega_m, nz, smags, z, chi_star):
+        """Compute the galaxy kernel for density-CMB lensing cross correlations."""
         return self.compute_w_d(e_z, chi_z, omega_m, nz, smags, z, chi_star)
 
     def compute_w_ia(self, e_z, chi_z, omega_m, nz, smags, z, chi_star):
+        """Compute the intrinsic alignment projection kernel."""
         rho_c = 2.7754e11
         c1_bar = 5e-14
         om_fid = 0.31
@@ -145,6 +155,7 @@ class ProjectionKernels(LikelihoodModule):
         return -om_fid * rho_c * c1_bar * w_ia, zeff_ia, ichi_inv
 
     def compute_w_k(self, e_z, chi_z, omega_m, nz, smags, z, chi_star):
+        """Compute the lensing convergence kernel W_kappa(chi)."""
         w_k = jnp.zeros_like(nz)
         cmax = jnp.max(chi_z) * 1.1  # what is the point of the * 1.1
 
@@ -175,6 +186,7 @@ class ProjectionKernels(LikelihoodModule):
         return w_k, jnp.ones_like(ichi_eff), ichi_eff
 
     def compute_c_cmbk(self, e_z, chi_z, omega_m, nz, smags, z, chi_star):
+        """Compute the CMB lensing convergence kernel."""
         w_cmbk = 1.5 * omega_m * (1.0 / 2997.925) ** 2 * (1 + z)
         w_cmbk *= chi_z * (chi_star - chi_z) / chi_star
         ichi_eff = 1 / chi_star
@@ -182,6 +194,7 @@ class ProjectionKernels(LikelihoodModule):
         return w_cmbk, jnp.ones_like(ichi_eff), ichi_eff
 
     def compute_w_mag(self, e_z, chi_z, omega_m, nz, smags, z, chi_star):
+        """Compute the magnification bias kernel, scaled by (5s-2)."""
         w_mag, zeff, ichi_eff = self.compute_w_k(
             e_z, chi_z, omega_m, nz, smags, z, chi_star
         )
@@ -196,12 +209,15 @@ class ProjectionKernels(LikelihoodModule):
         return w_mag, zeff, ichi_eff
 
     def compute_w_mag_dk(self, e_z, chi_z, omega_m, nz, smags, z, chi_star):
+        """Compute the magnification kernel for density-shear cross correlations."""
         return self.compute_w_mag(e_z, chi_z, omega_m, nz, smags, z, chi_star)
 
     def compute_w_mag_dcmbk(self, e_z, chi_z, omega_m, nz, smags, z, chi_star):
+        """Compute the magnification kernel for density-CMB lensing cross correlations."""
         return self.compute_w_mag(e_z, chi_z, omega_m, nz, smags, z, chi_star)
 
     def compute(self, state, params_values):
+        """Compute all required projection kernels and write to state."""
         param_vec = jnp.array(list(params_values.values()))
         e_z = state["e_z_limber"]
         chi_z_proj = state["chi_z_limber"]

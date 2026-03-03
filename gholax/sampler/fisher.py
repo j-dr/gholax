@@ -5,14 +5,39 @@ import numpy as np
 from copy import copy
 
 class Fisher(object):
+    """Fisher matrix forecast sampler.
+
+    Computes the Fisher information matrix from model Jacobians and the
+    inverse covariance, then draws samples from the resulting Gaussian
+    posterior approximation.  Optionally includes a prior contribution.
+    """
+
     def __init__(self, config):
+        """Initialize Fisher sampler from config.
+
+        Args:
+            config: Full config dict containing 'sampler' -> 'Fisher' section.
+        """
         c = config["sampler"]["Fisher"]
         self.include_prior = c.get("include_prior", True)
         self.n_samples = c.get("n_samples", 20000)
         self.s8_module_index = c.get("s8_module_index", 1)
 
     def run(self, model, output_file=None):
+        """Compute Fisher matrix and draw samples from the Gaussian posterior.
 
+        Computes the Jacobian of the model prediction w.r.t. parameters,
+        constructs the Fisher matrix F = J^T C^{-1} J (plus prior if enabled),
+        and draws multivariate normal samples.  Derived quantities (Omega_m,
+        sigma8, S8) are appended via the emulator.
+
+        Args:
+            model: Model instance with prior, likelihoods, and predict_model.
+            output_file: Unused, kept for sampler interface compatibility.
+
+        Returns:
+            Tuple of (samples array, parameter names list).
+        """
         param_dict = model.prior.initial_position(random_start=False)
         F = 0
         for like in model.likelihoods:        

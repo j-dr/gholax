@@ -10,7 +10,18 @@ from interpax import interp1d
 
 
 class Boltzmann(LikelihoodModule):
+    """Run the CLASS Boltzmann solver to produce cosmological predictions.
+
+    Writes a CLASS instance to state['boltzmann_results'] for use by
+    downstream modules.
+    """
+
     def __init__(self, **config):
+        """Initialize the Boltzmann module.
+
+        Args:
+            **config: Configuration dict. Supports 'nonlinear_pk' (default: 'none').
+        """
         self.output_requirements = {}
         self.output_requirements["boltzmann_results"] = [
             "As",

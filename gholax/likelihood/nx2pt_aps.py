@@ -22,7 +22,14 @@ from jax.lax import scan
 
 
 class Nx2PTAngularPowerSpectrum(GaussianLikelihood):
+    """N x 2-point angular power spectrum likelihood (cosmic shear, GGL, clustering).
+
+    Assembles a pipeline of theory, projection, and systematics modules to
+    predict C_ell spectra and compare against observed data.
+    """
+
     def __init__(self, config):
+        """Initialize the Nx2PT angular power spectrum likelihood from config."""
         c = config["likelihood"]["Nx2PTAngularPowerSpectrum"]
 
         self.zmin_proj = c.get("zmin_proj", 0.0001)
@@ -251,6 +258,7 @@ class Nx2PTAngularPowerSpectrum(GaussianLikelihood):
             self.all_spectra[t] = jnp.array(self.all_spectra[t])
 
     def get_model_from_state(self, state):
+        """Extract the windowed model vector from the pipeline state."""
         dv = self.observed_data_vector
         model = []
         for t in dv.spectrum_types:
@@ -264,6 +272,7 @@ class Nx2PTAngularPowerSpectrum(GaussianLikelihood):
         return model
 
     def get_model_from_state_no_window(self, state):
+        """Extract the pre-window theory C_ell predictions from the state."""
         self.ell_no_window = jnp.arange(6144)
         window_module = self.likelihood_pipeline[-1]
         ell_theory = window_module.ell

@@ -13,7 +13,25 @@ from .spline import spline_func_vec
 
 
 class DensityShapeIA(LikelihoodModule):
+    """Compute density-shape intrinsic alignment basis spectra P_ij(k,z).
+
+    Supports emulator and analytic (spinosaurus) backends.
+    Writes 'p_ij_real_space_density_shape_grid' to the state.
+    """
+
     def __init__(self, zmin=0, zmax=2.0, nz=50, kmin=1e-3, kmax=3.95, nk=200, **config):
+        """Initialize the density-shape IA module.
+
+        Args:
+            zmin: Minimum redshift.
+            zmax: Maximum redshift.
+            nz: Number of redshift bins.
+            kmin: Minimum wavenumber in h/Mpc.
+            kmax: Maximum wavenumber in h/Mpc.
+            nk: Number of wavenumber bins.
+            **config: Additional config (use_emulator, emulator_file_names,
+                interpolation_order, no_ia, heft_nla, kIR).
+        """
         self.nz = nz
         self.nk = nk
         self.z = jnp.linspace(zmin, zmax, nz)
@@ -57,6 +75,7 @@ class DensityShapeIA(LikelihoodModule):
         self.kIR = config.get("kIR", 0.2)
 
     def compute_emulator(self, state, params_values):
+        """Compute density-shape IA spectra using the neural network emulator."""
         cosmo_params = jnp.array(
             [params_values[p] for p in self.input_param_order[:-1]]
         )
@@ -88,6 +107,7 @@ class DensityShapeIA(LikelihoodModule):
         return state
 
     def compute_analytic(self, state):
+        """Compute density-shape IA spectra using spinosaurus perturbation theory."""
         k_lin = np.array(state["k_lin"])
         p_cb = state["Pcb_lin_z"]
 
@@ -115,6 +135,7 @@ class DensityShapeIA(LikelihoodModule):
         return state
 
     def compute(self, state, params_values):
+        """Compute density-shape IA spectra and write to state."""
         if self.use_emulator:
             state = self.compute_emulator(state, params_values)
         else:
@@ -136,7 +157,25 @@ class DensityShapeIA(LikelihoodModule):
 
 
 class ShapeShapeIA(LikelihoodModule):
+    """Compute shape-shape intrinsic alignment basis spectra P_mij(k,z).
+
+    Supports emulator and analytic (spinosaurus) backends.
+    Writes 'p_mij_real_space_shape_shape_grid' to the state.
+    """
+
     def __init__(self, zmin=0, zmax=2.0, nz=50, kmin=1e-3, kmax=3.95, nk=200, **config):
+        """Initialize the shape-shape IA module.
+
+        Args:
+            zmin: Minimum redshift.
+            zmax: Maximum redshift.
+            nz: Number of redshift bins.
+            kmin: Minimum wavenumber in h/Mpc.
+            kmax: Maximum wavenumber in h/Mpc.
+            nk: Number of wavenumber bins.
+            **config: Additional config (use_emulator, emulator_file_names,
+                interpolation_order, no_ia, heft_nla, kIR).
+        """
         self.nz = nz
         self.nk = nk
         self.kmin = kmin
@@ -194,6 +233,7 @@ class ShapeShapeIA(LikelihoodModule):
         self.kIR = config.get("kIR", 0.2)
 
     def compute_emulator(self, state, params_values):
+        """Compute shape-shape IA spectra using neural network emulators."""
         cosmo_params = jnp.array(
             [params_values[p] for p in self.input_param_order[:-1]]
         )
@@ -227,6 +267,7 @@ class ShapeShapeIA(LikelihoodModule):
         return state
 
     def compute_analytic(self, state):
+        """Compute shape-shape IA spectra using spinosaurus perturbation theory."""
         k_lin = np.array(state["k_lin"])
         p_cb = state["Pcb_lin_z"]
 
@@ -255,6 +296,7 @@ class ShapeShapeIA(LikelihoodModule):
         return state
 
     def compute(self, state, params_values):
+        """Compute shape-shape IA spectra and write to state."""
         if self.no_ia:
             return state
 
@@ -485,6 +527,17 @@ class RealSpaceIAExpansion(LikelihoodModule):
             self.indexed_params[s][1] = np.array(self.indexed_params[s][1])
 
     def required_spectrum_params(self, c_type, p_type, i, j):
+        """Get the parameter names required for a given spectrum type and bin pair.
+
+        Args:
+            c_type: Angular power spectrum type (e.g., 'c_dk', 'c_kk').
+            p_type: 3D spectrum type (e.g., 'p_gi', 'p_ii_ee', 'p_mi').
+            i: First bin index.
+            j: Second bin index.
+
+        Returns:
+            Dict mapping bin index tuples to lists of parameter names.
+        """
         pars = {}
         if self.no_ia:
             if p_type == "p_mi":
@@ -717,6 +770,18 @@ class RealSpaceIAExpansion(LikelihoodModule):
         return pars
 
     def set_cs(self, param_vec, param_indices, zeff, s8z, z_evolution_model):
+        """Compute IA bias coefficients with redshift evolution applied.
+
+        Args:
+            param_vec: Full parameter vector.
+            param_indices: Indices into param_vec for this spectrum.
+            zeff: Effective redshift (used for scalar models).
+            s8z: sigma8(z) array for normalization.
+            z_evolution_model: Redshift evolution model name.
+
+        Returns:
+            Tuple of (bias_coefficient_vector, sigma8_normalization).
+        """
         if (z_evolution_model == "maiar") | (z_evolution_model == "scalar_bias"):
             c_vec = param_vec[param_indices]
             s8z_i = jnp.interp(zeff, self.z, s8z) / self.sigma8_fid
@@ -747,6 +812,7 @@ class RealSpaceIAExpansion(LikelihoodModule):
         return c_vec, s8z_i
 
     def get_cs(self, p_type, i, j=None):
+        """Get the IA coefficient parameter names for a bin pair."""
         if self.no_ia:
             return []
 
@@ -763,6 +829,7 @@ class RealSpaceIAExpansion(LikelihoodModule):
         return c_vec
 
     def compute_p_ii_ee(self, state, xs):
+        """Compute the EE intrinsic-intrinsic power spectrum from shape-shape basis."""
         if self.no_ia:
             return jnp.zeros((self.logk.shape[0], self.z.shape[0]))
 
@@ -785,6 +852,7 @@ class RealSpaceIAExpansion(LikelihoodModule):
         return p
 
     def compute_p_ii_22_0(self, state, xs):
+        """Compute the m=0 helicity-2 intrinsic-intrinsic power spectrum."""
         if self.no_ia:
             return jnp.zeros((self.logk.shape[0], self.z.shape[0]))
 
@@ -801,6 +869,7 @@ class RealSpaceIAExpansion(LikelihoodModule):
         return pii0
 
     def compute_p_ii_22_1(self, state, xs):
+        """Compute the m=1 helicity-2 intrinsic-intrinsic power spectrum."""
         if self.no_ia:
             return jnp.zeros((self.logk.shape[0], self.z.shape[0]))
 
@@ -817,6 +886,7 @@ class RealSpaceIAExpansion(LikelihoodModule):
         return pii1
 
     def compute_p_ii_22_2(self, state, xs):
+        """Compute the m=2 helicity-2 intrinsic-intrinsic power spectrum."""
         if self.no_ia:
             return jnp.zeros((self.logk.shape[0], self.z.shape[0]))
 
@@ -833,6 +903,7 @@ class RealSpaceIAExpansion(LikelihoodModule):
         return pii2
 
     def compute_p_ii_bb(self, state, xs):
+        """Compute the BB intrinsic-intrinsic power spectrum from shape-shape basis."""
         if self.no_ia:
             return jnp.zeros((self.logk.shape[0], self.z.shape[0]))
 
@@ -849,6 +920,7 @@ class RealSpaceIAExpansion(LikelihoodModule):
         return pii1
 
     def compute_p_mi(self, state, xs):
+        """Compute the matter-intrinsic alignment cross spectrum."""
         if self.no_ia:
             return jnp.zeros((self.logk.shape[0], self.z.shape[0]))
 
@@ -866,6 +938,7 @@ class RealSpaceIAExpansion(LikelihoodModule):
         return 3 * pmi / 4
 
     def compute_p_gi(self, state, xs):
+        """Compute the galaxy-intrinsic alignment cross spectrum."""
         if self.no_ia:
             return jnp.zeros((self.logk.shape[0], self.z.shape[0]))
 
@@ -882,6 +955,12 @@ class RealSpaceIAExpansion(LikelihoodModule):
         return 3 * pgi / 4
 
     def compute(self, state, params_values):
+        """Compute all required IA spectra and write to state.
+
+        Dispatches to the appropriate spectrum computer for each required
+        spectrum type (p_mi, p_gi, p_ii_ee, p_ii_bb, etc.) and scans over
+        all relevant bin pairs.
+        """
         param_vec = jnp.array(list(params_values.values()))
         n_sbins_tot = self.n_sbins_tot
         n_dbins_tot = self.n_dbins_tot

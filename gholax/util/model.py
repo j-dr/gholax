@@ -13,7 +13,28 @@ jax.config.update("jax_default_matmul_precision", "float32")
 
 
 class Model:
+    """Central orchestrator for Bayesian cosmological inference.
+
+    Instantiated from a YAML config file, holds named GaussianLikelihood
+    instances and exposes JAX-differentiable log-posterior evaluation.
+
+    Attributes:
+        likelihoods: Dict mapping likelihood names to GaussianLikelihood instances.
+        param_names: List of sampled parameter names.
+        prior: Prior instance managing parameter priors and reference values.
+        likelihood_param_index: Dict mapping likelihood names to index arrays
+            for slicing the global parameter vector.
+    """
+
     def __init__(self, config_file):
+        """Initialize the Model from a YAML config file or config dict.
+
+        Parses the config, instantiates all likelihoods, collects sampled/fixed/derived
+        parameters, builds the Prior, and creates parameter index mappings.
+
+        Args:
+            config_file: Path to a YAML config file, or a pre-loaded config dict.
+        """
         try:
             with open(config_file, "r") as fp:
                 cfg = yaml.load(fp, Loader=yaml.SafeLoader)
@@ -56,6 +77,17 @@ class Model:
         self.likelihood_param_index = param_idx
 
     def log_posterior(self, param_values):
+        """Compute the log-posterior for a parameter vector.
+
+        Evaluates the prior and all likelihoods. Parameters are in natural
+        (unscaled) units.
+
+        Args:
+            param_values: Array of parameter values in the same order as param_names.
+
+        Returns:
+            Scalar log-posterior value (NaN mapped to -inf).
+        """
         param_dict_all = dict(zip(self.param_names, param_values))
         logp = self.prior.log_prior(param_dict_all)
 
@@ -71,6 +103,17 @@ class Model:
         return jnp.nan_to_num(logp, nan=-jnp.inf)
 
     def log_posterior_scaled_params(self, param_values):
+        """Compute the log-posterior from normalized parameter values.
+
+        Parameters are rescaled from normalized space (zero-mean, unit-prior-sigma)
+        to natural units before evaluation.
+
+        Args:
+            param_values: Array of normalized parameter values.
+
+        Returns:
+            Scalar log-posterior value (NaN mapped to -inf).
+        """
         param_values = (
             param_values * self.prior.prior_sigmas + self.prior.reference_values
         )  # rescale
@@ -89,6 +132,14 @@ class Model:
         return jnp.nan_to_num(logp, nan=-jnp.inf)
 
     def log_likelihood(self, param_values):
+        """Compute the log-likelihood (without the prior contribution).
+
+        Args:
+            param_values: Array of parameter values in natural units.
+
+        Returns:
+            Scalar log-likelihood value (NaN mapped to -inf).
+        """
         logp = 0
         for lname in self.likelihoods:
             param_dict = dict(
@@ -109,6 +160,19 @@ class Model:
         return_state=False,
         apply_scale_mask=True,
     ):
+        """Generate the model prediction for a named likelihood.
+
+        Args:
+            likelihood_name: Key into self.likelihoods.
+            params: Dict of parameter values (must include all sampled params).
+            params_am: Optional analytically marginalized parameter values.
+                Defaults to the likelihood's linear_params_means.
+            return_state: If True, also return the full pipeline state dict.
+            apply_scale_mask: If True, apply scale cuts to the prediction.
+
+        Returns:
+            Model prediction vector, or (prediction, state) if return_state is True.
+        """
         like = self.likelihoods[likelihood_name]
         if params_am is None:
             params_am = like.linear_params_means
@@ -122,6 +186,18 @@ class Model:
         )
 
     def setup_training_config(self, training_requirements):
+        """Configure the model for training data generation.
+
+        Determines which pipeline modules and parameters are needed to
+        produce the requested training outputs.
+
+        Args:
+            training_requirements: Dict mapping likelihood names to the
+                observables required for emulator training.
+
+        Returns:
+            List of unique parameter names required for training.
+        """
         all_required_params = []
         for lname in training_requirements:
             like = self.likelihoods[lname]
@@ -139,6 +215,15 @@ class Model:
         return self.required_params
 
     def generate_training_data(self, likelihood_name, params):
+        """Run the likelihood pipeline to generate emulator training data.
+
+        Args:
+            likelihood_name: Key into self.likelihoods.
+            params: Dict of parameter values for this evaluation.
+
+        Returns:
+            State dict containing the computed training observables.
+        """
         params_like = {
             k: params[k] if k in params else 0
             for k in self.likelihoods[likelihood_name].sampled_params
@@ -148,6 +233,15 @@ class Model:
 
 
 def _minimize(model, output_base):
+    """Find the maximum-a-posteriori parameters using L-BFGS optimization.
+
+    Args:
+        model: Model instance.
+        output_base: Base path for output files (unused, kept for API compat).
+
+    Returns:
+        Dict mapping parameter names to best-fit values in natural units.
+    """
     import jaxopt
 
     prior = model.prior
@@ -197,7 +291,12 @@ def _apply_gaussian_covariance(like, pred):
 
 
 def save_model_pred():
+    """CLI entry point for the ``save-model`` command.
 
+    Saves model predictions at a given parameter point, with options to
+    minimize, apply Gaussian covariance, load parameters from file, and
+    generate comparison plots.
+    """
     parser = argparse.ArgumentParser(
         prog='save-model',
         description='Save model predictions at a given parameter point.',
@@ -293,6 +392,12 @@ def save_model_pred():
 
 
 def _save_params_to_h5(filename, params):
+    """Save best-fit parameters as HDF5 group attributes.
+
+    Args:
+        filename: Path to the HDF5 file (appended to).
+        params: Dict mapping parameter names to scalar values.
+    """
     with h5.File(filename, "a") as f:
         grp = f.create_group("best_fit_params")
         for name, val in params.items():
@@ -300,11 +405,29 @@ def _save_params_to_h5(filename, params):
 
 
 def _load_params_from_h5(filename):
+    """Load best-fit parameters from an HDF5 file.
+
+    Args:
+        filename: Path to the HDF5 file containing a 'best_fit_params' group.
+
+    Returns:
+        Dict mapping parameter names to float values.
+    """
     with h5.File(filename, "r") as f:
         return {name: float(val) for name, val in f["best_fit_params"].attrs.items()}
 
 
 def _save_no_window(like, pred, filename):
+    """Save pre-window (unconvolved) theory predictions to an HDF5 file.
+
+    Writes a structured array with spectrum type, bin indices, separation
+    values, and prediction values.
+
+    Args:
+        like: GaussianLikelihood instance (Nx2PTAngularPowerSpectrum or RSDPK).
+        pred: Model prediction vector (before window convolution).
+        filename: Output HDF5 file path.
+    """
     from gholax.likelihood.nx2pt_aps import Nx2PTAngularPowerSpectrum
     from gholax.likelihood.rsd_pk import RSDPK
 

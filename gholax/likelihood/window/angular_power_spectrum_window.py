@@ -6,6 +6,12 @@ import jax.numpy as jnp
 
 
 class AngularPowerSpectrumWindow(LikelihoodModule):
+    """Convolve theory C_ell with bandpower window functions.
+
+    Interpolates theory C_ell to integer ell and applies the
+    coupling/window matrix to produce observed bandpowers.
+    """
+
     def __init__(
         self,
         observed_data_vector,
@@ -86,6 +92,7 @@ class AngularPowerSpectrumWindow(LikelihoodModule):
             self.cW[t] = cW_t
 
     def compute(self, state, params_values):
+        """Convolve theory C_ell with window matrices and write observed bandpowers to state."""
         ell_p = jnp.arange(self.l_max)
         for t in self.spectrum_types:
             f = lambda carry, c_l: (carry, jnp.interp(ell_p, self.ell, c_l))

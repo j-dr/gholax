@@ -106,7 +106,20 @@ def get_gaussian_proposal_generator(proposal_cov):
 
 
 class MetropolisHastings(object):
+    """Metropolis-Hastings random-walk sampler using blackjax.
+
+    Supports Gaussian or CosmoMC-style proposals, adaptive covariance
+    updates, optional L-BFGS pre-minimization, Hessian/Jacobian-based
+    initial proposal estimation, convergence checking via R-hat, and
+    checkpoint restart.
+    """
+
     def __init__(self, config):
+        """Initialize the Metropolis-Hastings sampler from config.
+
+        Args:
+            config: Full config dict containing 'sampler' -> 'MetropolisHastings' section.
+        """
         c = config["sampler"]["MetropolisHastings"]
         self.target_r_minus_one = c.get("target_r_minus_one", 0.1)
         self.min_cov_r_minus_one = c.get("min_cov_r_minus_one", 10)
@@ -134,6 +147,19 @@ class MetropolisHastings(object):
             self.proposal_covariance = None
 
     def run(self, model, output_file):
+        """Run the Metropolis-Hastings sampler until R-hat converges.
+
+        Initializes proposal covariance (from Jacobian, Hessian, file, or
+        diagonal prior), optionally pre-minimizes, then iteratively samples
+        with periodic covariance updates and checkpoint saving.
+
+        Args:
+            model: Model instance with log_posterior_scaled_params and prior.
+            output_file: Base path for output checkpoint and proposal files.
+
+        Returns:
+            Tuple of (samples array, parameter names list).
+        """
         rng_key = jax.random.key(int(datetime.now().strftime("%Y%m%d%s")))
         param_names = model.prior.params
         prior = model.prior
