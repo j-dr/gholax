@@ -639,6 +639,90 @@ class RealSpaceIAExpansion(LikelihoodModule):
                         for n in range(self.spline_N)
                     ]
                 )
+                
+        elif self.z_evolution_model == "per_source_bin_const":
+            if (p_type == "p_mi") & (c_type == "c_kk"):
+                s_idx = (i,)
+                pars[s_idx] = [
+                    [
+                        f"{p}_{i}" if i in self.sbins else "NA"
+                        for p in self.spectrum_params[p_type][0]
+                    ],
+                    [],
+                ]
+                if i != j:
+                    s_idx = (j,)
+                    pars[s_idx] = [
+                        [],
+                        [
+                            f"{p}_{j}" if j in self.sbins else "NA"
+                            for p in self.spectrum_params[p_type][0]
+                        ],
+                    ]
+
+            else:
+                s_idx = (i, j)
+                pars[s_idx] = []
+                if p_type == "p_gi":
+                    pars[s_idx].append(
+                        [
+                            f"{p}_{i}" if i in self.dbins else "NA"
+                            for p in self.spectrum_params[p_type][0]
+                        ]
+                    )
+                else:
+                    pars[s_idx].append(
+                        [
+                            f"{p}_{i}" if i in self.sbins else "NA"
+                            for p in self.spectrum_params[p_type][0]
+                        ]
+                    )
+                pars[s_idx].append(
+                    [
+                        f"{p}_{j}" if j in self.sbins else "NA"
+                        for p in self.spectrum_params[p_type][1]
+                    ]
+                ) 
+                
+        elif self.z_evolution_model == "const":
+            if (p_type == "p_mi") & (c_type == "c_kk"):
+                s_idx = (i,)
+                pars[s_idx] = [
+                    [
+                        p if i in self.sbins else "NA"for p in self.spectrum_params[p_type][0]
+                    ],
+                    [],
+                ]
+                if i != j:
+                    s_idx = (j,)
+                    pars[s_idx] = [
+                        [],
+                        [
+                            p if j in self.sbins else "NA" for p in self.spectrum_params[p_type][0]
+                        ],
+                    ]
+
+            else:
+                s_idx = (i, j)
+                pars[s_idx] = []
+                if p_type == "p_gi":
+                    pars[s_idx].append(
+                        [
+                            f"{p}_{i}" if i in self.dbins else "NA"
+                            for p in self.spectrum_params[p_type][0]
+                        ]
+                    )
+                else:
+                    pars[s_idx].append(
+                        [
+                            p if i in self.sbins else "NA" for p in self.spectrum_params[p_type][0]
+                        ]
+                    )
+                pars[s_idx].append(
+                    [
+                        p if j in self.sbins else "NA" for p in self.spectrum_params[p_type][1]
+                    ]
+                )                               
 
         elif self.z_evolution_model == "powerlaw":
             assert self.spline_N == 2, (
@@ -732,6 +816,11 @@ class RealSpaceIAExpansion(LikelihoodModule):
                 Delta=self.spline_Delta,
             )
             s8z_i = s8z / self.sigma8_fid
+            
+        elif 'const' in z_evolution_model:
+            c_vec = param_vec[param_indices].reshape(-1,1)
+            c_vec = jnp.tile(c_vec, (1, self.z.shape[0]))
+            s8z_i = s8z / self.sigma8_fid
 
         elif z_evolution_model == "powerlaw":
             zeff = 0.62
@@ -745,22 +834,6 @@ class RealSpaceIAExpansion(LikelihoodModule):
             
 
         return c_vec, s8z_i
-
-    def get_cs(self, p_type, i, j=None):
-        if self.no_ia:
-            return []
-
-        if self.z_evolution_model == "maiar":
-            c_vec = [f"{p}_{i}_{j}" for p in self.spectrum_params[p_type]][1]
-
-        elif self.z_evolution_model == "spline":
-            c_vec = [
-                f"{p}_{i}_{n}"
-                for n in range(self.spline_N)
-                for p in self.spectrum_params[p_type][1]
-            ]
-
-        return c_vec
 
     def compute_p_ii_ee(self, state, xs):
         if self.no_ia:

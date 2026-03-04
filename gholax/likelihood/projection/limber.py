@@ -215,7 +215,9 @@ class Limber(LikelihoodModule):
                     elif s.shape[0] == 1:
                         s = jnp.tile(s, (n_i * n_j, 1, 1))
                 else:
-                    if td_ == 0:
+                    if s.shape[0] == 1:
+                        s = jnp.tile(s, (n_i * n_j, 1, 1))
+                    elif td_ == 0:
                         s = jnp.repeat(s, n_j, 0)
                     elif td_ == 1:
                         s = jnp.tile(s, (n_i, 1, 1))                        
