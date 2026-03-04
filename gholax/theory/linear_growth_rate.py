@@ -4,7 +4,21 @@ import jax.numpy as jnp
 
 
 class LinearGrowthRate(LikelihoodModule):
+    """Compute the linear growth rate f(z) = d ln D / d ln a.
+
+    Supports emulator and Boltzmann solver backends.
+    Writes 'f_z' and 'z_pk' to the state.
+    """
+
     def __init__(self, zmin=0.0, zmax=2.0, nz=125, **config):
+        """Initialize the linear growth rate module.
+
+        Args:
+            zmin: Minimum redshift.
+            zmax: Maximum redshift.
+            nz: Number of redshift bins.
+            **config: Additional config (use_emulator, use_boltzmann, emulator_file_name).
+        """
         self.nz = nz
         self.z = jnp.linspace(zmin, zmax, self.nz)
         self.use_emulator = bool(config.get("use_emulator", True))
@@ -44,6 +58,7 @@ class LinearGrowthRate(LikelihoodModule):
             )
 
     def compute_emulator(self, state, params_values):
+        """Compute f(z) using the neural network emulator."""
         cosmo_params = jnp.array(
             [
                 params_values["As"],
@@ -67,6 +82,7 @@ class LinearGrowthRate(LikelihoodModule):
         return state
 
     def compute_boltzmann(self, state, params_values):
+        """Compute f(z) from a CLASS Boltzmann solver result."""
         boltz = state["boltzmann_results"]
         f_z = jnp.array([boltz.scale_independent_growth_factor_f(z) for z in self.z])
         state["f_z"] = f_z[:, 0]
@@ -75,9 +91,11 @@ class LinearGrowthRate(LikelihoodModule):
         return state
 
     def compute_analytic(state, params_values):
+        """Compute f(z) analytically (not implemented)."""
         raise (NotImplementedError("Analytic f(z) calculation not implemented."))
 
     def compute(self, state, params_values):
+        """Compute linear growth rate and write 'f_z', 'z_pk' to state."""
         if self.use_emulator:
             state = self.compute_emulator(state, params_values)
         elif self.use_boltzmann:

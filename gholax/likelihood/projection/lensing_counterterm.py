@@ -13,6 +13,12 @@ from .limber import required_components
 
 
 class LensingCounterterm(LikelihoodModule):
+    """Apply UV-sensitive lensing counterterms to angular power spectra.
+
+    Computes sigma_N_o integrals over the matter power spectrum above
+    a cutoff scale and adds counterterm corrections to C_ell.
+    """
+
     def __init__(
         self,
         observed_data_vector,
@@ -129,6 +135,7 @@ class LensingCounterterm(LikelihoodModule):
             self.output_requirements[o] = list(np.unique(self.output_requirements[o]))
 
     def sigma_N_o(self, state, lk):
+        """Compute sigma_N_o integrals from the matter power spectrum above k_cutoff."""
         k = 10**lk
         if self.integration_method == "gl_quad":
             mask = jnp.ones_like(k)
@@ -228,6 +235,7 @@ class LensingCounterterm(LikelihoodModule):
         return sigma_N_o_final
 
     def w_n(self, w, state):
+        """Compute the n-th order kernel moment W^(n) using analytic chi-z derivatives."""
         def dzn(n):
             return select_n(
                 n,
@@ -261,6 +269,7 @@ class LensingCounterterm(LikelihoodModule):
         return wn.T
 
     def w_n_autodiff(self, w, state):
+        """Compute the n-th order kernel moment W^(n) using JAX autodiff for dz/dchi."""
         w_n = []
         for n in range(1, self.lensing_counterterm_order + 1):
             if n == 1:
@@ -296,6 +305,7 @@ class LensingCounterterm(LikelihoodModule):
         return jnp.array(w_n).T
 
     def compute(self, state, params_values):
+        """Compute lensing counterterms and add them to angular power spectra in state."""
         param_vec = jnp.array(list(params_values.values()))
 
         def f(carry, ell):

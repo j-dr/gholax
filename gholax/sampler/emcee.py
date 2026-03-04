@@ -7,7 +7,17 @@ import numpy as np
 
 
 class Emcee(object):
+    """Affine-invariant ensemble sampler wrapping the emcee library.
+
+    Runs until the effective sample size exceeds target_neff.
+    """
+
     def __init__(self, config):
+        """Initialize the emcee sampler from config.
+
+        Args:
+            config: Full config dict containing 'sampler' -> 'Emcee' section.
+        """
         c = config["sampler"]["Emcee"]
         self.nwalkers = c.get("nwalkers", "3d")
         self.vectorize = c.get("vectorize", True)
@@ -18,6 +28,15 @@ class Emcee(object):
         self.random_start = c.get("random_start", True)
 
     def run(self, model, output_file):
+        """Run the emcee sampler until target effective sample size is reached.
+
+        Args:
+            model: Model instance with log_posterior and prior.
+            output_file: Base path for output HDF5 files.
+
+        Returns:
+            Tuple of (samples array, parameter names list).
+        """
         rng_key = jax.random.key(int(datetime.now().strftime("%Y%m%d%s")))
         param_names = model.prior.params
         prior = model.prior

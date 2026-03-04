@@ -5,7 +5,22 @@ from scipy.special import roots_legendre
 
 
 class ExpansionHistory(LikelihoodModule):
+    """Compute the comoving distance chi(z) and Hubble parameter E(z).
+
+    Supports analytic (Adachi & Kasai), emulator, and Boltzmann solver backends.
+    Writes 'chi_z', 'e_z', and Limber integration grids to the state.
+    """
+
     def __init__(self, zmin=0, zmax=2.0, nz=125, **config):
+        """Initialize the expansion history module.
+
+        Args:
+            zmin: Minimum redshift.
+            zmax: Maximum redshift.
+            nz: Number of redshift bins.
+            **config: Additional configuration (use_emulator, use_boltzmann,
+                integration_method, emulator_file_names).
+        """
         self.z = jnp.linspace(zmin, zmax, nz)
 
         self.use_emulator = bool(config.get("use_emulator", False))
@@ -76,6 +91,14 @@ class ExpansionHistory(LikelihoodModule):
         return Ez
 
     def compute_analytic(self, params_values):
+        """Compute chi(z) and E(z) using the Adachi & Kasai (2012) approximation.
+
+        Args:
+            params_values: Dict with keys 'H0', 'omch2', 'ombh2', 'mnu'.
+
+        Returns:
+            Tuple of (chi_z, e_z, omegam).
+        """
         h = params_values["H0"] / 100
         omega_nu = params_values["mnu"] / 93.14
         omegam = (params_values["omch2"] + params_values["ombh2"] + omega_nu) / h**2
@@ -86,6 +109,14 @@ class ExpansionHistory(LikelihoodModule):
         return chi_z, e_z, omegam
 
     def compute_emulator(self, params_values):
+        """Compute chi(z) and E(z) using neural network emulators.
+
+        Args:
+            params_values: Dict with cosmological parameter values.
+
+        Returns:
+            Tuple of (chi_z, e_z).
+        """
         cosmo_params = jnp.array(
             [
                 params_values["As"] * 10**9,
@@ -108,6 +139,15 @@ class ExpansionHistory(LikelihoodModule):
         return chi_z, e_z
 
     def compute_boltzmann(self, params_values, state):
+        """Compute chi(z) and E(z) from a CLASS Boltzmann solver result.
+
+        Args:
+            params_values: Dict with 'H0'.
+            state: State dict containing 'boltzmann_results'.
+
+        Returns:
+            Tuple of (chi_z, e_z).
+        """
         speed_of_light = 2.99792458e5
         boltz = state["boltzmann_results"]
         h = params_values["H0"] / 100
@@ -117,6 +157,18 @@ class ExpansionHistory(LikelihoodModule):
         return chi_z[:, 0], e_z[:, 0]
 
     def compute(self, state, params_values):
+        """Compute expansion history and write to state.
+
+        Writes 'chi_z', 'e_z', and Limber integration grids
+        ('chi_z_limber', 'z_limber', 'e_z_limber') to the state.
+
+        Args:
+            state: Pipeline state dict.
+            params_values: Dict of parameter values.
+
+        Returns:
+            Updated state dict.
+        """
         if self.use_emulator:
             chi_z, e_z = self.compute_emulator(params_values)
         elif self.use_boltzmann:

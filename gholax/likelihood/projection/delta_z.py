@@ -7,6 +7,12 @@ import numpy as np
 
 
 class DeltaZ(LikelihoodModule):
+    """Apply photo-z shift systematics to redshift distributions.
+
+    Shifts n(z) by a per-bin delta_z parameter and writes the shifted
+    distributions to state.
+    """
+
     def __init__(
         self,
         observed_data_vector,
@@ -56,6 +62,7 @@ class DeltaZ(LikelihoodModule):
             )[:, None]
 
     def compute(self, state, params_values):
+        """Apply delta_z shifts to n(z) and write shifted distributions to state."""
         if self.do_shift:
             param_vec = jnp.array(list(params_values.values()))
             nz = getattr(self.observed_data_vector, self.nz_name)

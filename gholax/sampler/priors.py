@@ -7,7 +7,20 @@ import scipy.stats
 
 
 class Prior(object):
+    """Manage parameter priors, reference values, and proposal distributions.
+
+    Supports uniform and normal prior distributions, parameter normalization,
+    and initial position generation for samplers.
+    """
+
     def __init__(self, config, derived_params=[], fixed_params=[]):
+        """Initialize priors from parameter configuration.
+
+        Args:
+            config: Dict mapping parameter names to their config (must include 'prior' key).
+            derived_params: List of derived parameter names.
+            fixed_params: List of fixed parameter names.
+        """
         self.prior_info = {}
         for p in config:
             self.prior_info[p] = config[p]["prior"]
@@ -25,13 +38,16 @@ class Prior(object):
         self.get_reference_values()
 
     def uniform(self, x, x_l, x_r, L=10):
+        """Compute log-probability of a smooth uniform prior using error functions."""
         delta = (x_r - x_l)
         return jnp.log(0.5 * (jax.lax.erf(L * (x - x_l)/delta) - jax.lax.erf(L * (x - x_r)/delta)))
 
     def normal(self, x, x_mean, sigma_x):
+        """Compute log-probability of a normal prior."""
         return -((x - x_mean) ** 2) / (2 * sigma_x**2)
 
     def log_prior(self, params_values):
+        """Compute the total log-prior for all parameters."""
         logp = 0
         for p in params_values:
             pi = self.prior_info[p]
@@ -46,6 +62,16 @@ class Prior(object):
         return logp
 
     def initial_position(self, random_start=True, key=None, normalize=False):
+        """Generate an initial parameter position for a sampler chain.
+
+        Args:
+            random_start: If True, draw from the prior/proposal. If False, use reference.
+            key: JAX random key (generated from timestamp if None).
+            normalize: If True, return position in normalized parameter space.
+
+        Returns:
+            Dict mapping parameter names to initial values.
+        """
         init = {}
         if random_start & (key is None):
             key = jax.random.key(int(datetime.now().strftime("%Y%m%d%s")))
@@ -97,6 +123,7 @@ class Prior(object):
         return init
 
     def get_reference_point(self):
+        """Get reference parameter values, falling back to prior means."""
         ref = {}
         for p in self.prior_info:
             pi = self.prior_info[p]
@@ -119,11 +146,13 @@ class Prior(object):
         return ref
 
     def get_reference_values(self):
+        """Get reference values as a JAX array and cache the result."""
         self.reference_values = jnp.array(list(self.get_reference_point().values()))
 
         return self.reference_values
 
     def get_proposal_sigmas(self):
+        """Get proposal widths from proposal/prior config."""
         proposal_std = []
         for p in self.prior_info:
             pi = self.prior_info[p]
@@ -138,6 +167,7 @@ class Prior(object):
         return self.proposal_sigmas
 
     def get_prior_sigmas(self):
+        """Get prior widths (range for uniform, scale for normal)."""
         proposal_std = []
         for p in self.prior_info:
             pi = self.prior_info[p]
@@ -149,6 +179,7 @@ class Prior(object):
         return self.prior_sigmas
 
     def get_minimizer_bounds(self, n_sigma=3):
+        """Get parameter bounds for optimization (min/max for uniform, n_sigma for normal)."""
         bounds = []
         for p in self.prior_info:
             pi = self.prior_info[p]
@@ -168,6 +199,7 @@ class Prior(object):
         return bounds
 
     def get_pocomc_prior(self):
+        """Get scipy prior distributions for use with pocoMC sampler."""
         prior_dist = []
         for p in self.prior_info:
             pi = self.prior_info[p]

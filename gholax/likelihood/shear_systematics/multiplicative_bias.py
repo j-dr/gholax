@@ -5,7 +5,20 @@ import numpy as np
 
 
 class ShearMultiplicativeBias(LikelihoodModule):
+    """Apply shear multiplicative bias correction (1+m) to angular power spectra.
+
+    Multiplies C_ell by (1+m_i)(1+m_j) for each bin pair involving shear fields.
+    """
+
     def __init__(self, observed_data_vector, spectrum_types, spectrum_info, **config):
+        """Initialize the multiplicative bias module.
+
+        Args:
+            observed_data_vector: DataVector instance.
+            spectrum_types: List of spectrum type strings.
+            spectrum_info: Dict of spectrum configuration info.
+            **config: Additional config (cl_tag).
+        """
         self.observed_data_vector = observed_data_vector
         self.spectrum_types = spectrum_types
         self.spectrum_info = spectrum_info
@@ -38,6 +51,7 @@ class ShearMultiplicativeBias(LikelihoodModule):
             self.indexed_params[k] = np.array(self.indexed_params[k])[:, None]
 
     def compute(self, state, params_values):
+        """Apply multiplicative bias to C_ell for all spectrum types."""
         param_vec = jnp.array(list(params_values.values()))
 
         for t in self.spectrum_types:

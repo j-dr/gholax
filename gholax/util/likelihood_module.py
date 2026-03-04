@@ -6,6 +6,12 @@ import abc
 
 
 class LikelihoodModule(object):
+    """Abstract base class for pipeline modules in a GaussianLikelihood.
+
+    Each module reads from and writes to a shared state dict, declaring its
+    output_requirements so the dependency graph can be resolved at init time.
+    """
+
     def __init__(self):
         """
         Initialize module. Set what inputs are required for each output,
@@ -16,6 +22,15 @@ class LikelihoodModule(object):
         pass
 
     def get_dependencies(self, state_dependencies):
+        """Resolve transitive parameter dependencies for this module.
+
+        Recursively expands state-level dependencies into leaf-level parameter
+        names, updating output_requirements and populating required_params.
+
+        Args:
+            state_dependencies: Dict mapping state keys to their required
+                parameters/state keys.
+        """
         self.original_requirements = copy(self.output_requirements)
 
         def get_dependencies_recurse(state_dependencies, requirements):
@@ -63,6 +78,14 @@ class LikelihoodModule(object):
         return jnp.any(params != last_params)
 
     def get_required_inputs(self, state):
+        """Extract the required input values from the state dict.
+
+        Args:
+            state: Pipeline state dict.
+
+        Returns:
+            Dict of required input key-value pairs.
+        """
         requirements = {r: state[r] for r in self.required_inputs}
 
         return requirements

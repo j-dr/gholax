@@ -88,6 +88,19 @@ def load_samples_checkpoint_nuts(output_file, model, likelihood_name, s8_module_
     return gds, params_bf_chain, reference, names, opt
 
 def load_samples_emcee(output_file, model, likelihood_name, s8_module_index=1, smooth_scale=-1, burn_in_frac=0.33):
+    """Load samples from an emcee checkpoint and return a GetDist MCSamples object.
+
+    Args:
+        output_file: Base name of the output files (without extensions).
+        model: Model object containing prior and likelihood information.
+        likelihood_name: Name of the likelihood in model.likelihoods.
+        s8_module_index: Index of the pipeline module that computes sigma8.
+        smooth_scale: Smoothing scale for GetDist plots.
+        burn_in_frac: Fraction of samples to discard as burn-in.
+
+    Returns:
+        Tuple of (MCSamples, reference_values, param_names, reference_point_dict).
+    """
     sampler_data = h5.File(f'{output_file}.0.samples.h5', 'r')
 
     nwalkers = sampler_data['mcmc/chain'].shape[1]
@@ -125,7 +138,22 @@ def load_samples_emcee(output_file, model, likelihood_name, s8_module_index=1, s
     
 
 def load_samples_from_checkpoint(output_file, model, likelihood_name, sampler, s8_module_index=1, burn_in_frac=0, ignore_chains=[], smooth_scale=-1, new_param_order=True):
-    
+    """Load MCMC samples from a checkpoint file, dispatching by sampler type.
+
+    Args:
+        output_file: Base name of the output files (without extensions).
+        model: Model object containing prior and likelihood information.
+        likelihood_name: Name of the likelihood in model.likelihoods.
+        sampler: Sampler type string ('NUTS' or 'emcee').
+        s8_module_index: Index of the pipeline module that computes sigma8.
+        burn_in_frac: Fraction of samples to discard as burn-in.
+        ignore_chains: List of chain indices to ignore.
+        smooth_scale: Smoothing scale for GetDist plots.
+        new_param_order: Unused, kept for backwards compatibility.
+
+    Returns:
+        Result from the sampler-specific loader (varies by sampler type).
+    """
     if sampler == 'NUTS':
         return load_samples_checkpoint_nuts(output_file, model, likelihood_name, s8_module_index=s8_module_index, burn_in_frac=burn_in_frac, ignore_chains=ignore_chains, smooth_scale=smooth_scale)
     elif sampler == 'emcee':

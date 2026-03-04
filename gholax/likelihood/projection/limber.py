@@ -50,6 +50,12 @@ spec_enum = {
 
 
 class Limber(LikelihoodModule):
+    """Compute angular power spectra C_ell via the Limber approximation.
+
+    Integrates products of projection kernels and 3D power spectra over
+    comoving distance to produce C_ell for each spectrum type.
+    """
+
     def __init__(
         self,
         observed_data_vector,
@@ -149,6 +155,7 @@ class Limber(LikelihoodModule):
 
 
     def compute_c_l(self, state, spec_type):
+        """Compute C_ell for a given spectrum type via Limber integration."""
         chi_z_proj = state["chi_z_limber"]
         k = (self.ell[:, np.newaxis] + 0.5) / chi_z_proj[None, :]
         log_kval = jnp.log10((k))
@@ -273,6 +280,7 @@ class Limber(LikelihoodModule):
         return state
 
     def compute(self, state, params_values):
+        """Compute angular power spectra for all spectrum types and write to state."""
         if self.non_parametric_growth:
             param_vec = jnp.array(list(params_values.values()))
             a_growth_chi = spline_func_vec(

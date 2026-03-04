@@ -6,6 +6,12 @@ import jax.numpy as jnp
 
 
 class RedshiftSpaceMultipolePowerSpectrumWindow(LikelihoodModule):
+    """Convolve theory P_ell(k) with survey window functions.
+
+    Applies the survey window matrix to theory multipoles to produce
+    observed bandpowers, accounting for wide-angle effects.
+    """
+
     def __init__(
         self,
         observed_data_vector,
@@ -84,6 +90,7 @@ class RedshiftSpaceMultipolePowerSpectrumWindow(LikelihoodModule):
         self.W = W_t
 
     def compute(self, state, params_values):
+        """Convolve theory P_ell(k) with window matrices and write to state."""
         for t in self.spectrum_types:
 
             def f(carry, p_l):

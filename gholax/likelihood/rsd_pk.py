@@ -17,7 +17,14 @@ from jax.lax import scan
 
 
 class RSDPK(GaussianLikelihood):
+    """Redshift-space distortion power spectrum multipole likelihood.
+
+    Assembles a pipeline of theory modules to predict P_ell(k) multipoles
+    and compare against observed data.
+    """
+
     def __init__(self, config):
+        """Initialize the RSD power spectrum likelihood from config."""
         c = config["likelihood"]["RSDPK"]
 
         self.zmin_proj = c.get("zmin_proj", 0.0001)
@@ -133,6 +140,7 @@ class RSDPK(GaussianLikelihood):
             self.all_spectra[t] = jnp.array(self.all_spectra[t])
 
     def get_model_from_state(self, state):
+        """Extract the windowed model vector from the pipeline state."""
         dv = self.observed_data_vector
         model = []
         for t in dv.spectrum_types:
@@ -145,6 +153,7 @@ class RSDPK(GaussianLikelihood):
         return model
 
     def get_model_from_state_no_window(self, state):
+        """Extract the pre-window theory P_ell(k) predictions from the state."""
         self.k_no_window = jnp.linspace(0, 0.6, 600)
         window_module = self.likelihood_pipeline[-1]
         k_theory = window_module.k

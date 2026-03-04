@@ -11,7 +11,12 @@ os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"]=".25"
 #jax.config.update("jax_log_compiles", True)
 
 def main():
+    """CLI entry point for running gholax inference.
 
+    Reads a YAML config from sys.argv[1], optionally restarts from
+    checkpoint (sys.argv[2]), instantiates the model and sampler,
+    runs the sampler, and saves the resulting chain to text files.
+    """
     with open(sys.argv[1], 'r') as fp:
         cfg = yaml.load(fp, Loader=yaml.SafeLoader)
         

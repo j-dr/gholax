@@ -8,6 +8,12 @@ from ...util.likelihood_module import LikelihoodModule
 
 
 class SmailOutlier(LikelihoodModule):
+    """Photo-z model with Smail-type n(z) and outlier distributions.
+
+    Convolves a Smail distribution with per-bin photo-z shifts and scatter,
+    mixing in an outlier population. Writes shifted n(z) to state.
+    """
+
     def __init__(
         self,
         observed_data_vector,
@@ -96,6 +102,7 @@ class SmailOutlier(LikelihoodModule):
             
 
     def compute(self, state, params_values):
+        """Compute Smail+outlier n(z) for each bin and write to state."""
         param_vec = jnp.array(list(params_values.values()))
         pz_params = param_vec[self.param_indices]
         pz_params = pz_params.at[:,1].set(jnp.where(pz_params[:,1] == 0, 1e-4, pz_params[:,1]))

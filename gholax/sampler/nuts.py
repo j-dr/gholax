@@ -11,7 +11,18 @@ from blackjax.diagnostics import potential_scale_reduction
 
 
 class NUTS(object):
+    """No-U-Turn Sampler using blackjax.
+
+    Wraps blackjax's NUTS sampler with window adaptation warmup, convergence
+    checking via R-hat, parallel chains via jax.pmap, and checkpoint restart.
+    """
+
     def __init__(self, config):
+        """Initialize NUTS sampler from config.
+
+        Args:
+            config: Full config dict containing 'sampler' -> 'NUTS' section.
+        """
         c = config["sampler"]["NUTS"]
 
         self.n_steps_warmup = c.get("n_steps_warmup", 500)
@@ -28,6 +39,18 @@ class NUTS(object):
         self.parallel_warmup = c.get("parallel_warmup", False)
 
     def run(self, model, output_file):
+        """Run the NUTS sampler until convergence.
+
+        Performs warmup adaptation, then iteratively runs inference until
+        R-hat converges below target_r_minus_one.
+
+        Args:
+            model: Model instance with log_posterior_scaled_params and prior.
+            output_file: Base path for output files.
+
+        Returns:
+            Tuple of (samples array, parameter names list).
+        """
         rng_key = jax.random.key(int(datetime.now().strftime("%Y%m%d%s")))
         param_names = model.prior.params
         prior = model.prior

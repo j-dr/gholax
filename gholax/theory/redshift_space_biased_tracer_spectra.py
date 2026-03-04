@@ -14,6 +14,13 @@ except:
 
 
 class RedshiftSpaceBiasedTracerSpectra(LikelihoodModule):
+    """Compute redshift-space biased tracer P_ij(k,ell) basis spectra.
+
+    Supports emulator and analytic (velocileptors LPT_RSD) backends.
+    Applies Alcock-Paczynski corrections. Writes
+    'p_ij_ell_redshift_space_bias_grid' to state.
+    """
+
     def __init__(
         self,
         zeff,
@@ -27,6 +34,21 @@ class RedshiftSpaceBiasedTracerSpectra(LikelihoodModule):
         nk=200,
         **config,
     ):
+        """Initialize the redshift-space biased tracer spectra module.
+
+        Args:
+            zeff: Array of effective redshifts for the tracer samples.
+            hz_fid: Fiducial H(z) values at zeff (for AP correction).
+            chiz_fid: Fiducial chi(z) values at zeff (for AP correction).
+            zmin: Minimum redshift for the basis grid.
+            zmax: Maximum redshift for the basis grid.
+            nz: Number of redshift bins.
+            kmin: Minimum wavenumber in h/Mpc.
+            kmax: Maximum wavenumber in h/Mpc.
+            nk: Number of wavenumber bins.
+            **config: Additional config (use_emulator, emulator_file_names,
+                save_noap_spectra, kIR, interpolation_order).
+        """
         self.nk = nk
         self.k = np.logspace(np.log10(kmin), np.log10(kmax), nk)
         self.logk = np.linspace(np.log10(kmin), np.log10(kmax), nk)
@@ -108,6 +130,11 @@ class RedshiftSpaceBiasedTracerSpectra(LikelihoodModule):
         self.interpolation_order = config.get("interpolation_order", "cubic")
 
     def apply_ap(self, state):
+        """Apply Alcock-Paczynski corrections to the no-AP basis spectra.
+
+        Transforms pre-AP multipole spectra through the AP distortion using
+        Gauss-Legendre quadrature and 2D interpolation.
+        """
         h_z = state["e_z_limber"]
         chi_z = state["chi_z_limber"]
         h_z_eff = jnp.interp(self.zeff, state["z_limber"], h_z)
@@ -202,6 +229,7 @@ class RedshiftSpaceBiasedTracerSpectra(LikelihoodModule):
         return state
 
     def compute_emulator(self, state, params_values):
+        """Compute redshift-space P_ij(k,ell) using emulators and apply AP corrections."""
         cosmo_params = jnp.array(
             [params_values[p] for p in self.input_param_order[:-1]]
         )
@@ -243,6 +271,7 @@ class RedshiftSpaceBiasedTracerSpectra(LikelihoodModule):
         return state
 
     def compute_analytic(self, state, params_values):
+        """Compute redshift-space P_ij(k,ell) using velocileptors LPT_RSD."""
         h_z = state["e_z_limber"]
         chi_z = state["chi_z_limber"]
         f_z = state["f_z"]
@@ -409,6 +438,7 @@ class RedshiftSpaceBiasedTracerSpectra(LikelihoodModule):
         return state
 
     def compute(self, state, params_values):
+        """Compute redshift-space basis spectra and write to state."""
         if self.use_emulator:
             state = self.compute_emulator(state, params_values)
         else:
@@ -551,6 +581,7 @@ class RedshiftSpaceBiasExpansion(LikelihoodModule):
             self.indexed_params["p_gg_ell"] = np.array(self.indexed_params["p_gg_ell"])
 
     def compute_p_gg_ell(self, state, bias_params, p_ij, s8, f, aap):
+        """Compute galaxy-galaxy redshift-space multipole power spectra."""
         if not self.scale_by_s8z:
             s8 = 1
         
@@ -572,6 +603,7 @@ class RedshiftSpaceBiasExpansion(LikelihoodModule):
         return p
 
     def compute_cross_p_gg_ell(self, state, bias_params, p_ij, s8, f):
+        """Compute galaxy-galaxy cross redshift-space multipole power spectra."""
         if not self.scale_by_s8z:
             s8 = 1
 
@@ -588,6 +620,7 @@ class RedshiftSpaceBiasExpansion(LikelihoodModule):
         return p
 
     def compute(self, state, params_values):
+        """Compute all required redshift-space spectra and write to state."""
         param_vec = jnp.array(list(params_values.values()))
 
         for s in self.all_spectra:
