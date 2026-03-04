@@ -754,18 +754,20 @@ class TwoPointSpectrum(DataVector):
                 offset += n
         return d
 
-    def plot_spectra_vs_model(self, model_pred):
-        """Plot measured spectra vs model predictions for every spectrum type.
+    def plot_spectra_vs_model(self, model_pred=None):
+        """Plot measured spectra, optionally compared to model predictions.
 
-        One figure is created per spectrum type.  Each figure has a grid of
-        (data panel, residual panel) column pairs — one column per bin pair.
+        One figure is created per spectrum type.  When *model_pred* is given,
+        each figure has a grid of (data panel, residual panel) column pairs.
+        When *model_pred* is ``None``, only the data panels are shown.
         Regions excluded by scale cuts are shaded.
 
         Parameters
         ----------
-        model_pred : array_like
+        model_pred : array_like, optional
             Full (unmasked) model prediction in the same ordering as
-            ``self.spectra`` (i.e. ``apply_scale_mask=False``).
+            ``self.spectra`` (i.e. ``apply_scale_mask=False``).  If ``None``,
+            only the measurements are plotted.
 
         Returns
         -------
@@ -783,7 +785,9 @@ class TwoPointSpectrum(DataVector):
             'c_cmbkcmbk': r'$\ell\,C_\ell^{\kappa_{\rm CMB} \kappa_{\rm CMB}}$',
         }
 
-        model_pred = np.asarray(model_pred)
+        has_model = model_pred is not None
+        if has_model:
+            model_pred = np.asarray(model_pred)
         figs = {}
 
         for t in self.spectrum_types:
@@ -793,18 +797,28 @@ class TwoPointSpectrum(DataVector):
             n_cols = max(1, int(np.ceil(np.sqrt(n_pairs))))
             n_rows = max(1, int(np.ceil(n_pairs / n_cols)))
 
-            fig, axes = plt.subplots(
-                2 * n_rows, n_cols,
-                sharex=True,
-                gridspec_kw={'height_ratios': [3, 1] * n_rows},
-                squeeze=False,
-            )
+            if has_model:
+                fig, axes = plt.subplots(
+                    2 * n_rows, n_cols,
+                    sharex=True,
+                    gridspec_kw={'height_ratios': [3, 1] * n_rows},
+                    squeeze=False,
+                )
+            else:
+                fig, axes = plt.subplots(
+                    n_rows, n_cols,
+                    sharex=True,
+                    squeeze=False,
+                )
 
             for pair_idx, (b0, b1) in enumerate(bin_pairs):
                 row = pair_idx // n_cols
                 col = pair_idx % n_cols
-                ax_main = axes[2 * row, col]
-                ax_res  = axes[2 * row + 1, col]
+                if has_model:
+                    ax_main = axes[2 * row, col]
+                    ax_res  = axes[2 * row + 1, col]
+                else:
+                    ax_main = axes[row, col]
 
                 idx = np.where(
                     (self.spectra["spectrum_type"] == t.encode('utf-8'))
@@ -813,7 +827,6 @@ class TwoPointSpectrum(DataVector):
                 )[0]
 
                 data  = self.spectra["value"][idx]
-                model = model_pred[idx]
 
                 if hasattr(self, 'cov') and self.cov is not None:
                     idxx, idxy = np.meshgrid(idx, idx, indexing='ij')
@@ -823,10 +836,13 @@ class TwoPointSpectrum(DataVector):
 
                 ax_main.errorbar(sep, sep * data, sep * err,
                                  color='k', ls='', marker='o', ms=3, capsize=3)
-                ax_main.plot(sep, sep * model, color='k')
-                ax_res.plot(sep, (data - model) / err,
-                            color='k', ls='', marker='o', ms=3)
-                ax_res.axhline(0, color='k', lw=0.8)
+
+                if has_model:
+                    model = model_pred[idx]
+                    ax_main.plot(sep, sep * model, color='k')
+                    ax_res.plot(sep, (data - model) / err,
+                                color='k', ls='', marker='o', ms=3)
+                    ax_res.axhline(0, color='k', lw=0.8)
 
                 # shade excluded scale ranges
                 has_cuts = (self.scale_cuts is not None
@@ -835,7 +851,8 @@ class TwoPointSpectrum(DataVector):
                 if has_cuts:
                     ell_min, ell_max = self.scale_cuts[t][f'{b0}_{b1}']
                     x_max_plot = ell_max * 1.5
-                    for ax in (ax_main, ax_res):
+                    shade_axes = [ax_main, ax_res] if has_model else [ax_main]
+                    for ax in shade_axes:
                         ax.axvspan(sep[0] * 0.5, ell_min,
                                    color='k', alpha=0.15, linewidth=0)
                         ax.axvspan(ell_max, x_max_plot * 2,
@@ -845,20 +862,31 @@ class TwoPointSpectrum(DataVector):
                 ax_main.set_xscale('log')
                 ax_main.set_yscale('log')
                 ax_main.set_title(f'({b0}, {b1})', fontsize=9)
-                ax_res.set_ylim(-4, 4)
 
-                if row == n_rows - 1:
-                    ax_res.set_xlabel(r'$\ell$')
+                if has_model:
+                    ax_res.set_ylim(-4, 4)
+
+                bottom_row = row == n_rows - 1
+                if has_model:
+                    if bottom_row:
+                        ax_res.set_xlabel(r'$\ell$')
+                else:
+                    if bottom_row:
+                        ax_main.set_xlabel(r'$\ell$')
                 if col == 0:
                     ax_main.set_ylabel(_YLABEL.get(t, rf'$\ell\,C_\ell$ [{t}]'))
-                    ax_res.set_ylabel(r'$(d-m)/\sigma$')
+                    if has_model:
+                        ax_res.set_ylabel(r'$(d-m)/\sigma$')
 
             # hide unused subplots
             for pair_idx in range(n_pairs, n_rows * n_cols):
                 row = pair_idx // n_cols
                 col = pair_idx % n_cols
-                axes[2 * row, col].axis('off')
-                axes[2 * row + 1, col].axis('off')
+                if has_model:
+                    axes[2 * row, col].axis('off')
+                    axes[2 * row + 1, col].axis('off')
+                else:
+                    axes[row, col].axis('off')
 
             fig.suptitle(_YLABEL.get(t, t).replace(r'\ell\,', ''), y=1.01)
             fig.set_size_inches(4 * n_cols, 5 * n_rows)

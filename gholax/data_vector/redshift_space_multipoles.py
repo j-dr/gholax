@@ -694,20 +694,22 @@ class RedshiftSpaceMultipoles(DataVector):
 
         return cov
 
-    def plot_spectra_vs_model(self, model_pred):
-        """Plot measured spectra vs model predictions for every spectrum type.
+    def plot_spectra_vs_model(self, model_pred=None):
+        """Plot measured spectra, optionally compared to model predictions.
 
-        One figure is created per spectrum type.  Each figure has a grid of
-        (data panel, residual panel) pairs — one column per bin pair.
+        One figure is created per spectrum type.  When *model_pred* is given,
+        each figure has a grid of (data panel, residual panel) pairs.
+        When *model_pred* is ``None``, only the data panels are shown.
         Different multipole orders (ell = 0, 2, 4, …) are overlaid in each
         panel with distinct colours.  Regions excluded by scale cuts are shaded
         using the cuts for the first multipole order.
 
         Parameters
         ----------
-        model_pred : array_like
+        model_pred : array_like, optional
             Full (unmasked) model prediction in the same ordering as
-            ``self.spectra`` (i.e. ``apply_scale_mask=False``).
+            ``self.spectra`` (i.e. ``apply_scale_mask=False``).  If ``None``,
+            only the measurements are plotted.
 
         Returns
         -------
@@ -716,7 +718,9 @@ class RedshiftSpaceMultipoles(DataVector):
         """
         import matplotlib.pyplot as plt
 
-        model_pred = np.asarray(model_pred)
+        has_model = model_pred is not None
+        if has_model:
+            model_pred = np.asarray(model_pred)
         figs = {}
 
         for t in self.spectrum_types:
@@ -726,18 +730,28 @@ class RedshiftSpaceMultipoles(DataVector):
             n_cols = max(1, int(np.ceil(np.sqrt(n_pairs))))
             n_rows = max(1, int(np.ceil(n_pairs / n_cols)))
 
-            fig, axes = plt.subplots(
-                2 * n_rows, n_cols,
-                sharex=True,
-                gridspec_kw={'height_ratios': [3, 1] * n_rows},
-                squeeze=False,
-            )
+            if has_model:
+                fig, axes = plt.subplots(
+                    2 * n_rows, n_cols,
+                    sharex=True,
+                    gridspec_kw={'height_ratios': [3, 1] * n_rows},
+                    squeeze=False,
+                )
+            else:
+                fig, axes = plt.subplots(
+                    n_rows, n_cols,
+                    sharex=True,
+                    squeeze=False,
+                )
 
             for pair_idx, (b0, b1) in enumerate(bin_pairs):
                 row = pair_idx // n_cols
                 col = pair_idx % n_cols
-                ax_main = axes[2 * row, col]
-                ax_res  = axes[2 * row + 1, col]
+                if has_model:
+                    ax_main = axes[2 * row, col]
+                    ax_res  = axes[2 * row + 1, col]
+                else:
+                    ax_main = axes[row, col]
 
                 for ell_idx, ell in enumerate(self.ells):
                     idx = np.where(
@@ -748,7 +762,6 @@ class RedshiftSpaceMultipoles(DataVector):
                     )[0]
 
                     data  = self.spectra["value"][idx]
-                    model = model_pred[idx]
 
                     if hasattr(self, 'cov') and self.cov is not None:
                         idxx, idxy = np.meshgrid(idx, idx, indexing='ij')
@@ -760,11 +773,15 @@ class RedshiftSpaceMultipoles(DataVector):
                     ax_main.errorbar(sep, sep * data, sep * err,
                                      color=color, ls='', marker='o', ms=3,
                                      capsize=3, label=rf'$\ell={ell}$')
-                    ax_main.plot(sep, sep * model, color=color)
-                    ax_res.plot(sep, (data - model) / err,
-                                color=color, ls='', marker='o', ms=3)
 
-                ax_res.axhline(0, color='k', lw=0.8)
+                    if has_model:
+                        model = model_pred[idx]
+                        ax_main.plot(sep, sep * model, color=color)
+                        ax_res.plot(sep, (data - model) / err,
+                                    color=color, ls='', marker='o', ms=3)
+
+                if has_model:
+                    ax_res.axhline(0, color='k', lw=0.8)
 
                 # shade excluded scale ranges using the first multipole's cuts
                 first_ell = self.ells[0]
@@ -775,7 +792,8 @@ class RedshiftSpaceMultipoles(DataVector):
                 if has_cuts:
                     k_min, k_max = self.scale_cuts[t][cut_key]
                     x_max_plot = k_max * 1.5
-                    for ax in (ax_main, ax_res):
+                    shade_axes = [ax_main, ax_res] if has_model else [ax_main]
+                    for ax in shade_axes:
                         ax.axvspan(0, k_min,
                                    color='k', alpha=0.15, linewidth=0)
                         ax.axvspan(k_max, x_max_plot * 2,
@@ -783,13 +801,21 @@ class RedshiftSpaceMultipoles(DataVector):
                     ax_main.set_xlim(0, x_max_plot)
 
                 ax_main.set_title(f'({b0}, {b1})', fontsize=9)
-                ax_res.set_ylim(-4, 4)
 
-                if row == n_rows - 1:
-                    ax_res.set_xlabel(r'$k\,[h\,\mathrm{Mpc}^{-1}]$')
+                if has_model:
+                    ax_res.set_ylim(-4, 4)
+
+                bottom_row = row == n_rows - 1
+                if has_model:
+                    if bottom_row:
+                        ax_res.set_xlabel(r'$k\,[h\,\mathrm{Mpc}^{-1}]$')
+                else:
+                    if bottom_row:
+                        ax_main.set_xlabel(r'$k\,[h\,\mathrm{Mpc}^{-1}]$')
                 if col == 0:
                     ax_main.set_ylabel(r'$k\,P_\ell(k)$')
-                    ax_res.set_ylabel(r'$(d-m)/\sigma$')
+                    if has_model:
+                        ax_res.set_ylabel(r'$(d-m)/\sigma$')
                 if pair_idx == 0:
                     ax_main.legend(fontsize=7)
 
@@ -797,8 +823,11 @@ class RedshiftSpaceMultipoles(DataVector):
             for pair_idx in range(n_pairs, n_rows * n_cols):
                 row = pair_idx // n_cols
                 col = pair_idx % n_cols
-                axes[2 * row, col].axis('off')
-                axes[2 * row + 1, col].axis('off')
+                if has_model:
+                    axes[2 * row, col].axis('off')
+                    axes[2 * row + 1, col].axis('off')
+                else:
+                    axes[row, col].axis('off')
 
             fig.set_size_inches(4 * n_cols, 5 * n_rows)
             fig.tight_layout()
