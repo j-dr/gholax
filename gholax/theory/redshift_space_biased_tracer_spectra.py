@@ -557,7 +557,7 @@ class RedshiftSpaceBiasExpansion(LikelihoodModule):
         # set up params for indexing
         self.indexed_params = {}
         self.indexed_params["p_gg_ell"] = []
-        for i in range(self.observed_data_vector.nz_d.shape[0]):
+        for i in range(self.observed_data_vector.n_dbins): #nz_d.shape[0]):
             if (
                 i in self.dbins
             ):  # self.observed_data_vector.spectrum_info[spec_type]["bins0"]:

@@ -13,7 +13,7 @@ covariance_field_types = {
 
 
 datavector_requires = {
-    "p_gg_ell": ["z_fid", "chiz_fid", "hz_fid", "nz_d"],
+    "p_gg_ell": ["z_fid", "chiz_fid", "hz_fid"],
 }
 
 field_types = {
@@ -309,6 +309,8 @@ class RedshiftSpaceMultipoles(DataVector):
             spectra = self.data_vector_info['spectra'][:]
         else:
             spectra = self.generate_data()
+            
+        self.n_dbins = len(np.unique(spectra["zbin0"]))  # assumes same bins for zbin0 and zbin1
 
         self.process_spectrum_info(spectra)
 
@@ -320,25 +322,25 @@ class RedshiftSpaceMultipoles(DataVector):
             for r in requirements:
                 if r in ["z_fid", "chiz_fid", "hz_fid"]:
                     self.spectrum_info[t][r] = jnp.array(self.data_vector_info[r][:])
-                elif "nz" in r:
-                    nz_ = self.data_vector_info[r][:]
-
-                    nbins = nz_.shape[1] - 1
-                    nz = jnp.zeros((nbins, len(self.z)))
-
-                    for i in range(nbins):
-                        idx = nz_[:, i + 1] > 0
-                        nz = nz.at[i, :].set(
-                            RegularGridInterpolator(
-                                [(nz_[idx, 0])],
-                                np.atleast_2d(nz_[idx, i + 1]).T,
-                                fill_value=0,
-                            )(self.z)[:, 0]
-                        )
-
-                    nz = nz / trapezoid(nz, x=self.z, axis=-1)[:, None]
-                    self.spectrum_info[t][r] = nz
-                    setattr(self, r, nz)
+#                elif "nz" in r:
+#                    nz_ = self.data_vector_info[r][:]
+#
+#                    nbins = nz_.shape[1] - 1
+#                    nz = jnp.zeros((nbins, len(self.z)))
+#
+#                    for i in range(nbins):
+#                        idx = nz_[:, i + 1] > 0
+#                        nz = nz.at[i, :].set(
+#                            RegularGridInterpolator(
+#                                [(nz_[idx, 0])],
+#                                np.atleast_2d(nz_[idx, i + 1]).T,
+#                                fill_value=0,
+#                            )(self.z)[:, 0]
+#                        )
+#
+#                    nz = nz / trapezoid(nz, x=self.z, axis=-1)[:, None]
+#                    self.spectrum_info[t][r] = nz
+#                    setattr(self, r, nz)
 
         if ("pkell_windows" in self.data_vector_info.keys()) & (
             not self.generate_data_vector
