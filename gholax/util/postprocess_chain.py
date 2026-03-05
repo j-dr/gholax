@@ -137,6 +137,151 @@ def load_samples_emcee(output_file, model, likelihood_name, s8_module_index=1, s
     return gds, reference, names, params
     
 
+def spot_check_emulator(
+    chain_file,
+    config_file,
+    model,
+    likelihood_name,
+    sampler,
+    n_samples=20,
+    seed=42,
+    burn_in_frac=0.3,
+    ignore_chains=[],
+    state_keys=None,
+):
+    """Spot-check emulator accuracy against exact calculations for a subsample of chain points.
+
+    Reads a NUTS or emcee chain, randomly selects n_samples points, then evaluates
+    both the emulator-based model and a freshly instantiated exact model (with
+    use_emulator=False and use_boltzmann=True) at each point and returns the comparison.
+
+    Args:
+        chain_file: Base path for chain output files (without extensions).
+        config_file: Path to the YAML config file used to run the chain.
+        model: Instantiated emulator Model object.
+        likelihood_name: Key into model.likelihoods to evaluate.
+        sampler: Sampler type string ('NUTS' or 'emcee').
+        n_samples: Number of chain points to evaluate exactly.
+        seed: Random seed for reproducible subsampling.
+        burn_in_frac: Fraction of samples to discard as burn-in from the start of each chain.
+        ignore_chains: List of NUTS chain indices to skip.
+        state_keys: Optional list of state dict keys to extract and return from the
+            pipeline for both the emulator and exact models. If None, no state is saved.
+
+    Returns:
+        Dict with keys:
+            'params': array of shape (n_samples, n_params) in physical parameter space.
+            'param_names': list of sampled parameter names.
+            'emu_predictions': array of shape (n_samples, n_dv), emulator predictions.
+            'exact_predictions': array of shape (n_samples, n_dv), exact predictions.
+            'frac_diff': (emu - exact) / exact, shape (n_samples, n_dv).
+            'abs_diff': emu - exact, shape (n_samples, n_dv).
+            'emu_state': dict mapping each requested state key to a list of per-sample
+                values from the emulator model. Only present if state_keys is not None.
+            'exact_state': dict mapping each requested state key to a list of per-sample
+                values from the exact model. Only present if state_keys is not None.
+    """
+    import yaml
+    from gholax.util.model import Model
+
+    # --- Load chain samples (physical parameter space) ---
+    if sampler == 'NUTS':
+        raw = np.load(f'{chain_file}.samples_chk.npy')  # (n_chains, n_steps, n_params)
+        n_chains, n_steps, _ = raw.shape
+        chains = []
+        for i in range(n_chains):
+            if i in ignore_chains:
+                continue
+            burn_in_steps = int(n_steps * burn_in_frac)
+            chains.append(raw[i, burn_in_steps:, :])
+        samples_flat = np.concatenate(chains, axis=0)  # (N_total, n_params)
+    elif sampler == 'emcee':
+        sampler_data = h5.File(f'{chain_file}.0.samples.h5', 'r')
+        nwalkers = sampler_data['mcmc/chain'].shape[1]
+        samples_flat = sampler_data['mcmc/chain'][:].reshape(-1, sampler_data['mcmc/chain'].shape[-1])
+        sampler_data.close()
+        n_burn = int(len(samples_flat) * burn_in_frac)
+        samples_flat = samples_flat[n_burn:]
+    else:
+        raise NotImplementedError(f"Sampler '{sampler}' not recognized.")
+
+    # --- Randomly subsample ---
+    rng = np.random.default_rng(seed)
+    n_total = len(samples_flat)
+    if n_samples > n_total:
+        raise ValueError(f"Requested {n_samples} samples but chain only has {n_total} points after burn-in.")
+    indices = rng.choice(n_total, size=n_samples, replace=False)
+    subsamples = samples_flat[indices]  # (n_samples, n_params)
+
+    # --- Build exact (no-emulator) config ---
+    with open(config_file, 'r') as fp:
+        cfg_exact = yaml.load(fp, Loader=yaml.SafeLoader)
+
+    for module_cfg in cfg_exact.get('theory', {}).values():
+        if isinstance(module_cfg, dict):
+            module_cfg['use_emulator'] = False
+
+    for lname, like_cfg in cfg_exact.get('likelihood', {}).items():
+        if lname == 'params':
+            continue
+        if isinstance(like_cfg, dict):
+            like_cfg['use_boltzmann'] = True
+
+    print("Instantiating exact (no-emulator) model. This may take a moment...", flush=True)
+    exact_model = Model(cfg_exact)
+
+    # --- Evaluate predictions at each subsampled point ---
+    param_names = model.param_names
+    emu_preds = []
+    exact_preds = []
+    if state_keys is not None:
+        emu_state = {k: [] for k in state_keys}
+        exact_state = {k: [] for k in state_keys}
+
+    for i, sample in enumerate(subsamples):
+        params_dict = dict(zip(param_names, sample))
+
+        if state_keys is not None:
+            emu_pred, emu_s = model.predict_model(
+                likelihood_name, params_dict, apply_scale_mask=False, return_state=True
+            )
+            exact_pred, exact_s = exact_model.predict_model(
+                likelihood_name, params_dict, apply_scale_mask=False, return_state=True
+            )
+            for k in state_keys:
+                emu_state[k].append(np.array(emu_s[k]))
+                exact_state[k].append(np.array(exact_s[k]))
+        else:
+            emu_pred = model.predict_model(
+                likelihood_name, params_dict, apply_scale_mask=False
+            )
+            exact_pred = exact_model.predict_model(
+                likelihood_name, params_dict, apply_scale_mask=False
+            )
+
+        emu_preds.append(np.array(emu_pred))
+        exact_preds.append(np.array(exact_pred))
+
+        max_frac = np.max(np.abs((emu_pred - exact_pred) / exact_pred))
+        print(f"  [{i+1}/{n_samples}] max |frac diff| = {max_frac:.4e}", flush=True)
+
+    emu_preds = np.array(emu_preds)
+    exact_preds = np.array(exact_preds)
+
+    result = {
+        'params': subsamples,
+        'param_names': param_names,
+        'emu_predictions': emu_preds,
+        'exact_predictions': exact_preds,
+        'frac_diff': (emu_preds - exact_preds) / exact_preds,
+        'abs_diff': emu_preds - exact_preds,
+    }
+    if state_keys is not None:
+        result['emu_state'] = emu_state
+        result['exact_state'] = exact_state
+    return result
+
+
 def load_samples_from_checkpoint(output_file, model, likelihood_name, sampler, s8_module_index=1, burn_in_frac=0, ignore_chains=[], smooth_scale=-1, new_param_order=True):
     """Load MCMC samples from a checkpoint file, dispatching by sampler type.
 
