@@ -176,6 +176,9 @@ def spot_check_emulator(
             'exact_predictions': array of shape (n_samples, n_dv), exact predictions.
             'frac_diff': (emu - exact) / exact, shape (n_samples, n_dv).
             'abs_diff': emu - exact, shape (n_samples, n_dv).
+            'emu_log_like': array of shape (n_samples,), emulator log-likelihoods.
+            'exact_log_like': array of shape (n_samples,), exact log-likelihoods.
+            'delta_log_like': emu_log_like - exact_log_like, shape (n_samples,).
             'emu_state': dict mapping each requested state key to a list of per-sample
                 values from the emulator model. Only present if state_keys is not None.
             'exact_state': dict mapping each requested state key to a list of per-sample
@@ -233,8 +236,15 @@ def spot_check_emulator(
 
     # --- Evaluate predictions at each subsampled point ---
     param_names = model.param_names
+    like = model.likelihoods[likelihood_name]
+    dv = like.observed_data_vector
+    data_masked = np.array(dv.measured_spectra[dv.scale_mask])
+    cinv = np.array(dv.cinv)
+
     emu_preds = []
     exact_preds = []
+    emu_log_likes = []
+    exact_log_likes = []
     if state_keys is not None:
         emu_state = {k: [] for k in state_keys}
         exact_state = {k: [] for k in state_keys}
@@ -263,11 +273,20 @@ def spot_check_emulator(
         emu_preds.append(np.array(emu_pred))
         exact_preds.append(np.array(exact_pred))
 
+        diff_emu = data_masked - np.array(emu_pred)[dv.scale_mask]
+        diff_exact = data_masked - np.array(exact_pred)[dv.scale_mask]
+        emu_ll = float(-0.5 * diff_emu @ cinv @ diff_emu)
+        exact_ll = float(-0.5 * diff_exact @ cinv @ diff_exact)
+        emu_log_likes.append(emu_ll)
+        exact_log_likes.append(exact_ll)
+
         max_frac = np.max(np.abs((emu_pred - exact_pred) / exact_pred))
-        print(f"  [{i+1}/{n_samples}] max |frac diff| = {max_frac:.4e}", flush=True)
+        print(f"  [{i+1}/{n_samples}] max |frac diff| = {max_frac:.4e}  delta_log_like = {emu_ll - exact_ll:.4e}", flush=True)
 
     emu_preds = np.array(emu_preds)
     exact_preds = np.array(exact_preds)
+    emu_log_likes = np.array(emu_log_likes)
+    exact_log_likes = np.array(exact_log_likes)
 
     result = {
         'params': subsamples,
@@ -276,6 +295,9 @@ def spot_check_emulator(
         'exact_predictions': exact_preds,
         'frac_diff': (emu_preds - exact_preds) / exact_preds,
         'abs_diff': emu_preds - exact_preds,
+        'emu_log_like': emu_log_likes,
+        'exact_log_like': exact_log_likes,
+        'delta_log_like': emu_log_likes - exact_log_likes,
     }
     if state_keys is not None:
         result['emu_state'] = emu_state
