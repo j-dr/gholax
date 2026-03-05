@@ -220,6 +220,7 @@ def spot_check_emulator(
     for module_cfg in cfg_exact.get('theory', {}).values():
         if isinstance(module_cfg, dict):
             module_cfg['use_emulator'] = False
+            module_cfg['use_boltzmann'] = True
 
     for lname, like_cfg in cfg_exact.get('likelihood', {}).items():
         if lname == 'params':
