@@ -726,27 +726,31 @@ class RedshiftSpaceMultipoles(DataVector):
         for t in self.spectrum_types:
             bin_pairs = self.spectrum_info[t]["bin_pairs"]
             sep = self.spectrum_info[t]["separation"]
-            n_pairs = len(bin_pairs)
-            n_cols = max(1, int(np.ceil(np.sqrt(n_pairs))))
-            n_rows = max(1, int(np.ceil(n_pairs / n_cols)))
+
+            unique_b0 = sorted(set(b0 for b0, b1 in bin_pairs))
+            unique_b1 = sorted(set(b1 for b0, b1 in bin_pairs))
+            n_cols = len(unique_b0)
+            n_rows = len(unique_b1)
+            occupied = {(unique_b1.index(b1), unique_b0.index(b0))
+                        for b0, b1 in bin_pairs}
 
             if has_model:
                 fig, axes = plt.subplots(
                     2 * n_rows, n_cols,
-                    sharex=True,
+                    sharex=True, sharey='row',
                     gridspec_kw={'height_ratios': [3, 1] * n_rows},
                     squeeze=False,
                 )
             else:
                 fig, axes = plt.subplots(
                     n_rows, n_cols,
-                    sharex=True,
+                    sharex=True, sharey='row',
                     squeeze=False,
                 )
 
             for pair_idx, (b0, b1) in enumerate(bin_pairs):
-                row = pair_idx // n_cols
-                col = pair_idx % n_cols
+                col = unique_b0.index(b0)
+                row = unique_b1.index(b1)
                 if has_model:
                     ax_main = axes[2 * row, col]
                     ax_res  = axes[2 * row + 1, col]
@@ -805,13 +809,9 @@ class RedshiftSpaceMultipoles(DataVector):
                 if has_model:
                     ax_res.set_ylim(-4, 4)
 
-                bottom_row = row == n_rows - 1
-                if has_model:
-                    if bottom_row:
-                        ax_res.set_xlabel(r'$k\,[h\,\mathrm{Mpc}^{-1}]$')
-                else:
-                    if bottom_row:
-                        ax_main.set_xlabel(r'$k\,[h\,\mathrm{Mpc}^{-1}]$')
+                if row == n_rows - 1:
+                    (ax_res if has_model else ax_main).set_xlabel(
+                        r'$k\,[h\,\mathrm{Mpc}^{-1}]$')
                 if col == 0:
                     ax_main.set_ylabel(r'$k\,P_\ell(k)$')
                     if has_model:
@@ -820,17 +820,17 @@ class RedshiftSpaceMultipoles(DataVector):
                     ax_main.legend(fontsize=7)
 
             # hide unused subplots
-            for pair_idx in range(n_pairs, n_rows * n_cols):
-                row = pair_idx // n_cols
-                col = pair_idx % n_cols
-                if has_model:
-                    axes[2 * row, col].axis('off')
-                    axes[2 * row + 1, col].axis('off')
-                else:
-                    axes[row, col].axis('off')
+            for row in range(n_rows):
+                for col in range(n_cols):
+                    if (row, col) not in occupied:
+                        if has_model:
+                            axes[2 * row, col].axis('off')
+                            axes[2 * row + 1, col].axis('off')
+                        else:
+                            axes[row, col].axis('off')
 
             fig.set_size_inches(4 * n_cols, 5 * n_rows)
-            fig.tight_layout()
+            fig.subplots_adjust(wspace=0.02, hspace=0.14)
             figs[t] = fig
 
         return figs
