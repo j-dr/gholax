@@ -56,7 +56,7 @@ def load_getdist_samples(file, param_names, ignore_rows=0.3):
     w_np = getattr(samples, "weights", None)
     return theta, w_np
 
-def save_flow(path, flow, config, mean, std, bounds, params):
+def save_flow(path, flow, config):
     eqx.tree_serialise_leaves(path + "_flow.eqx", flow)
 
     with open(path + "_config.yaml", "w") as f:
@@ -230,7 +230,7 @@ if __name__ == "__main__":
     flow, mean, std = train_posterior_flow(theta, weights, flow_settings=config)
     config_out = {**config, "mean": mean.tolist(), "std": std.tolist()}
 
-    save_flow(config["save_path"], flow, config_out, mean, std, param_names)
+    save_flow(config["save_path"], flow, config_out)
 
     run_flow_diagnostics(
         flow, mean, std, theta, weights, param_names,

@@ -12,6 +12,7 @@ import equinox as eqx
 from flowjax.flows import masked_autoregressive_flow
 from flowjax.distributions import Normal
 from flowjax.bijections import RationalQuadraticSpline
+from datetime import datetime
 
 from gholax.sampler.priors import Prior
 
@@ -39,7 +40,6 @@ def build_flow_from_config(config: Dict[str, Any], key: jax.Array):
 
     return flow
 
-@dataclass
 class FlowLikelihood:
     """Implements a likelihood using a normalizing flow to model the posterior distribution.
     The flow is trained on samples from the posterior (e.g. from GetDist) and then can be
@@ -54,24 +54,13 @@ class FlowLikelihood:
     params: List[str]
     prior: Any
     
-    @classmethod
-    def load(self,
-             prefix: str,
-             *,
-             flow_file: Optional[str] = None,
-             meta_file: Optional[str] = None,
-             config_file: Optional[str] = None,
-             eps: float = 1e-6,
-             seed: int = 0) -> "FlowLikelihood":
-        """
-        Loads:
-          - {prefix}_flow.eqx
-          - {prefix}_config.yaml (architecture)
+    def __init__(self, config):
+        """Initialize the Nx2PT angular power spectrum likelihood from config."""
+        c = config["likelihood"]["FlowLikelihood"]
 
-        Currently does
-        """
-        flow_file = flow_file or (prefix + "_flow.eqx")
-        config_file = config_file or (prefix + "_config.yaml")
+        flow_file = c.get("flow_file")
+        config_file = c.get("config_file")
+
         with open(config_file, "r") as f:
             config = yaml.load(f, Loader=yaml.FullLoader)
 
@@ -85,7 +74,8 @@ class FlowLikelihood:
         prior_obj = Prior(prior_config)
 
         # Rebuild architecture, then load parameters into it
-        key = jax.random.key(seed)
+        key = jax.random.key(int(datetime.now().strftime("%Y%m%d%s")))
+
         flow_template = build_flow_from_config(config, key=key)
         flow = eqx.tree_deserialise_leaves(flow_file, flow_template)
 

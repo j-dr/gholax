@@ -266,6 +266,11 @@ class NUTS(object):
             np.save(f"{output_file}.logposterior_chk.npy", log_density)
             n_steps = samples.shape[1]
 
+            keys = jax.random.split(rng_key, 1 + n_devices)
+            rng_key = keys[0]
+            sample_keys = keys[1:]
+            
+
         samples = samples * sigmas[None, None, :] + reference[None, None, :]
         samples = jnp.vstack([samples.T, log_density[..., None].T]).T
         param_names.append("log_posterior")

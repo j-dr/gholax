@@ -1,14 +1,16 @@
 #!/bin/bash
 module load python
-#mamba create --prefix /global/common/software/cosmosim/gholax --clone base
-mamba create gholax --clone base
-mamba activate gholax
+conda create --prefix /global/common/software/cosmosim/jaxeft --clone base
+mamba install pip
+#mamba create gholax --clone base
+mamba activate /global/common/software/cosmosim/jaxeft
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
 pip install --upgrade "jax[cuda12]==0.6.2"
 pip install blackjax
 mamba install numpy scipy pyyaml setuptools ipython jupyter cython gsl matplotlib h5py emcee --yes
 pip install interpax==0.3.8 optax==0.2.4
 pip install jaxopt
+pip install flowjax==18.0.0
 #pip install git+https://github.com/blackjax-devs/blackjax.git
 pip install git+https://github.com/sfschen/spinosaurus.git 
 pip install git+https://github.com/sfschen/velocileptors.git

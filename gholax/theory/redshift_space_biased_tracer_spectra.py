@@ -285,12 +285,12 @@ class RedshiftSpaceBiasedTracerSpectra(LikelihoodModule):
         if not self.save_noap_spectra:
             p_cb = np.array(
                 [
-                    np.interp(self.z, state["z_pk"], state["Pcb_lin_z"][:, i])
+                    np.interp(self.zeff, state["z_pk"], state["Pcb_lin_z"][:, i])
                     for i in range(k_lin.shape[0])
                 ]
             ).T
 
-            p_ij_ell = np.zeros((n_spec, self.n_ell, self.nk, self.nz))
+            p_ij_ell = np.zeros((n_spec, self.n_ell, self.nk, self.nzeff))
 
             for i, z in enumerate(self.zeff):
                 apar, aperp = (
@@ -319,7 +319,7 @@ class RedshiftSpaceBiasedTracerSpectra(LikelihoodModule):
                 p_ij_ell[:, 0, :, i] = model_lpt.p0ktable.T
                 p_ij_ell[:, 1, :, i] = model_lpt.p2ktable.T
                 p_ij_ell[:, 2, :, i] = model_lpt.p4ktable.T
-                state["p_ij_ell_redshift_space_bias_grid"] = p_ij_ell
+            state["p_ij_ell_redshift_space_bias_grid"] = p_ij_ell
 
         else:
             p_cb = state["Pcb_lin_z"]
@@ -433,7 +433,7 @@ class RedshiftSpaceBiasedTracerSpectra(LikelihoodModule):
                     * np.sum((ws * L4)[:, None, None] * pknu_obs_w_sct, axis=0).T
                     / vol_fac
                 )
-                state["p_ij_ell_redshift_space_bias_grid"] = p_ij_ell
+            state["p_ij_ell_redshift_space_bias_grid"] = p_ij_ell
 
         return state
 

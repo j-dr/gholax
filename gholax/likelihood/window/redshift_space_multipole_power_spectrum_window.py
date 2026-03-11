@@ -20,7 +20,7 @@ class RedshiftSpaceMultipolePowerSpectrumWindow(LikelihoodModule):
         kmin=1e-3,
         kmax=0.6,
         nk=200,
-        n_ell=3,
+        n_ell_th=3,
         **config,
     ):
         self.observed_data_vector = observed_data_vector
@@ -29,7 +29,7 @@ class RedshiftSpaceMultipolePowerSpectrumWindow(LikelihoodModule):
         self.k = jnp.logspace(jnp.log10(kmin), jnp.log10(kmax), nk)
         self.logk = jnp.linspace(jnp.log10(kmin), jnp.log10(kmax), nk)
         self.nk = nk
-        self.n_ell = n_ell
+        self.n_ell_th = n_ell_th
         self.pl_tag = config.get("pl_tag", "")
 
         self.all_spectra = {}
@@ -76,6 +76,7 @@ class RedshiftSpaceMultipolePowerSpectrumWindow(LikelihoodModule):
                     except:
                         W_t = W_t.at[counter].set(self.W[f"{j}_{i}"])
                     counter += 1
+                
         else:
             W_t = jnp.zeros(
                 (
@@ -87,6 +88,7 @@ class RedshiftSpaceMultipolePowerSpectrumWindow(LikelihoodModule):
             for i in bins0:
                 W_t = W_t.at[i].set(self.W[f"{i}_{i}"])
 
+        self.n_ell_obs = self.W[f"{bins0[0]}_{bins1[0]}"].shape[1]//self.observed_data_vector.ko_eff.shape[0]
         self.W = W_t
 
     def compute(self, state, params_values):
@@ -95,9 +97,9 @@ class RedshiftSpaceMultipolePowerSpectrumWindow(LikelihoodModule):
 
             def f(carry, p_l):
                 p_l_kth = jnp.zeros(
-                    (self.n_ell, self.observed_data_vector.kth.shape[0])
+                    (self.n_ell_th, self.observed_data_vector.kth.shape[0])
                 )
-                for i in range(self.n_ell):
+                for i in range(self.n_ell_th):
                     p_l_kth = p_l_kth.at[i, ...].set(
                         jnp.interp(self.observed_data_vector.kth, self.k, p_l[i])
                     )
@@ -106,7 +108,7 @@ class RedshiftSpaceMultipolePowerSpectrumWindow(LikelihoodModule):
             _, p_l_kth = scan(f, 0, state[f"{t}{self.pl_tag}"])
             p_l_kth = jnp.einsum("ito,it->io", self.W[:, :, :], p_l_kth)
             state[f"{t}_obs"] = p_l_kth.reshape(
-                -1, self.n_ell, self.observed_data_vector.ko_eff.shape[0]
+                -1, self.n_ell_obs, self.observed_data_vector.ko_eff.shape[0]
             )
 
         return state

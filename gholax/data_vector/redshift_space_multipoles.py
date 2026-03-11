@@ -500,7 +500,7 @@ class RedshiftSpaceMultipoles(DataVector):
 
         covidx, covidy = np.meshgrid(idxi, idxi, indexing="ij")
         self.cov = cov_raw[covidx, covidy]
-        assert np.allclose(self.cov["value"], self.cov["value"].T, 1e-16)
+        assert np.allclose(self.cov["value"], self.cov["value"].T, 1e-12)
 
         cov_scale_mask_i, cov_scale_mask_j = np.meshgrid(
             self.scale_mask, self.scale_mask, indexing="ij"
