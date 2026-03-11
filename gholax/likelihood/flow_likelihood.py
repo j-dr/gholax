@@ -77,7 +77,7 @@ class FlowLikelihood:
 
         mu = jnp.asarray(config["mean"])
         sig = jnp.asarray(config["std"])
-        priors = config['priors']
+        priors = config['params']
         params = list(priors.keys())
 
         # Prior expects {param: {'prior': {dist, min/max or loc/scale}}}

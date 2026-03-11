@@ -44,8 +44,8 @@ def train_posterior_flow(theta, weights, train_split=0.8, flow_settings={}):
     return flow, mean, std
 
 def load_getdist_samples(file, param_names, ignore_rows=0.3):
-    import getdist
-    samples = getdist.mcsamples.MCSamples(root=file, settings={'ignore_rows': ignore_rows})
+    from getdist import loadMCSamples
+    samples = loadMCSamples(file, settings={'ignore_rows': ignore_rows})
     
     def extract_theta_from_getdist(gd, params):
         chain_names = [p.name for p in gd.paramNames.names]
@@ -222,7 +222,7 @@ if __name__ == "__main__":
         config = yaml.load(f, Loader=yaml.FullLoader)
         
     chain_root = config["chain_root"]
-    priors = config['priors']
+    priors = config['params']
     param_names = list(priors.keys())
     
     theta, weights = load_getdist_samples(chain_root, param_names)
