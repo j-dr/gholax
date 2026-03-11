@@ -240,8 +240,6 @@ class NUTS(object):
                     sample_keys, kernel, states, self.n_steps_incr
                 )
             else:
-                init_pmap = jax.pmap(nuts.init, in_axes=(0))
-                states = init_pmap(states.position[:, -1, :])
                 states = pmap_inference_loop(
                     sample_keys, kernel, states, self.n_steps_incr
                 )
