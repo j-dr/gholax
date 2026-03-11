@@ -240,10 +240,12 @@ class NUTS(object):
                     sample_keys, kernel, states, self.n_steps_incr
                 )
             else:
-                states = pmap_inference_loop(
+               init_pmap = jax.pmap(nuts.init, in_axes=(0))
+               states = init_pmap(states.position[:, -1, :])
+               states = pmap_inference_loop(
                     sample_keys, kernel, states, self.n_steps_incr
                 )
-
+                
             if (counter == 0) & (n_steps == 0):
                 samples = states.position
                 log_density = states.logdensity
