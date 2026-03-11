@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 import jax.numpy as jnp
 import jax
@@ -15,6 +14,7 @@ from flowjax.bijections import RationalQuadraticSpline
 from datetime import datetime
 
 from gholax.sampler.priors import Prior
+from .likelihood import Likelihood
 
 def build_flow_from_config(config: Dict[str, Any], key: jax.Array):
     """
@@ -28,19 +28,19 @@ def build_flow_from_config(config: Dict[str, Any], key: jax.Array):
         (e.g. n_transforms/hidden_dims/etc.) can be passed via config["maf_kwargs"].
     """
 
-    if config['type'] == 'maf':
-        ndim = len(list(config['priors'].keys()))
+    if config.get('type', 'maf') == 'maf':
+        ndim = len(list(config['params'].keys()))
         base = Normal(jnp.zeros((ndim,)))  # unit Normal, scale defaults to 1 if omitted in your version
         flow = masked_autoregressive_flow(key,
                                       base_dist=base,
-                                      transformer=RationalQuadraticSpline(knots=config["knots"], interval=config["interval"]),
+                                      transformer=RationalQuadraticSpline(knots=config.get("knots",16), interval=config.get("interval", 4)),
                                      )
     else:
         raise NotImplementedError("Currently not supported.")
 
     return flow
 
-class FlowLikelihood:
+class FlowLikelihood(Likelihood):
     """Implements a likelihood using a normalizing flow to model the posterior distribution.
     The flow is trained on samples from the posterior (e.g. from GetDist) and then can be
     used to evaluate the likelihood at new parameter values. The likelihood is obtained by
@@ -57,29 +57,30 @@ class FlowLikelihood:
     def __init__(self, config):
         """Initialize the Nx2PT angular power spectrum likelihood from config."""
         c = config["likelihood"]["FlowLikelihood"]
-
-        flow_file = c.get("flow_file")
-        config_file = c.get("config_file")
+        base_path = c.get("base_path")
+        flow_file = f'{base_path}_flow.eqx'
+        config_file = f'{base_path}_config.yaml'
 
         with open(config_file, "r") as f:
             config = yaml.load(f, Loader=yaml.FullLoader)
 
-        mu = jnp.asarray(config["mean"])
-        sig = jnp.asarray(config["std"])
+        self.mu = jnp.asarray(config["mean"])
+        self.sig = jnp.asarray(config["std"])
         priors = config['params']
-        params = list(priors.keys())
+        self.params = list(priors.keys())
 
         # Prior expects {param: {'prior': {dist, min/max or loc/scale}}}
-        prior_config = {p: {'prior': priors[p]} for p in priors}
-        prior_obj = Prior(prior_config)
+#        prior_config = {p: {'prior': priors[p]} for p in priors}
+        self.prior = Prior(priors)
 
         # Rebuild architecture, then load parameters into it
         key = jax.random.key(int(datetime.now().strftime("%Y%m%d%s")))
 
         flow_template = build_flow_from_config(config, key=key)
-        flow = eqx.tree_deserialise_leaves(flow_file, flow_template)
+        self.flow = eqx.tree_deserialise_leaves(flow_file, flow_template)
+        
+        self.likelihood_pipeline = []
 
-        return self(flow=flow, mu=mu, sig=sig, priors=priors, params=params, prior=prior_obj)
 
     def compute(self, params: Dict) -> jax.Array:
         """

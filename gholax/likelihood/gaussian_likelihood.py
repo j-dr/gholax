@@ -3,9 +3,9 @@ import numpy as np
 from jax import jacobian, jit
 from copy import copy
 import yaml
-import abc
+from .likelihood import Likelihood
 
-class GaussianLikelihood(metaclass=abc.ABCMeta):
+class GaussianLikelihood(Likelihood):
     """Abstract base class for Gaussian likelihoods.
 
     Manages a pipeline of LikelihoodModules, parameter classification
@@ -284,7 +284,6 @@ class GaussianLikelihood(metaclass=abc.ABCMeta):
 
         return state
 
-    @abc.abstractmethod
     def get_model_from_state(
         self,
         state,
