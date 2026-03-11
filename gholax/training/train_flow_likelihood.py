@@ -222,7 +222,7 @@ if __name__ == "__main__":
         config = yaml.load(f, Loader=yaml.FullLoader)
         
     chain_root = config["chain_root"]
-    priors = config['priors']
+    priors = config['params']
     param_names = list(priors.keys())
     
     theta, weights = load_getdist_samples(chain_root, param_names)
