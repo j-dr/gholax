@@ -228,7 +228,7 @@ if __name__ == "__main__":
     theta, weights = load_getdist_samples(chain_root, param_names)
     
     flow, mean, std = train_posterior_flow(theta, weights, flow_settings=config)
-    config_out = {**config, "mean": mean.tolist(), "std": std.tolist()}
+    config_out = {**config, "mean": mean.tolist(), "std": std.tolist(), "param_names": param_names}
 
     save_flow(config["save_path"], flow, config_out)
 

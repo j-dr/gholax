@@ -20,8 +20,8 @@ class Likelihood(metaclass=abc.ABCMeta):
             shared_params: Parameters shared between likelihoods (e.g., cosmology).
         """
         self.output_requirements = {}
-
-        l_pars = copy(config["params"])
+        config_params = config.get("params",{})
+        l_pars = copy(config_params)
         l_pars.update(shared_params) #include parameters shared between likelihoods, e.g. cosmology.
         
         self.fixed_params = {}
@@ -43,14 +43,13 @@ class Likelihood(metaclass=abc.ABCMeta):
                                     f"Must specify either a prior, ref/value or derived for parameter {p}."
                                 )
                             )
-                if p in config['params']:
-                    config["params"].pop(p)
-            elif p not in config["params"]:
-                config["params"][p] = l_pars[p]
+                if p in config_params:
+                    config_params.pop(p)
+            elif p not in config_params:
+                config_params[p] = l_pars[p]
         
-        self.sampled_params = config["params"]
+        self.sampled_params = config_params
         self.free_params = copy(self.sampled_params)
-        self.free_params.update(self.linear_params_dict)
         
         self.setup_params()
         self.build_dependency_graph()

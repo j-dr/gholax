@@ -62,12 +62,12 @@ class FlowLikelihood(Likelihood):
         config_file = f'{base_path}_config.yaml'
 
         with open(config_file, "r") as f:
-            config = yaml.load(f, Loader=yaml.FullLoader)
+            flow_config = yaml.load(f, Loader=yaml.FullLoader)
 
-        self.mu = jnp.asarray(config["mean"])
-        self.sig = jnp.asarray(config["std"])
-        priors = config['params']
-        self.params = list(priors.keys())
+        self.mu = jnp.asarray(flow_config["mean"])
+        self.sig = jnp.asarray(flow_config["std"])
+        priors = flow_config['params']
+        self.params = flow_config['param_names']
 
         # Prior expects {param: {'prior': {dist, min/max or loc/scale}}}
 #        prior_config = {p: {'prior': priors[p]} for p in priors}
@@ -76,10 +76,12 @@ class FlowLikelihood(Likelihood):
         # Rebuild architecture, then load parameters into it
         key = jax.random.key(int(datetime.now().strftime("%Y%m%d%s")))
 
-        flow_template = build_flow_from_config(config, key=key)
+        flow_template = build_flow_from_config(flow_config, key=key)
         self.flow = eqx.tree_deserialise_leaves(flow_file, flow_template)
         
         self.likelihood_pipeline = []
+
+        super(FlowLikelihood, self).__init__(c, config["likelihood"].get('params', {}))
 
 
     def compute(self, params: Dict) -> jax.Array:
@@ -89,6 +91,7 @@ class FlowLikelihood(Likelihood):
         returns: (...) log prior
         """
         theta = jnp.asarray([params[p] for p in self.params])
+        flow_params = dict(zip(self.params, theta))
 
         u_std = (theta - self.mu) / self.sig
 
@@ -99,6 +102,6 @@ class FlowLikelihood(Likelihood):
 
         logp_theta = logp_u_std + logJ_std
 
-        log_prior = self.prior.log_prior(params)
+        log_prior = self.prior.log_prior(flow_params)
 
         return logp_theta - log_prior
