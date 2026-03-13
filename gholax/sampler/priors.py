@@ -13,13 +13,15 @@ class Prior(object):
     and initial position generation for samplers.
     """
 
-    def __init__(self, config, derived_params=[], fixed_params=[]):
+    def __init__(self, config, derived_params=[], fixed_params=[], joint_priors={}):
         """Initialize priors from parameter configuration.
 
         Args:
             config: Dict mapping parameter names to their config (must include 'prior' key).
             derived_params: List of derived parameter names.
             fixed_params: List of fixed parameter names.
+            joint_priors: Dict of multivariate Gaussian prior groups. Each key is a group
+                name, each value has 'params', 'mean', and 'cov' entries.
         """
         self.prior_info = {}
         for p in config:
@@ -30,10 +32,43 @@ class Prior(object):
                 self.prior_info[p]["proposal"] = config[p]["proposal"]
 
         self.params = list(config.keys())
-        self.derived_params = derived_params 
+        self.derived_params = derived_params
         self.fixed_params = fixed_params
         self.config = config
-        
+
+        self.joint_prior_groups = {}
+        self.joint_prior_params = set()
+
+        for name, group in joint_priors.items():
+            params = group["params"]
+            mean = jnp.array(group["mean"], dtype=float)
+            cov = jnp.array(group["cov"], dtype=float)
+            n = len(params)
+            cinv = jnp.linalg.inv(cov)
+            sign, log_det = jnp.linalg.slogdet(cov)
+            log_norm = -0.5 * (n * jnp.log(2 * jnp.pi) + log_det)
+            self.joint_prior_groups[name] = {
+                "params": params,
+                "mean": mean,
+                "cinv": cinv,
+                "log_norm": log_norm,
+            }
+            for i, p in enumerate(params):
+                self.joint_prior_params.add(p)
+                # Overwrite stub prior_info with marginal normal so downstream
+                # methods (get_prior_sigmas, initial_position, etc.) work unchanged.
+                existing = self.prior_info.get(p, {})
+                marginal_std = float(jnp.sqrt(cov[i, i]))
+                self.prior_info[p] = {
+                    "dist": "norm",
+                    "loc": float(mean[i]),
+                    "scale": marginal_std,
+                }
+                if "ref" in existing:
+                    self.prior_info[p]["ref"] = existing["ref"]
+                if "proposal" in existing:
+                    self.prior_info[p]["proposal"] = existing["proposal"]
+
         self.get_prior_sigmas()
         self.get_reference_values()
 
@@ -50,6 +85,8 @@ class Prior(object):
         """Compute the total log-prior for all parameters."""
         logp = 0
         for p in params_values:
+            if p in self.joint_prior_params:
+                continue  # handled by joint prior below
             pi = self.prior_info[p]
             if pi["dist"] == "uniform":
                 logp += self.uniform(params_values[p], pi["min"], pi["max"])
@@ -59,6 +96,14 @@ class Prior(object):
                 raise (
                     NotImplementedError(f"Prior form {pi['dist']} is not implemented.")
                 )
+
+        for group in self.joint_prior_groups.values():
+            residual = jnp.stack(
+                [params_values[p] - group["mean"][i]
+                 for i, p in enumerate(group["params"])]
+            )
+            logp += -0.5 * residual @ group["cinv"] @ residual + group["log_norm"]
+
         return logp
 
     def initial_position(self, random_start=True, key=None, normalize=False):
