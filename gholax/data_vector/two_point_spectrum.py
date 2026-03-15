@@ -557,9 +557,13 @@ class TwoPointSpectrum(DataVector):
         if self.covariance_info is None:
             self.covariance_info = {}
 
-        if "f_sky" not in self.covariance_info:
-            val = input("f_sky not found in config. Enter f_sky: ")
-            self.covariance_info["f_sky"] = float(val)
+        if ("f_sky" not in self.covariance_info):
+            for s in self.covariance_info:
+                try:
+                    f_sky = self.covariance_info[s]["f_sky"]
+                except KeyError:
+                    val = input("f_sky not found in config. Enter f_sky: ")
+                    self.covariance_info[s]["f_sky"] = float(val)
 
         for t in self.spectrum_info:
             if t not in self.covariance_info:
@@ -648,9 +652,13 @@ class TwoPointSpectrum(DataVector):
                 )
 
             spec_w_n.append(c_w_n)
+        try:
+            f_sky = np.min([self.covariance_info[c]['f_sky'] for c in [c0, c1, c2, c3] if c in self.covariance_info])
+        except ValueError:
+            f_sky = self.covariance_info["f_sky"]
 
         var = (spec_w_n[0] * spec_w_n[1] + spec_w_n[2] * spec_w_n[3]) / (
-            float(self.covariance_info["f_sky"]) * self.delta_ell * (2 * self.ell_eff)
+            float(f_sky) * self.delta_ell * (2 * self.ell_eff)
         )
 
         return var
@@ -754,7 +762,7 @@ class TwoPointSpectrum(DataVector):
                 offset += n
         return d
 
-    def plot_spectra_vs_model(self, model_pred=None):
+    def plot_spectra_vs_model(self, model_pred=None, log_x_scale=True, log_y_scale=True):
         """Plot measured spectra, optionally compared to model predictions.
 
         One figure is created per spectrum type.  When *model_pred* is given,
@@ -862,9 +870,10 @@ class TwoPointSpectrum(DataVector):
                         ax.axvspan(ell_max, x_max_plot * 2,
                                    color='k', alpha=0.15, linewidth=0)
                     ax_main.set_xlim(sep[0] * 0.8, x_max_plot)
-
-                ax_main.set_xscale('log')
-                ax_main.set_yscale('log')
+                if log_x_scale:
+                    ax_main.set_xscale('log')
+                if log_y_scale:
+                    ax_main.set_yscale('log')
                 ax_main.set_title(f'({b0}, {b1})', fontsize=9)
 
                 if has_model:
