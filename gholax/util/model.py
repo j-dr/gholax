@@ -270,16 +270,19 @@ def _minimize(model, output_base):
     return params
 
 
-def _apply_gaussian_covariance(like, pred):
-    """Replace the likelihood's covariance with a Gaussian covariance computed
-    from the full (unmasked) model prediction vector *pred*."""
+def _apply_gaussian_covariance(like, pred, model_spectra=None):
+    """Replace the likelihood's covariance with a Gaussian covariance.
+
+    If *model_spectra* is provided, use it directly (e.g. from a cross-bin
+    model). Otherwise, build the spectra dict from the prediction vector *pred*.
+    """
     from gholax.data_vector.two_point_spectrum import TwoPointSpectrum
 
     dv = like.observed_data_vector
-    pred_np = np.asarray(pred)
 
     if isinstance(dv, TwoPointSpectrum):
-        model_spectra = dv.spectra_dict_from_vector(pred_np)
+        if model_spectra is None:
+            model_spectra = dv.spectra_dict_from_vector(np.asarray(pred))
         cov = dv.gaussian_covariance(model_spectra=model_spectra)
     else:
         cov = dv.gaussian_covariance()
@@ -290,6 +293,34 @@ def _apply_gaussian_covariance(like, pred):
         dv.cov["value"][cov_mask_i, cov_mask_j].reshape(dv.n_dv_masked, dv.n_dv_masked)
     )
     print("  Applied model-predicted Gaussian covariance.", flush=True)
+
+
+def _needs_cross_c_dd_model(model):
+    """Return True if any likelihood has auto-only (use_cross=False) c_dd spectra."""
+    from gholax.data_vector.two_point_spectrum import TwoPointSpectrum
+
+    for like in model.likelihoods.values():
+        dv = like.observed_data_vector
+        if isinstance(dv, TwoPointSpectrum):
+            si = dv.spectrum_info
+            if "c_dd" in si and not si["c_dd"]["use_cross"]:
+                return True
+    return False
+
+
+def _set_c_dd_use_cross(cfg, value):
+    """Set use_cross for c_dd spectrum in a config dict (in-place)."""
+    def _walk(d):
+        if isinstance(d, dict):
+            if "c_dd" in d and isinstance(d["c_dd"], dict) and "use_cross" in d["c_dd"]:
+                d["c_dd"]["use_cross"] = value
+                return
+            for v in d.values():
+                _walk(v)
+        elif isinstance(d, list):
+            for item in d:
+                _walk(item)
+    _walk(cfg)
 
 
 def save_model_pred():
@@ -330,17 +361,33 @@ def save_model_pred():
     model = Model(cfg)
 
     if args.gauss_cov:
+        import copy
         ref_params = model.prior.get_reference_point()
+
+        needs_cross_model = _needs_cross_c_dd_model(model)
+        if needs_cross_model:
+            cross_cfg = copy.deepcopy(cfg)
+            _set_c_dd_use_cross(cross_cfg, True)
+            cross_model = Model(cross_cfg)
+        else:
+            cross_model = model
+
         print("Computing model prediction at reference parameters for Gaussian covariance...",
               flush=True)
         for lname in model.likelihoods:
             like = model.likelihoods[lname]
-            params_am = like.linear_params_means
-            params_like = {k: ref_params[k] for k in like.sampled_params}
-            pred_ref = like.predict_model(
-                params_like, params_am, return_state=False, apply_scale_mask=False
+            cross_like = cross_model.likelihoods[lname]
+
+            params_like = {k: ref_params[k] for k in cross_like.sampled_params}
+            cross_pred = cross_like.predict_model(
+                params_like, cross_like.linear_params_means,
+                return_state=False, apply_scale_mask=False
             )
-            _apply_gaussian_covariance(like, pred_ref)
+            cross_spectra = cross_like.observed_data_vector.spectra_dict_from_vector(
+                np.asarray(cross_pred)
+            )
+            _apply_gaussian_covariance(like, None, model_spectra=cross_spectra)
+
         params = _minimize(model, output_base)
     elif args.params is not None:
         params = _load_params_from_h5(args.params)
