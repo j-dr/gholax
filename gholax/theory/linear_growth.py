@@ -5,6 +5,32 @@ from jax import grad, jit
 from jax.experimental.ode import odeint
 from functools import partial
 
+# Physical constants for neutrino thermodynamics
+_T_CMB0_K = 2.7255                   # K, Fixsen (2009)
+_K_B_EV = 8.617333e-5                # eV/K
+_T_NU0_EV = (4.0/11.0)**(1.0/3.0) * _K_B_EV * _T_CMB0_K  # neutrino temperature today in eV
+_OMEGA_GAMMA_H2 = 2.473e-5           # photon omega*h^2 for T_CMB=2.7255 K
+_OMEGA_NU_REL_H2_PER_SPECIES = (7.0/8.0) * (4.0/11.0)**(4.0/3.0) * _OMEGA_GAMMA_H2
+
+
+def neutrino_density_ratio(y, nodes, weights):
+    """
+    Returns F(y) = (120/(7*pi^4)) * integral_0^inf sqrt(x^2+y^2)*x^2/(e^x+1) dx
+    via Gauss-Laguerre quadrature (nodes and weights from scipy.special.roots_laguerre).
+
+    y = m_nu_per_species * a / _T_NU0_EV
+
+    Limits: F(0) = 1 (fully relativistic); F(y>>1) -> (45*zeta(3)/(7*pi^4))*y
+    (non-relativistic, recovering omega_nu*h^2 = mnu/93.14).
+
+    JAX-differentiable in y.
+    """
+    norm = 120.0 / (7.0 * jnp.pi**4)
+    # Gauss-Laguerre integrates f(x)*e^{-x}: rewrite 1/(e^x+1) = e^{-x}/(1+e^{-x})
+    integrand = jnp.sqrt(nodes**2 + y**2) * nodes**2 / (1.0 + jnp.exp(-nodes))
+    return norm * jnp.dot(weights, integrand)
+
+
 def dark_energy_density(a, w0=-1.0, wa=0.0):
     return a**(-3*(1 + w0 + wa)) * jnp.exp(3*wa*(a - 1))
 

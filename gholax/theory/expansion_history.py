@@ -1,8 +1,11 @@
 from .emulator import ScalarEmulator
 from ..util.likelihood_module import LikelihoodModule
-from .linear_growth import hubble_E_z, dE_da_auto, d2E_da2_auto, d3E_da3_auto
+from .linear_growth import (hubble_E_z, dE_da_auto, d2E_da2_auto, d3E_da3_auto,
+                             dark_energy_density, neutrino_density_ratio,
+                             _T_NU0_EV, _OMEGA_GAMMA_H2, _OMEGA_NU_REL_H2_PER_SPECIES)
+import jax
 import jax.numpy as jnp
-from scipy.special import roots_legendre
+from scipy.special import roots_legendre, roots_laguerre
 
 speed_of_light = 2.99792458e5
 
@@ -48,6 +51,35 @@ def comoving_distance_integral(z_targets, n_int=4096,\
     return chi_targets, E_targets, chi_derivs
 
 
+def comoving_distance_integral_full(z_targets, E_z_func, n_int=4096):
+    """
+    Compute chi(z) and E(z) for an arbitrary scalar E(z) callable.
+
+    Uses a grid uniform in log(1+z) so that resolution is maintained at
+    arbitrarily high redshift (equal coverage per e-fold).
+
+    E_z_func must accept a scalar z and return a scalar E(z), and must be
+    JAX-differentiable (used for chi_derivs via jax.grad in compute_analytic).
+
+    Returns (chi_targets, E_targets) in Mpc/h.
+    """
+    z_targets = jnp.atleast_1d(z_targets)
+    zmax = jnp.max(z_targets)
+
+    # Log-spaced grid: uniform in log(1+z)
+    log1pz_grid = jnp.linspace(0.0, jnp.log1p(zmax), n_int)
+    z_grid = jnp.expm1(log1pz_grid)
+
+    E_grid = jax.vmap(E_z_func)(z_grid)
+    I_grid = cumulative_trapz(1.0 / E_grid, z_grid)
+    chi_grid = (speed_of_light / 100.0) * I_grid
+
+    E_targets = jax.vmap(E_z_func)(z_targets)
+    chi_targets = jnp.interp(z_targets, z_grid, chi_grid)
+
+    return chi_targets, E_targets
+
+
 class ExpansionHistory(LikelihoodModule):
     def __init__(self, zmin=0, zmax=2.0, nz=125, **config):
         self.z = jnp.linspace(zmin, zmax, nz)
@@ -58,6 +90,13 @@ class ExpansionHistory(LikelihoodModule):
         self.integration_method = config.get("integration_method", "gl_quad")
         if self.integration_method == "gl_quad":
             self.nodes, self.weights = roots_legendre(nz)
+
+        # Gauss-Laguerre nodes for the neutrino Fermi-Dirac phase-space integral.
+        # 32 nodes gives sub-0.01% accuracy in F(y) across all y (all neutrino masses
+        # and scale factors of interest).
+        _gl_nu_nodes_np, _gl_nu_weights_np = roots_laguerre(32)
+        self.gl_nu_nodes = jnp.array(_gl_nu_nodes_np)
+        self.gl_nu_weights = jnp.array(_gl_nu_weights_np)
 
         self.output_requirements = {}
         if self.use_emulator:
@@ -131,23 +170,56 @@ class ExpansionHistory(LikelihoodModule):
         return chi_z, e_z, omegam
     
     def compute_analytic(self, params_values):
-
-        h = params_values['H0'] / 100.
-        omega_nu = params_values["mnu"] / 93.14
-        Omega_m = (params_values["omch2"] + params_values["ombh2"] + omega_nu) / h**2
+        h = params_values['H0'] / 100.0
         w0 = params_values["w"]
-        
-        # These are set to zero for now
-        wa = 0.0
-        Omega_r = 0.0
+        n_species = 3  # three degenerate massive neutrino species
+        mnu_per_species = params_values["mnu"] / n_species
 
-        Omega_Lambda = 1 - Omega_m
-        Omega_k = 1 - Omega_m - Omega_Lambda
-        
-        n_int = getattr(self, "n_points_int", 1024)
+        Omega_cb = (params_values["omch2"] + params_values["ombh2"]) / h**2
+        Omega_r_photon = _OMEGA_GAMMA_H2 / h**2
 
-        chi_z, e_z, chi_derivs = comoving_distance_integral(self.z, n_int, Omega_m, Omega_Lambda, Omega_k, Omega_r, w0, wa)
-        
+        # Neutrino density at a=1 using the full Fermi-Dirac integral.
+        # For typical masses (mnu > 0.06 eV), y0 >> 1 so this recovers
+        # Omega_nu_0 ≈ mnu/93.14/h^2, but the formula is exact.
+        y0 = mnu_per_species / _T_NU0_EV
+        F_y0 = neutrino_density_ratio(y0, self.gl_nu_nodes, self.gl_nu_weights)
+        Omega_nu_0 = n_species * (_OMEGA_NU_REL_H2_PER_SPECIES / h**2) * F_y0
+
+        # Total matter (used downstream for Omega_m and chi_derivs convention)
+        Omega_m = Omega_cb + Omega_nu_0
+
+        # Flatness: Lambda picks up the slack after cb matter, neutrinos, and photons
+        Omega_Lambda = 1.0 - Omega_cb - Omega_nu_0 - Omega_r_photon
+
+        # Capture node arrays for the closure (avoids holding self reference in JAX trace)
+        gl_nodes = self.gl_nu_nodes
+        gl_weights = self.gl_nu_weights
+
+        def E_a_full(a):
+            """Full E(a) with relativistic-to-NR neutrino transition and photon radiation."""
+            y = mnu_per_species * a / _T_NU0_EV
+            F_y = neutrino_density_ratio(y, gl_nodes, gl_weights)
+            Omega_nu_a = n_species * (_OMEGA_NU_REL_H2_PER_SPECIES / h**2) * F_y / a**4
+            Omega_de = Omega_Lambda * dark_energy_density(a, w0, 0.0)
+            return jnp.sqrt(Omega_r_photon / a**4 + Omega_cb / a**3 + Omega_nu_a + Omega_de)
+
+        def E_z_full(z):
+            return E_a_full(1.0 / (1.0 + z))
+
+        n_int = getattr(self, "n_points_int", 4096)
+        chi_z, e_z = comoving_distance_integral_full(self.z, E_z_full, n_int)
+
+        # chi_derivs: Taylor coefficients of chi(z) at z=0, expressed via dE/da|_{a=1}.
+        # Convention matches comoving_distance_integral (lines ~38-46 above).
+        dEda    = jax.grad(E_a_full)(1.0)
+        d2Eda2  = jax.grad(jax.grad(E_a_full))(1.0)
+        d3Eda3  = jax.grad(jax.grad(jax.grad(E_a_full)))(1.0)
+        dchidz  = 1.0
+        d2chidz2 = dEda
+        d3chidz3 = -2*dEda + 2*dEda**2 - d2Eda2
+        d4chidz4 = 6*dEda - 12*dEda**2 + 6*dEda**3 + 6*d2Eda2 - 6*dEda*d2Eda2 + d3Eda3
+        chi_derivs = jnp.array([dchidz, d2chidz2, d3chidz3, d4chidz4])
+
         return chi_z, e_z, Omega_m, chi_derivs
     
     def compute_emulator(self, params_values):
