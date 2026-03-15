@@ -6,34 +6,10 @@ from jax.experimental.ode import odeint
 from functools import partial
 
 def dark_energy_density(a, w0=-1.0, wa=0.0):
-    """Compute the dark energy density ratio relative to its z=0 value.
-
-    Args:
-        a: Scale factor.
-        w0: Dark energy equation of state parameter at z=0.
-        wa: Time-varying dark energy equation of state parameter.
-
-    Returns:
-        Dark energy density ratio rho_DE(a) / rho_DE(a=1).
-    """
     return a**(-3*(1 + w0 + wa)) * jnp.exp(3*wa*(a - 1))
 
-def hubble_E(a, Omega_m=0.3, Omega_Lambda=0.7, Omega_k=0.0, Omega_r=0.0,
+def hubble_E(a, Omega_m=0.3, Omega_Lambda=0.7, Omega_k=0.0, Omega_r=0.0, 
              w0=-1.0, wa=0.0):
-    """Compute the dimensionless Hubble parameter E(a) = H(a)/H0.
-
-    Args:
-        a: Scale factor.
-        Omega_m: Matter density parameter.
-        Omega_Lambda: Dark energy density parameter.
-        Omega_k: Curvature density parameter.
-        Omega_r: Radiation density parameter.
-        w0: Dark energy equation of state at z=0.
-        wa: Time-varying dark energy equation of state.
-
-    Returns:
-        Dimensionless Hubble parameter E(a).
-    """
     Omega_DE_term = Omega_Lambda * dark_energy_density(a, w0, wa)
     
     E_squared = (
@@ -47,26 +23,11 @@ def hubble_E(a, Omega_m=0.3, Omega_Lambda=0.7, Omega_k=0.0, Omega_r=0.0,
 
 def hubble_E_z(z, Omega_m=0.3, Omega_Lambda=0.7, Omega_k=0.0, Omega_r=0.0,
                w0=-1.0, wa=0.0):
-    """Compute the dimensionless Hubble parameter E(z) = H(z)/H0.
-
-    Args:
-        z: Redshift.
-        Omega_m: Matter density parameter.
-        Omega_Lambda: Dark energy density parameter.
-        Omega_k: Curvature density parameter.
-        Omega_r: Radiation density parameter.
-        w0: Dark energy equation of state at z=0.
-        wa: Time-varying dark energy equation of state.
-
-    Returns:
-        Dimensionless Hubble parameter E(z).
-    """
     a = 1 / (1 + z)
     return hubble_E(a, Omega_m, Omega_Lambda, Omega_k, Omega_r, w0, wa)
 
 def dE_da_auto(a, Omega_m=0.3, Omega_Lambda=0.7, Omega_k=0.0, Omega_r=0.0,
                w0=-1.0, wa=0.0):
-    """Compute dE/da using JAX automatic differentiation."""
     E_func = partial(hubble_E, 
                      Omega_m=Omega_m, 
                      Omega_Lambda=Omega_Lambda,
@@ -78,7 +39,6 @@ def dE_da_auto(a, Omega_m=0.3, Omega_Lambda=0.7, Omega_k=0.0, Omega_r=0.0,
 
 def d2E_da2_auto(a, Omega_m=0.3, Omega_Lambda=0.7, Omega_k=0.0, Omega_r=0.0,
                  w0=-1.0, wa=0.0):
-    """Compute d^2E/da^2 using JAX automatic differentiation."""
     dE_func = partial(dE_da_auto,
                      Omega_m=Omega_m,
                      Omega_Lambda=Omega_Lambda, 
@@ -87,6 +47,17 @@ def d2E_da2_auto(a, Omega_m=0.3, Omega_Lambda=0.7, Omega_k=0.0, Omega_r=0.0,
                      w0=w0,
                      wa=wa)
     return grad(dE_func)(a)
+
+def d3E_da3_auto(a, Omega_m=0.3, Omega_Lambda=0.7, Omega_k=0.0, Omega_r=0.0,
+                 w0=-1.0, wa=0.0):
+    d2E_func = partial(d2E_da2_auto,
+                     Omega_m=Omega_m,
+                     Omega_Lambda=Omega_Lambda, 
+                     Omega_k=Omega_k,
+                     Omega_r=Omega_r,
+                     w0=w0,
+                     wa=wa)
+    return grad(d2E_func)(a)
 
 def growth_ode_system(y, a, Omega_m, Omega_Lambda, Omega_k, Omega_r, w0, wa, f_nu):
     """"
@@ -106,22 +77,7 @@ def growth_ode_system(y, a, Omega_m, Omega_Lambda, Omega_k, Omega_r, w0, wa, f_n
 
 
 class LinearGrowth(LikelihoodModule):
-    """Compute the linear growth factor D(z) and sigma8(z).
-
-    Supports emulator, Boltzmann solver, and ODE integration backends.
-    Writes 'sigma8_z' and 'D_z' to the state.
-    """
-
     def __init__(self, zmin=0.0, zmax=2.0, nz=125, **config):
-        """Initialize the linear growth module.
-
-        Args:
-            zmin: Minimum redshift.
-            zmax: Maximum redshift.
-            nz: Number of redshift bins.
-            **config: Additional config (use_emulator, use_boltzmann, solve_ode,
-                emulator_file_name, n_points_ode, a_init_ode).
-        """
         self.nz = nz
         self.z = jnp.linspace(zmin, zmax, self.nz)
         self.use_emulator = bool(config.get("use_emulator", True))
@@ -181,9 +137,18 @@ class LinearGrowth(LikelihoodModule):
                     "Cannot currently compute differentiable growth predictions without emulator."
                 )
             )
+        if self.solve_ode:
+            self.output_requirements['D_ode'] = [
+                "As",
+                "ns",
+                "H0",
+                "w",
+                "ombh2",
+                "omch2",
+                "mnu",
+            ]
 
     def compute_emulator(self, state, params_values):
-        """Compute sigma8(z) and D(z) using the neural network emulator."""
         cosmo_params = jnp.array(
             [
                 params_values["As"],
@@ -202,28 +167,29 @@ class LinearGrowth(LikelihoodModule):
 
         sigma8_z = self.emulator.predict(cparam_grid)[:, 0]
         Dz = sigma8_z / sigma8_z[0]
-
+        
+        state["z_D"] = self.z
         state["sigma8_z"] = sigma8_z
         state["D_z"] = Dz
 
         return state
 
     def compute_boltzmann(self, state, params_values):
-        """Compute sigma8(z) and D(z) from a CLASS Boltzmann solver result."""
         boltz = state["boltzmann_results"]
         Dz = jnp.array([boltz.scale_independent_growth_factor(z) for z in self.z])
         sigma8_z = jnp.array([boltz.sigma(8, z, h_units=True) for z in self.z])
+        
+        state["z_D"] = self.z
         state["sigma8_z"] = sigma8_z
         state["D_z"] = Dz
 
         return state
     
     def compute_ode(self, state, params_values):
-        """Compute D(z) by solving the linear growth ODE with JAX odeint."""
         h = params_values["H0"] / 100
         omega_nu = params_values["mnu"] / 93.14
-        omegam = (params_values["omch2"] + params_values["ombh2"] + omega_nu) / h**2    
-        fnu = omega_nu / (omegam * h**2)        
+        omegam = (params_values["omch2"] + params_values["ombh2"] + omega_nu) / h**2
+        fnu = omega_nu / (omegam * h**2)
         omegal = 1 - omegam
         w0 = params_values["w"]
 
@@ -240,7 +206,7 @@ class LinearGrowth(LikelihoodModule):
                         Omega_r=0.,
                         w0=w0,
                         wa=0.0,
-                        fnu=fnu)
+                        f_nu=fnu)
         
         solution = odeint(ode_func, y0, a_points)
         D_solution = solution[:, 0]
@@ -252,13 +218,13 @@ class LinearGrowth(LikelihoodModule):
         a_target_array = jnp.atleast_1d(a_target)
         D_interp = jnp.interp(a_target_array, a_points, D_normalized)
         
-        state["D_z"] = (self.z_ode, D_interp)
+        state["z_Dz_ode"] = self.z_ode
+        state["Dz_ode"] = D_interp
 
         return state
 
 
     def compute(self, state, params_values):
-        """Compute linear growth and write 'sigma8_z', 'D_z' to state."""
         if self.use_emulator:
             state = self.compute_emulator(state, params_values)
         elif self.use_boltzmann:
