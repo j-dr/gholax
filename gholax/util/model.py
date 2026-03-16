@@ -336,6 +336,25 @@ def _remove_scale_cuts(cfg):
     _walk(cfg)
 
 
+def _set_dummy_cov(cfg, value):
+    """Set dummy_cov in every data_vector config block (in-place).
+
+    Targets dicts that contain 'data_vector_info_filename', which is the
+    distinguishing key of a data_vector config block.
+    """
+    def _walk(d):
+        if isinstance(d, dict):
+            if "data_vector_info_filename" in d:
+                d["dummy_cov"] = value
+            else:
+                for v in d.values():
+                    _walk(v)
+        elif isinstance(d, list):
+            for item in d:
+                _walk(item)
+    _walk(cfg)
+
+
 def save_model_pred():
     """CLI entry point for the ``save-model`` command.
 
@@ -382,6 +401,7 @@ def save_model_pred():
             cross_cfg = copy.deepcopy(cfg)
             _set_c_dd_use_cross(cross_cfg, True)
             _remove_scale_cuts(cross_cfg)
+            _set_dummy_cov(cross_cfg, True)
             cross_model = Model(cross_cfg)
         else:
             cross_model = model
