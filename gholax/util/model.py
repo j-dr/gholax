@@ -323,6 +323,19 @@ def _set_c_dd_use_cross(cfg, value):
     _walk(cfg)
 
 
+def _remove_scale_cuts(cfg):
+    """Remove all scale_cuts entries from a config dict (in-place)."""
+    def _walk(d):
+        if isinstance(d, dict):
+            d.pop("scale_cuts", None)
+            for v in d.values():
+                _walk(v)
+        elif isinstance(d, list):
+            for item in d:
+                _walk(item)
+    _walk(cfg)
+
+
 def save_model_pred():
     """CLI entry point for the ``save-model`` command.
 
@@ -368,6 +381,7 @@ def save_model_pred():
         if needs_cross_model:
             cross_cfg = copy.deepcopy(cfg)
             _set_c_dd_use_cross(cross_cfg, True)
+            _remove_scale_cuts(cross_cfg)
             cross_model = Model(cross_cfg)
         else:
             cross_model = model
