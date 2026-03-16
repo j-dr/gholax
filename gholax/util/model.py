@@ -5,6 +5,7 @@ import numpy as np
 import yaml
 import sys
 import h5py as h5
+import copy
 
 from gholax import likelihood
 from gholax.sampler.priors import Prior
@@ -390,15 +391,15 @@ def save_model_pred():
     else:
         output_base = cfg['output_file'].replace('.txt', '.h5')
 
+    cfg_c = copy.deepcopy(cfg)
     model = Model(cfg)
 
     if args.gauss_cov:
-        import copy
         ref_params = model.prior.get_reference_point()
 
         needs_cross_model = _needs_cross_c_dd_model(model)
         if needs_cross_model:
-            cross_cfg = copy.deepcopy(cfg)
+            cross_cfg = copy.deepcopy(cfg_c)
             _set_c_dd_use_cross(cross_cfg, True)
             _remove_scale_cuts(cross_cfg)
             _set_dummy_cov(cross_cfg, True)

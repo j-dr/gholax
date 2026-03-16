@@ -582,11 +582,15 @@ class TwoPointSpectrum(DataVector):
         """Look up a spectrum value from model_spectra dict or observed data."""
         if model_spectra is not None and (spec, za, zb) in model_spectra:
             return model_spectra[(spec, za, zb)]
-        return self.spectra["value"][
+        s = self.spectra["value"][
             (self.spectra["spectrum_type"] == spec.encode('utf-8'))
             & (self.spectra["zbin0"] == za)
             & (self.spectra["zbin1"] == zb)
         ]
+        if len(s)>0:
+            return s
+        else:
+            raise(ValueError(f"No spectrum {spec} with zbin comination {za}, {zb} found in model spectra or observed data."))
 
     def gaussian_variance(self, si, sj, z00, z01, z10, z11, model_spectra=None):
         """Compute the diagonal Gaussian variance for a pair of spectrum blocks.
@@ -637,19 +641,16 @@ class TwoPointSpectrum(DataVector):
                 covariance_field_types[sj][0],
             ],
         ):
-            if (za, zb) in self.spectrum_info[spec]["bin_pairs"]:
+            try:
                 c_w_n = self._lookup_spectrum(spec, za, zb, model_spectra) \
                         + float(self.covariance_info[spec][f"{za}_{zb}"]["noise"])
-            elif covariance_field_types[spec][0] == covariance_field_types[spec][1]:
-                c_w_n = self._lookup_spectrum(spec, zb, za, model_spectra) \
+            
+            except:
+                if f0 == f1:
+                    c_w_n = self._lookup_spectrum(spec, zb, za, model_spectra) \
                         + float(self.covariance_info[spec][f"{zb}_{za}"]["noise"])
-            elif f1 == "d":
-                c_w_n = self._lookup_spectrum(spec, zb, za, model_spectra) \
-                        + float(self.covariance_info[spec][f"{zb}_{za}"]["noise"])
-            else:
-                raise (
-                    ValueError(f"No spectrum {spec} with zbin comination {za}, {zb}")
-                )
+                else:
+                    raise(ValueError(f"No spectrum {spec} with zbin comination {za}, {zb} or {zb}, {za}"))
 
             spec_w_n.append(c_w_n)
         try:
