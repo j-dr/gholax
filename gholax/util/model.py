@@ -256,6 +256,24 @@ def _minimize(model, output_base):
     solver = jaxopt.LBFGS(fun=vgrad, value_and_grad=True)
 
     x0 = jnp.zeros(len(model.param_names))
+
+    # --- NaN diagnostics ---
+    val0 = jnlp(x0)
+    grad0 = jax.grad(jnlp)(x0)
+    for lname, like in model.likelihoods.items():
+        dv = like.observed_data_vector
+        if hasattr(dv, 'cinv') and dv.cinv is not None:
+            cinv_nan = bool(jnp.any(jnp.isnan(dv.cinv)))
+            cinv_inf = bool(jnp.any(jnp.isinf(dv.cinv)))
+            print(f"  [{lname}] cinv has NaN: {cinv_nan}, has Inf: {cinv_inf}", flush=True)
+    print(f"  -logp at x0: {float(val0):.4f}", flush=True)
+    print(f"  grad at x0 has NaN: {bool(jnp.any(jnp.isnan(grad0)))}", flush=True)
+    print(f"  grad at x0 has Inf: {bool(jnp.any(jnp.isinf(grad0)))}", flush=True)
+    if bool(jnp.any(jnp.isnan(grad0))):
+        nan_params = [model.param_names[i] for i in range(len(model.param_names)) if jnp.isnan(grad0[i])]
+        print(f"  NaN gradient params: {nan_params}", flush=True)
+    # --- end diagnostics ---
+
     print("Running minimization", flush=True)
     res = solver.run(x0)
 
