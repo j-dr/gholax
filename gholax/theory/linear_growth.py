@@ -113,29 +113,18 @@ class LinearGrowth(LikelihoodModule):
         self.a_init_ode = float(config.get("a_init_ode", 1/(1+50)))
         self.z_ode = jnp.linspace(0, 15, 200)
 
+        self.compute_w0wa = bool(config.get("compute_w0wa", False))
         self.output_requirements = {}
         if self.use_emulator:
             self.emulator_file_name = config["emulator_file_name"]
             self.emulator = ScalarEmulator(self.emulator_file_name)
             # these are the parameters that are checked in order to decide whether quantities need to be recomputed
-            self.output_requirements["sigma8_z"] = [
-                "As",
-                "ns",
-                "H0",
-                "w",
-                "ombh2",
-                "omch2",
-                "mnu",
-            ]
-            self.output_requirements["D_z"] = [
-                "As",
-                "ns",
-                "H0",
-                "w",
-                "ombh2",
-                "omch2",
-                "mnu",
-            ]
+            if self.compute_w0wa:
+                params = ["As", "ns", "H0", "w", "wa", "ombh2", "omch2", "mnu"]
+            else:
+                params = ["As", "ns", "H0", "w", "ombh2", "omch2", "mnu"]
+            self.output_requirements["sigma8_z"] = params
+            self.output_requirements["D_z"] = params
 
         elif self.use_boltzmann:
             self.output_requirements["sigma8_z"] = [
@@ -174,22 +163,58 @@ class LinearGrowth(LikelihoodModule):
                 "mnu",
             ]
 
-    def compute_emulator(self, state, params_values):
-        cosmo_params = jnp.array(
-            [
-                params_values["As"],
-                params_values["ns"],
-                params_values["H0"],
-                params_values["w"],
-                params_values["ombh2"],
-                params_values["omch2"],
-                jnp.log10(params_values["mnu"]),
-            ]
-        )
+    def _compute_D_at_z(self, omegam, omegal, fnu, w0, wa):
+        """Returns unnormalized D(z) interpolated onto self.z."""
+        D_init = self.a_init_ode
+        y0 = jnp.array([D_init, 1.0])
+        a_points = jnp.logspace(jnp.log10(self.a_init_ode), 0, self.n_points_ode)
+        ode_func = partial(growth_ode_system,
+                           Omega_m=omegam, Omega_Lambda=omegal,
+                           Omega_k=0., Omega_r=0.,
+                           w0=w0, wa=wa, f_nu=fnu)
+        solution = odeint(ode_func, y0, a_points)
+        D_solution = solution[:, 0]
+        a_target = 1.0 / (1.0 + self.z)
+        return jnp.interp(a_target, a_points, D_solution)
 
+    def compute_w0wa_emulator(self, state, params_values):
+        # Run wCDM emulator with w=w0, wa=0
+        cosmo_params = jnp.array([
+            params_values["As"],
+            params_values["ns"],
+            params_values["H0"],
+            params_values["w"],
+            params_values["ombh2"],
+            params_values["omch2"],
+            jnp.log10(params_values["mnu"]),
+        ])
         cparam_grid = jnp.zeros((self.nz, len(cosmo_params) + 1))
         cparam_grid = cparam_grid.at[:, :-1].set(cosmo_params)
         cparam_grid = cparam_grid.at[:, -1].set(self.z)
+        sigma8_z = self.emulator.predict(cparam_grid)[:, 0]
+
+        # Growth factor correction: unnormalized ODE ratio D_w0wa / D_wCDM
+        h = params_values["H0"] / 100
+        omega_nu = params_values["mnu"] / 93.14
+        omegam = (params_values["omch2"] + params_values["ombh2"] + omega_nu) / h**2
+        omegal = 1 - omegam
+        fnu = omega_nu / (omegam * h**2)
+        w0 = params_values["w"]
+        wa = params_values["wa"]
+
+        D_wcdm = self._compute_D_at_z(omegam, omegal, fnu, w0=w0, wa=0.0)
+        D_w0wa = self._compute_D_at_z(omegam, omegal, fnu, w0=w0, wa=wa)
+        sigma8_z = sigma8_z * (D_w0wa / D_wcdm)
+
+        Dz = sigma8_z / sigma8_z[0]
+        state["z_D"] = self.z
+        state["sigma8_z"] = sigma8_z
+        state["D_z"] = Dz
+        return state
+
+    def compute_emulator(self, state, params_values):
+        from .spectral_equivalence import build_equiv_cparam_grid
+        cparam_grid = build_equiv_cparam_grid(params_values, self.z, state)
 
         sigma8_z = self.emulator.predict(cparam_grid)[:, 0]
         Dz = sigma8_z / sigma8_z[0]
@@ -231,7 +256,7 @@ class LinearGrowth(LikelihoodModule):
                         Omega_k=0.,
                         Omega_r=0.,
                         w0=w0,
-                        wa=0.0,
+                        wa=params_values.get("wa", 0.0),
                         f_nu=fnu)
         
         solution = odeint(ode_func, y0, a_points)
@@ -251,7 +276,9 @@ class LinearGrowth(LikelihoodModule):
 
 
     def compute(self, state, params_values):
-        if self.use_emulator:
+        if self.use_emulator and self.compute_w0wa:
+            state = self.compute_w0wa_emulator(state, params_values)
+        elif self.use_emulator:
             state = self.compute_emulator(state, params_values)
         elif self.use_boltzmann:
             state = self.compute_boltzmann(state, params_values)

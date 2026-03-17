@@ -8,6 +8,7 @@ from ..theory.real_space_biased_tracer_spectra import (
     RealSpaceBiasExpansion,
 )
 from ..theory.ia import DensityShapeIA, ShapeShapeIA, RealSpaceIAExpansion
+from ..theory.spectral_equivalence import SpectralEquivalence
 from .projection.limber import Limber
 from .projection.kernels import ProjectionKernels
 from .projection.delta_z import DeltaZ
@@ -96,6 +97,16 @@ class Nx2PTAngularPowerSpectrum(GaussianLikelihood):
                 )
         
             
+        spectral_equiv_modules = []
+        if "SpectralEquivalence" in config_theory:
+            z_pk = jnp.linspace(self.zmin_pk, self.zmax_pk, self.nz_pk)
+            spectral_equiv_modules.append(
+                SpectralEquivalence(
+                    z=z_pk,
+                    **config_theory["SpectralEquivalence"],
+                )
+            )
+
         self.likelihood_pipeline.extend(
             [
                 ExpansionHistory(
@@ -104,6 +115,7 @@ class Nx2PTAngularPowerSpectrum(GaussianLikelihood):
                     nz=self.nz_proj,
                     **config_theory.get("ExpansionHistory", {}),
                 ),
+                *spectral_equiv_modules,
                 LinearGrowth(
                     zmin=self.zmin_pk,
                     zmax=self.zmax_pk,

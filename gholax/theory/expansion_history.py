@@ -172,6 +172,7 @@ class ExpansionHistory(LikelihoodModule):
     def compute_analytic(self, params_values):
         h = params_values['H0'] / 100.0
         w0 = params_values["w"]
+        wa = params_values.get("wa", 0.0)
         n_species = 3  # three degenerate massive neutrino species
         mnu_per_species = params_values["mnu"] / n_species
 
@@ -200,7 +201,7 @@ class ExpansionHistory(LikelihoodModule):
             y = mnu_per_species * a / _T_NU0_EV
             F_y = neutrino_density_ratio(y, gl_nodes, gl_weights)
             Omega_nu_a = n_species * (_OMEGA_NU_REL_H2_PER_SPECIES / h**2) * F_y / a**4
-            Omega_de = Omega_Lambda * dark_energy_density(a, w0, 0.0)
+            Omega_de = Omega_Lambda * dark_energy_density(a, w0, wa)
             return jnp.sqrt(Omega_r_photon / a**4 + Omega_cb / a**3 + Omega_nu_a + Omega_de)
 
         def E_z_full(z):
@@ -222,22 +223,11 @@ class ExpansionHistory(LikelihoodModule):
 
         return chi_z, e_z, Omega_m, chi_derivs
     
-    def compute_emulator(self, params_values):
-        cosmo_params = jnp.array(
-            [
-                params_values["As"] * 10**9,
-                params_values["ns"],
-                params_values["H0"],
-                params_values["w"],
-                params_values["ombh2"],
-                params_values["omch2"],
-                jnp.log10(params_values["mnu"]),
-            ]
-        )
-
-        cparam_grid = jnp.zeros((self.nz, len(cosmo_params) + 1))
-        cparam_grid = cparam_grid.at[:, :-1].set(cosmo_params)
-        cparam_grid = cparam_grid.at[:, -1].set(self.z)
+    def compute_emulator(self, params_values, state=None):
+        from .spectral_equivalence import build_equiv_cparam_grid
+        if state is None:
+            state = {}
+        cparam_grid = build_equiv_cparam_grid(params_values, self.z, state, scale_As=1e9)
 
         chi_z = self.emulators["chi_z"].predict(cparam_grid)
         e_z = self.emulators["e_z"].predict(cparam_grid)
@@ -260,7 +250,7 @@ class ExpansionHistory(LikelihoodModule):
             state['chi_derivs'] = chi_derivs
         
         elif self.use_emulator:
-            chi_z, e_z = self.compute_emulator(params_values)
+            chi_z, e_z = self.compute_emulator(params_values, state)
             omega_nu = params_values["mnu"] / 93.14
             h = params_values["H0"] / 100
             state["omegam"] = (

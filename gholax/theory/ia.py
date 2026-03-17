@@ -76,12 +76,10 @@ class DensityShapeIA(LikelihoodModule):
 
     def compute_emulator(self, state, params_values):
         """Compute density-shape IA spectra using the neural network emulator."""
-        cosmo_params = jnp.array(
-            [params_values[p] for p in self.input_param_order[:-1]]
+        from .spectral_equivalence import build_equiv_cparam_grid_custom_order
+        cparam_grid = build_equiv_cparam_grid_custom_order(
+            params_values, self.z, state, self.input_param_order,
         )
-        cparam_grid = jnp.zeros((self.nz, len(cosmo_params) + 1))
-        cparam_grid = cparam_grid.at[:, :-1].set(cosmo_params)
-        cparam_grid = cparam_grid.at[:, -1].set(self.z)
         n_spec = self.emulator.n_spec
 
         # assume same k values for density shape and shape shape.
@@ -234,12 +232,10 @@ class ShapeShapeIA(LikelihoodModule):
 
     def compute_emulator(self, state, params_values):
         """Compute shape-shape IA spectra using neural network emulators."""
-        cosmo_params = jnp.array(
-            [params_values[p] for p in self.input_param_order[:-1]]
+        from .spectral_equivalence import build_equiv_cparam_grid_custom_order
+        cparam_grid = build_equiv_cparam_grid_custom_order(
+            params_values, self.z, state, self.input_param_order,
         )
-        cparam_grid = jnp.zeros((self.nz, len(cosmo_params) + 1))
-        cparam_grid = cparam_grid.at[:, :-1].set(cosmo_params)
-        cparam_grid = cparam_grid.at[:, -1].set(self.z)
         n_spec = self.emulators[0].n_spec
 
         # assume same k values same for all m.

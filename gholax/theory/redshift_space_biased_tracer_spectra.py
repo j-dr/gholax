@@ -230,12 +230,10 @@ class RedshiftSpaceBiasedTracerSpectra(LikelihoodModule):
 
     def compute_emulator(self, state, params_values):
         """Compute redshift-space P_ij(k,ell) using emulators and apply AP corrections."""
-        cosmo_params = jnp.array(
-            [params_values[p] for p in self.input_param_order[:-1]]
+        from .spectral_equivalence import build_equiv_cparam_grid_custom_order
+        cparam_grid = build_equiv_cparam_grid_custom_order(
+            params_values, self.z, state, self.input_param_order,
         )
-        cparam_grid = jnp.zeros((self.nz, len(cosmo_params) + 1))
-        cparam_grid = cparam_grid.at[:, :-1].set(cosmo_params)
-        cparam_grid = cparam_grid.at[:, -1].set(self.z)
 
         logk_emu = jnp.log10(self.emulators[0].k)
         state["p_ij_ell_redshift_space_bias_grid"] = jnp.zeros(
