@@ -128,8 +128,8 @@ class ExpansionHistory(LikelihoodModule):
             self.output_requirements["e_z"] = ["boltzmann_results"]
             self.output_requirements["omegam"] = ["boltzmann_results"]
         else:
-            self.output_requirements["chi_z"] = ["omch2", "ombh2", "H0", "mnu", "w"]
-            self.output_requirements["e_z"] = ["omch2", "ombh2", "H0", "mnu", "w"]
+            self.output_requirements["chi_z"] = ["omch2", "ombh2", "H0", "mnu", "w", "wa"]
+            self.output_requirements["e_z"] = ["omch2", "ombh2", "H0", "mnu", "w", "wa"]
             self.output_requirements["omegam"] = ["omch2", "ombh2", "H0", "mnu"]
 
     def T_AK(self, x):

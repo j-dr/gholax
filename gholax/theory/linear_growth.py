@@ -127,24 +127,8 @@ class LinearGrowth(LikelihoodModule):
             self.output_requirements["D_z"] = params
 
         elif self.use_boltzmann:
-            self.output_requirements["sigma8_z"] = [
-                "As",
-                "ns",
-                "H0",
-                "w",
-                "ombh2",
-                "omch2",
-                "mnu",
-            ]
-            self.output_requirements["D_z"] = [
-                "As",
-                "ns",
-                "H0",
-                "w",
-                "ombh2",
-                "omch2",
-                "mnu",
-            ]
+            self.output_requirements["sigma8_z"] = ["boltzmann_results"]
+            self.output_requirements["D_z"] = ["boltzmann_results"]
 
         else:
             raise (
@@ -158,6 +142,7 @@ class LinearGrowth(LikelihoodModule):
                 "ns",
                 "H0",
                 "w",
+                "wa",
                 "ombh2",
                 "omch2",
                 "mnu",

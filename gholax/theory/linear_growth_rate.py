@@ -40,15 +40,7 @@ class LinearGrowthRate(LikelihoodModule):
             ]
 
         elif self.use_boltzmann:
-            self.output_requirements["f_z"] = [
-                "As",
-                "ns",
-                "H0",
-                "w",
-                "ombh2",
-                "omch2",
-                "mnu",
-            ]
+            self.output_requirements["f_z"] = ["boltzmann_results"]
 
         else:
             raise (

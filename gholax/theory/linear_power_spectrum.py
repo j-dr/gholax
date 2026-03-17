@@ -58,24 +58,8 @@ class LinearPowerSpectrum(LikelihoodModule):
             self.z = np.linspace(zmin, zmax, self.nz)
             self.k = np.logspace(np.log10(self.kmin), np.log10(self.kmax), self.nk)
 
-            self.output_requirements["Pm_lin_z"] = [
-                "As",
-                "ns",
-                "H0",
-                "w",
-                "ombh2",
-                "omch2",
-                "mnu",
-            ]
-            self.output_requirements["Pcb_lin_z"] = [
-                "As",
-                "ns",
-                "H0",
-                "w",
-                "ombh2",
-                "omch2",
-                "mnu",
-            ]
+            self.output_requirements["Pm_lin_z"] = ["boltzmann_results", "H0"]
+            self.output_requirements["Pcb_lin_z"] = ["boltzmann_results", "H0"]
 
         else:
             raise (
