@@ -214,10 +214,12 @@ class LinearGrowth(LikelihoodModule):
         boltz = state["boltzmann_results"]
         Dz = jnp.array([boltz.scale_independent_growth_factor(z) for z in self.z])
         sigma8_z = jnp.array([boltz.sigma(8, z, h_units=True) for z in self.z])
+        sigma12_z = jnp.array([boltz.sigma(12, z, h_units=False) for z in self.z])
         
         state["z_D"] = self.z
         state["sigma8_z"] = sigma8_z
         state["D_z"] = Dz
+        state["sigma12_z"] = sigma12_z
 
         return state
     

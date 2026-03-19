@@ -52,6 +52,12 @@ except ImportError:
 
 
 try:
+    from velocileptors.LPT.lpt_rsd_fftw import LPT_RSD as _LPT_RSD  # noqa: F401
+    lpt_rsd_available = True
+except ImportError:
+    lpt_rsd_available = False
+
+try:
     import euclidemu2 as _ee2  # noqa: F401
     euclidemu2_available = True
 except ImportError:
@@ -65,6 +71,9 @@ requires_density_shape = pytest.mark.skipif(
 )
 requires_shape_shape = pytest.mark.skipif(
     not shape_shape_available, reason="spinosaurus ShapeShapeCorrelators not installed"
+)
+requires_lpt_rsd = pytest.mark.skipif(
+    not lpt_rsd_available, reason="velocileptors LPT_RSD not installed"
 )
 requires_euclidemu2 = pytest.mark.skipif(
     not euclidemu2_available, reason="euclidemu2 not installed"
@@ -97,6 +106,7 @@ _K_LIN = np.logspace(np.log10(_K_LIN_MIN), np.log10(_K_LIN_MAX), _NK_LIN)
 _RTOL_CLEFT = 0.01       # 1% for CLEFT P_ij
 _RTOL_DENSITY_SHAPE = 0.01  # 1% for density-shape IA
 _RTOL_SHAPE_SHAPE = 0.01    # 1% for shape-shape IA
+_RTOL_RSD = 0.05            # 5% for LPT_RSD P_ij (growth rate f(z) adds mismatch)
 
 # HEFT P_11 emulator config
 _HEFT_PIJ_EMU_CONFIG = "emu_config_dst_irresum.yaml"
@@ -403,6 +413,121 @@ def _compute_shape_shape_spectra(k_lin, pk_cb):
     return spec
 
 
+def _class_pk_rsd(params, z_arr):
+    """Run CLASS and return (k_lin, Pcb_lin[nz, nk], f_z[nz]).
+
+    Like _class_pk but also returns the scale-independent growth rate f(z)
+    and only returns Pcb (not Pm), since LPT_RSD only needs cb spectra.
+    """
+    from classy import Class
+    boltz = Class()
+    z_str = ",".join([f"{z:.4f}" for z in z_arr])
+    boltz.set({
+        "output": "mPk",
+        "P_k_max_h/Mpc": _K_LIN_MAX * 1.1,
+        "z_pk": z_str,
+        "A_s": params["As"] * 1e-9,
+        "n_s": params["ns"],
+        "h": params["H0"] / 100,
+        "omega_b": params["ombh2"],
+        "omega_cdm": params["omch2"],
+        "N_ur": 0.0,
+        "N_ncdm": 1,
+        "deg_ncdm": 3,
+        "m_ncdm": params["mnu"] / 3,
+        "Omega_Lambda": 0.0,
+        "w0_fld": params["w"],
+        "wa_fld": params.get("wa", 0.0),
+        "tau_reio": 0.0568,
+    })
+    boltz.compute()
+
+    h = params["H0"] / 100
+    nz = len(z_arr)
+    Pcb = np.zeros((nz, _NK_LIN))
+    f_z = np.zeros(nz)
+    for i, z in enumerate(z_arr):
+        f_z[i] = boltz.scale_independent_growth_factor_f(float(z))
+        for j, k in enumerate(_K_LIN):
+            Pcb[i, j] = boltz.pk_cb(k * h, float(z)) * h**3
+
+    boltz.struct_cleanup()
+    boltz.empty()
+    return _K_LIN, Pcb, f_z
+
+
+def _compute_lpt_rsd_spectra(k_lin, pk_cb, f_z, kIR=_KIR):
+    """Run LPT_RSD on a single redshift slice and return (3, 19, nk) array.
+
+    Output shape is (n_ell, n_spec, nk) for ell=0,2,4.
+    No AP correction (apar=aperp=1).
+    """
+    from velocileptors.LPT.lpt_rsd_fftw import LPT_RSD
+
+    model = LPT_RSD(
+        k_lin, pk_cb, kIR=kIR,
+        use_Pzel=False, cutoff=10,
+        extrap_min=-4, extrap_max=3,
+        N=2000, threads=1, jn=5,
+    )
+    model.make_pltable(
+        np.float64(f_z), kv=_K, apar=1, aperp=1,
+    )
+
+    spec = np.zeros((3, 19, _NK))
+    spec[0] = model.p0ktable.T
+    spec[1] = model.p2ktable.T
+    spec[2] = model.p4ktable.T
+    return spec
+
+
+def _plot_rsd_residuals(k, spec_exact, spec_equiv, params, z_values,
+                        spec_indices, spec_names=None):
+    """Plot relative residuals vs k for LPT_RSD spectra, with panels for ell=0,2,4."""
+    import matplotlib.pyplot as plt
+
+    if spec_names is None:
+        spec_names = {i: f"spec {i}" for i in spec_indices}
+
+    ell_labels = [r"$\ell=0$", r"$\ell=2$", r"$\ell=4$"]
+    label = _cosmo_label(params)
+    nz = len(z_values)
+    ns = len(spec_indices)
+    n_ell = 3
+
+    fig, axes = plt.subplots(ns * n_ell, nz, figsize=(5 * nz, 3.0 * ns * n_ell),
+                             squeeze=False, sharex=True)
+    fig.suptitle(f"LPT_RSD P_ij residuals: spectral equiv vs exact w0wa\n{label}",
+                 fontsize=13)
+
+    for col, z_i in enumerate(z_values):
+        for li in range(n_ell):
+            for si, s_idx in enumerate(spec_indices):
+                row = li * ns + si
+                ax = axes[row, col]
+                exact = spec_exact[z_i][li, s_idx]
+                equiv = spec_equiv[z_i][li, s_idx]
+
+                mask = np.abs(exact) > 1e-6 * np.max(np.abs(exact))
+                rel_err = np.full_like(exact, np.nan)
+                rel_err[mask] = (equiv[mask] - exact[mask]) / exact[mask]
+
+                ax.semilogx(k, rel_err, "C0-", lw=0.8)
+                ax.axhline(0, color="k", ls="--", lw=0.5)
+                ax.set_ylabel(f"{ell_labels[li]} {spec_names.get(s_idx, f's{s_idx}')}")
+                if row == 0:
+                    ax.set_title(f"z = {z_i}")
+                if row == ns * n_ell - 1:
+                    ax.set_xlabel(r"$k$ [$h$/Mpc]")
+                ax.set_ylim(-0.05, 0.05)
+
+    fig.tight_layout()
+    fname = os.path.join(_PLOT_DIR, f"lpt_rsd_residuals_{label}.png")
+    fig.savefig(fname, dpi=150)
+    plt.close(fig)
+    return fname
+
+
 # ---------------------------------------------------------------------------
 # Select test cosmologies with nonzero wa
 # ---------------------------------------------------------------------------
@@ -632,6 +757,122 @@ def test_cleft_wa_zero_identity():
             spec_equiv[s_idx], spec_orig[s_idx], rtol=0.01,
             err_msg=f"wa=0 regression: CLEFT spec {s_idx} at z={z_i} differs",
         )
+
+
+# ---------------------------------------------------------------------------
+# Test: LPT_RSD P_ij (RedshiftSpaceBiasedTracerSpectra)
+# ---------------------------------------------------------------------------
+
+@requires_classy
+@requires_lpt_rsd
+@pytest.mark.parametrize("params", _W0WA_NONZERO, ids=_W0WA_NONZERO_IDS)
+def test_lpt_rsd_spectral_equiv_vs_exact(params, plot_diagnostics):
+    """LPT_RSD P_ij from equivalent wCDM matches true w0wa to within tolerance.
+
+    For each test redshift, runs LPT_RSD on CLASS P_cb(k) and f(z) from
+    the true w0wa cosmology and compares against LPT_RSD run on the equivalent
+    wCDM cosmology determined by SpectralEquivalence.
+    """
+    w_equiv_z, As_equiv_z, z_equiv = _run_spectral_equivalence(params)
+
+    _RSD_SPEC_INDICES = [0, 1, 2, 3, 5]
+    _RSD_SPEC_NAMES = {0: r"$P^{(0)}$", 1: r"$P^{(1)}$",
+                       2: r"$P^{(2)}$", 3: r"$P^{(3)}$",
+                       5: r"$P^{(5)}$"}
+
+    all_spec_exact = {}
+    all_spec_equiv = {}
+
+    for z_i in _Z_TEST:
+        # Exact: CLASS with true w0wa
+        k_lin, Pcb_exact, f_z_exact = _class_pk_rsd(params, [z_i])
+        spec_exact = _compute_lpt_rsd_spectra(k_lin, Pcb_exact[0], f_z_exact[0])
+
+        # Spectral equiv: CLASS with equivalent wCDM at this z
+        equiv_params = _make_equiv_params(params, z_i, w_equiv_z, As_equiv_z, z_equiv)
+        k_lin_eq, Pcb_eq, f_z_eq = _class_pk_rsd(equiv_params, [z_i])
+        spec_equiv = _compute_lpt_rsd_spectra(k_lin_eq, Pcb_eq[0], f_z_eq[0])
+
+        all_spec_exact[z_i] = spec_exact
+        all_spec_equiv[z_i] = spec_equiv
+
+        # Compare dominant spectra per multipole
+        for ell_idx in range(3):
+            for s_idx in _RSD_SPEC_INDICES:
+                exact = spec_exact[ell_idx, s_idx]
+                equiv = spec_equiv[ell_idx, s_idx]
+
+                # Use a tighter mask to exclude zero crossings in RSD spectra
+                mask = np.abs(exact) > 1e-4 * np.max(np.abs(exact))
+                if not mask.any():
+                    continue
+
+                rel_err = np.abs(equiv[mask] - exact[mask]) / np.abs(exact[mask])
+                median_err = np.median(rel_err)
+                ell = ell_idx * 2
+                assert median_err < _RTOL_RSD, (
+                    f"LPT_RSD ell={ell} spec {s_idx} at z={z_i}: median rel error "
+                    f"{median_err:.4f} > {_RTOL_RSD} (max={rel_err.max():.4f})"
+                )
+
+    if plot_diagnostics:
+        _ensure_plot_dir()
+        fname = _plot_rsd_residuals(
+            _K, all_spec_exact, all_spec_equiv, params, list(_Z_TEST),
+            _RSD_SPEC_INDICES, _RSD_SPEC_NAMES,
+        )
+        print(f"  Saved LPT_RSD diagnostic plot: {fname}")
+
+
+# ---------------------------------------------------------------------------
+# Regression test: wa=0 gives identical RSD spectra (no mapping)
+# ---------------------------------------------------------------------------
+
+@requires_classy
+@requires_lpt_rsd
+def test_lpt_rsd_wa_zero_identity():
+    """With wa=0, spectral equivalence should produce identical LPT_RSD spectra.
+
+    Since no w0wa mapping is needed, the equivalent wCDM should match the
+    original cosmology exactly.
+    """
+    params = W0WA_COSMO_PARAMS["wa_zero"]
+    w_equiv_z, As_equiv_z, z_equiv = _run_spectral_equivalence(params)
+
+    # w_equiv should be very close to w0
+    np.testing.assert_allclose(w_equiv_z, params["w"], atol=1e-4,
+                               err_msg="w_equiv should equal w0 when wa=0")
+
+    # As_equiv should be very close to As
+    np.testing.assert_allclose(As_equiv_z, params["As"], rtol=1e-3,
+                               err_msg="As_equiv should equal As when wa=0")
+
+    # Verify RSD spectra match at z=0.5
+    z_i = 0.5
+    k_lin, Pcb, f_z = _class_pk_rsd(params, [z_i])
+    spec_orig = _compute_lpt_rsd_spectra(k_lin, Pcb[0], f_z[0])
+
+    equiv_params = _make_equiv_params(params, z_i, w_equiv_z, As_equiv_z, z_equiv)
+    k_lin_eq, Pcb_eq, f_z_eq = _class_pk_rsd(equiv_params, [z_i])
+    spec_equiv = _compute_lpt_rsd_spectra(k_lin_eq, Pcb_eq[0], f_z_eq[0])
+
+    for ell_idx in range(3):
+        for s_idx in [0, 1, 5]:
+            orig = spec_orig[ell_idx, s_idx]
+            equiv = spec_equiv[ell_idx, s_idx]
+
+            # Only compare where signal is nontrivial (skip near-zero components)
+            mask = np.abs(orig) > 1e-4 * np.max(np.abs(orig))
+            if not mask.any():
+                continue
+
+            rel_err = np.abs(equiv[mask] - orig[mask]) / np.abs(orig[mask])
+            median_err = np.median(rel_err)
+            ell = ell_idx * 2
+            assert median_err < 0.01, (
+                f"wa=0 regression: LPT_RSD ell={ell} spec {s_idx} at z={z_i}: "
+                f"median rel error {median_err:.4f} > 0.01"
+            )
 
 
 # ---------------------------------------------------------------------------
