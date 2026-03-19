@@ -340,24 +340,33 @@ class Emulator(nn.Module):
         print(f"Total parameters saved: {total_params:,}")
         print(f"File size: {os.path.getsize(filepath+'.json') / 1024 / 1024:.2f} MB")    
 
-if __name__ == '__main__':
-
+def train_emulator():
+    """CLI entry point for training an emulator from a YAML config file."""
     info_txt = sys.argv[1]
     with open(info_txt, 'rb') as fp:
         emu_info = yaml.load(fp, Loader=Loader)
+
+    # Optional: run reformatting before training
+    if 'raw_training_filename' in emu_info:
+        from gholax.training.reformat import reformat
+        raw_filename = emu_info['raw_training_filename']
+        generation_config = emu_info['generation_config']
+        reformat(raw_filename, generation_config, emu_info['target'])
+        # Use the same file for training (reformatted datasets written in-place)
+        emu_info.setdefault('training_filename', raw_filename)
 
     training_data_filename = emu_info['training_filename']
     output_path = emu_info['output_path']
     learning_rate = emu_info.pop('learning_rate', [5e-3, 1e-3, 5e-4, 1e-4])
     batch_size = emu_info.pop('batch_size', [320, 640, 1280, 2560])
     n_epochs = emu_info['n_epochs']
-    
+
     phases = [
         {'lr': learning_rate[0], 'epochs':n_epochs, 'initial_bs': int(batch_size[0]), 'warmup': 50},
         {'lr': learning_rate[1], 'epochs':n_epochs, 'initial_bs': int(batch_size[1]), 'warmup': 0},
         {'lr': learning_rate[2], 'epochs':n_epochs, 'initial_bs': int(batch_size[2]), 'warmup': 0},
         {'lr': learning_rate[3], 'epochs':n_epochs, 'initial_bs': int(batch_size[3]), 'warmup': 0}
-    ]    
+    ]
 
     emu_target = emu_info['target']
     emu_params = emu_info['param_dataset']
@@ -415,10 +424,14 @@ if __name__ == '__main__':
     pc_train = np.dot(Ftrain, v)
 
     pc_mean = np.mean(pc_train, axis=0)
-    pc_sigmas = np.std(pc_train, axis=0)    
+    pc_sigmas = np.std(pc_train, axis=0)
 
     emu = Emulator(Ptrain.shape[-1], torch.Tensor(pc_sigmas), torch.Tensor(pc_mean), torch.Tensor(v), n_components=n_pcs,
                    n_hidden=n_hidden, mean=torch.Tensor(mean), sigmas=torch.Tensor(sigmas),
                    param_mean=torch.Tensor(Pmean), param_sigmas=torch.Tensor(Psigmas), fstd=torch.Tensor(Fstd))
-    emu.train_with_adaptive_batching(torch.Tensor(Ptrain), torch.Tensor(Ftrain), torch.Tensor(Pval), torch.Tensor(Fval), phases=phases)    
+    emu.train_with_adaptive_batching(torch.Tensor(Ptrain), torch.Tensor(Ftrain), torch.Tensor(Pval), torch.Tensor(Fval), phases=phases)
     emu.save(output_path)
+
+
+if __name__ == '__main__':
+    train_emulator()
