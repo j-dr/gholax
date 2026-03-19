@@ -1,4 +1,6 @@
 import sys
+import os
+os.environ['HDF5_USE_FILE_LOCKING'] = 'FALSE'
 import numpy as np
 import yaml
 import h5py
@@ -9,7 +11,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
-import os
 
 class EarlyStopping:
     def __init__(self, patience=7, min_delta=0, restore_best_weights=True):
