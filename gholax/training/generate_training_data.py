@@ -26,6 +26,7 @@ def generate_models(
     params_fast=None,
     param_names_fast=None,
     nfast_per_slow=1,
+    n_checkpoint=2,
 ):
     """
     Generate training data for emulator by running model predictions in parallel.
@@ -148,13 +149,17 @@ def generate_models(
                 count += 1  
             end = time()                
 
+            if (n + 1) % n_checkpoint == 0:
+                with h5py.File(f"{emu_info['output_filename']}.{rank}", "w") as fp:
+                    for k in out:
+                        fp.create_dataset(k, data=out[k][:count])
+                if rank == 0:
+                    print(f"Checkpoint at slow step {n+1}", flush=True)
+
     # Save this rank's results to a separate HDF5 file
-    for k in out:
-        with h5py.File("{}.{}".format(emu_info["output_filename"], rank), "w") as fp:
-            for k in out:
-                shape = out[k].shape
-                fp.create_dataset(k, shape)
-                fp[k][:] = out[k]
+    with h5py.File("{}.{}".format(emu_info["output_filename"], rank), "w") as fp:
+        for k in out:
+            fp.create_dataset(k, data=out[k][:count])
 
     # Wait for all ranks to finish writing their individual files
     comm.Barrier()
@@ -198,6 +203,7 @@ def generate_training_data():
     nend = emu_info.pop("nend", 100)    # Ending parameter index
     param_names_fast = emu_info.pop("param_names_fast", None)  # Fast parameter names
     nfast = emu_info.pop("nfast_per_slow", 1)  # Fast samples per slow sample
+    n_checkpoint = emu_info.pop("n_checkpoint", 2)  # Checkpoint every n slow steps
     design_scheme = emu_info.pop("design_scheme", "qrs")  # Sampling scheme (qrs, sobol, lhs)
     seed = emu_info.pop("seed", 0)  # Random seed for reproducibility
 
@@ -248,4 +254,5 @@ def generate_training_data():
         params_fast=params_fast,
         param_names_fast=param_names_fast,
         nfast_per_slow=nfast,
+        n_checkpoint=n_checkpoint,
     )
