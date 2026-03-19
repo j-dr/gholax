@@ -340,6 +340,125 @@ class Emulator(nn.Module):
         print(f"Total parameters saved: {total_params:,}")
         print(f"File size: {os.path.getsize(filepath+'.json') / 1024 / 1024:.2f} MB")    
 
+_TARGET_NSPEC = {
+    'p_cleft': 19, 'p_density_shape': 21,
+    'p0_shape_shape': 13, 'p1_shape_shape': 13, 'p2_shape_shape': 13,
+    'pkell0': 13, 'pkell1': 13, 'pkell2': 13, 'pkell3': 13,
+}
+
+
+def plot_residuals(emu, Pval, Fval, mean, sigmas, Fstd, use_asinh,
+                   target, output_path, z_idx_val=None, z=None, k=None,
+                   Pval_raw=None):
+    """Generate residual diagnostic plots after training."""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    from matplotlib.backends.backend_pdf import PdfPages
+
+    emu.eval()
+    with torch.no_grad():
+        pred = emu(torch.tensor(Pval, dtype=torch.float32).to(emu.device)).cpu().numpy()
+
+    # pred and Fval are in normalized space: (F - mean) / sigmas
+    pred_unnorm = pred * sigmas + mean
+    truth_unnorm = Fval * sigmas + mean
+
+    if use_asinh and Fstd is not None:
+        pred_real = np.sinh(pred_unnorm) * Fstd
+        truth_real = np.sinh(truth_unnorm) * Fstd
+    else:
+        pred_real = pred_unnorm
+        truth_real = truth_unnorm
+
+    safe = np.abs(truth_real) > 1e-30
+    frac_resid = np.where(safe, (pred_real - truth_real) / truth_real, 0.0)
+
+    nspec = _TARGET_NSPEC.get(target, None)
+    is_spectrum = nspec is not None
+    pdf_path = f"{output_path}_residuals.pdf"
+    quantiles = [5, 16, 50, 84, 95]
+
+    with PdfPages(pdf_path) as pdf:
+        if is_spectrum and k is not None:
+            nk = len(k)
+            frac_3d = frac_resid.reshape(-1, nspec, nk)
+
+            # Page 1: residual vs k, one panel per spectrum component
+            ncols = min(4, nspec)
+            nrows = (nspec + ncols - 1) // ncols
+            fig, axes = plt.subplots(nrows, ncols, figsize=(4 * ncols, 3 * nrows),
+                                     squeeze=False)
+            for s in range(nspec):
+                ax = axes[s // ncols, s % ncols]
+                r = frac_3d[:, s, :]
+                q = np.percentile(r, quantiles, axis=0)
+                ax.fill_between(k, q[0], q[4], alpha=0.2, color='C0', label='5-95%')
+                ax.fill_between(k, q[1], q[3], alpha=0.4, color='C0', label='16-84%')
+                ax.plot(k, q[2], color='C0', lw=1, label='median')
+                ax.axhline(0, color='k', ls='--', lw=0.5)
+                ax.set_xlabel('k')
+                ax.set_ylabel('frac. residual')
+                ax.set_title(f'spec {s}')
+                ax.set_xscale('log')
+                if s == 0:
+                    ax.legend(fontsize=6)
+            for idx in range(nspec, nrows * ncols):
+                axes[idx // ncols, idx % ncols].set_visible(False)
+            fig.suptitle(f'{target}: fractional residual vs k', y=1.02)
+            fig.tight_layout()
+            pdf.savefig(fig, bbox_inches='tight')
+            plt.close(fig)
+
+            # Page 2: summary residual vs z
+            if z_idx_val is not None and z is not None:
+                abs_flat = np.abs(frac_3d).reshape(len(frac_3d), -1)
+                unique_zi = np.unique(z_idx_val)
+                z_vals = z[unique_zi]
+                medians, p95s = [], []
+                for zi in unique_zi:
+                    sel = z_idx_val == zi
+                    ar = abs_flat[sel]
+                    medians.append(np.median(ar))
+                    p95s.append(np.percentile(ar, 95))
+                fig, ax = plt.subplots(figsize=(6, 4))
+                ax.plot(z_vals, medians, 'o-', label='median |resid|')
+                ax.plot(z_vals, p95s, 's--', label='95th pctl |resid|')
+                ax.set_xlabel('z')
+                ax.set_ylabel('|fractional residual|')
+                ax.set_title(f'{target}: residual summary vs z')
+                ax.legend()
+                fig.tight_layout()
+                pdf.savefig(fig)
+                plt.close(fig)
+        else:
+            # Scalar target: plot quantile bands vs z
+            if Pval_raw is not None:
+                z_values = Pval_raw[:, -1]
+            else:
+                z_values = np.arange(len(frac_resid))
+            frac_resid = frac_resid.flatten()
+            unique_z = np.unique(z_values)
+            q_vals = np.zeros((5, len(unique_z)))
+            for i, zv in enumerate(unique_z):
+                r = frac_resid[z_values == zv]
+                q_vals[:, i] = np.percentile(r, quantiles)
+            fig, ax = plt.subplots(figsize=(6, 4))
+            ax.fill_between(unique_z, q_vals[0], q_vals[4], alpha=0.2, color='C0', label='5-95%')
+            ax.fill_between(unique_z, q_vals[1], q_vals[3], alpha=0.4, color='C0', label='16-84%')
+            ax.plot(unique_z, q_vals[2], 'o-', color='C0', label='median')
+            ax.axhline(0, color='k', ls='--', lw=0.5)
+            ax.set_xlabel('z')
+            ax.set_ylabel('fractional residual')
+            ax.set_title(f'{target}: fractional residual vs z')
+            ax.legend()
+            fig.tight_layout()
+            pdf.savefig(fig)
+            plt.close(fig)
+
+    print(f"Residual plots saved to {pdf_path}")
+
+
 def train_emulator():
     """CLI entry point for training an emulator from a YAML config file."""
     info_txt = sys.argv[1]
@@ -385,6 +504,7 @@ def train_emulator():
     Ftrain = Ftrain[idx]
     Ptrain = Ptrain[idx]
 
+    Fstd = None
     if use_asinh:
         if scale_by_std:
             print('use asinh, scaled', flush=True)
@@ -394,6 +514,7 @@ def train_emulator():
             Ftrain = np.arcsinh(Ftrain)
             Fstd = np.ones(Ftrain.shape[-1])
 
+    Ptrain_raw = Ptrain.copy()
     Pmean = np.mean(Ptrain,axis=0)
     Psigmas = np.std(Ptrain,axis=0)
     Ptrain = (Ptrain - Pmean)/Psigmas
@@ -401,6 +522,7 @@ def train_emulator():
     validation_frac = 0.2
     iis = np.random.rand(len(Ptrain)) > validation_frac
 
+    Pval_raw = Ptrain_raw[~iis]
     Pval = Ptrain[~iis, :]
     Fval = Ftrain[~iis, :]
 
@@ -428,9 +550,36 @@ def train_emulator():
 
     emu = Emulator(Ptrain.shape[-1], torch.Tensor(pc_sigmas), torch.Tensor(pc_mean), torch.Tensor(v), n_components=n_pcs,
                    n_hidden=n_hidden, mean=torch.Tensor(mean), sigmas=torch.Tensor(sigmas),
-                   param_mean=torch.Tensor(Pmean), param_sigmas=torch.Tensor(Psigmas), fstd=torch.Tensor(Fstd))
+                   param_mean=torch.Tensor(Pmean), param_sigmas=torch.Tensor(Psigmas),
+                   fstd=torch.Tensor(Fstd) if Fstd is not None else None)
     emu.train_with_adaptive_batching(torch.Tensor(Ptrain), torch.Tensor(Ftrain), torch.Tensor(Pval), torch.Tensor(Fval), phases=phases)
     emu.save(output_path)
+
+    # Generate residual diagnostic plots
+    z_plot = None
+    k_plot = None
+    z_idx_val = None
+    if 'generation_config' in emu_info:
+        try:
+            from gholax.training.reformat import _get_target_config
+            from gholax.util.model import Model
+            lik_name, pipe_idx, _, _, _ = _get_target_config(emu_target)
+            model = Model(emu_info['generation_config'])
+            pipeline_module = model.likelihoods[lik_name].likelihood_pipeline[pipe_idx]
+            z_plot = np.array(pipeline_module.z)
+            k_plot = np.array(pipeline_module.k) if hasattr(pipeline_module, 'k') else None
+            n_z = len(z_plot)
+            z_idx = np.arange(len(Ptrain_raw)) % n_z
+            z_idx_val = z_idx[~iis]
+        except Exception as e:
+            print(f"Warning: could not load z/k for residual plots: {e}")
+
+    try:
+        plot_residuals(emu, Pval, Fval, mean, sigmas, Fstd, use_asinh,
+                       emu_target, output_path, z_idx_val=z_idx_val,
+                       z=z_plot, k=k_plot, Pval_raw=Pval_raw)
+    except Exception as e:
+        print(f"Warning: residual plot generation failed: {e}")
 
 
 if __name__ == '__main__':
