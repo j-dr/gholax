@@ -1,11 +1,13 @@
 import sys
-
+import os
+os.environ["JAX_PLATFORMS"] = "cpu"
+os.environ["CUDA_VISIBLE_DEVICES"] = ""
 import h5py
 import numpy as np
 import yaml
 from mpi4py import MPI
 from yaml import Loader
-
+from time import time
 from ..util.model import Model
 from .design import Design
 
@@ -66,12 +68,18 @@ def generate_models(
     count = 0  
     
     # Main loop: distribute slow parameter sets across MPI ranks
+    end = time()    
+    start = time()
     for n in range(npars_slow):
-    
+        
         if n % nproc == rank:
-    
             if rank == 0:
                 print(n, flush=True)
+                if n > 0:
+                    print("Time for last {} samples: {:.2f} seconds".format(nfast_per_slow, end - start), flush=True)            
+            
+            start = time()
+        
 
             # Sample the slow parameters for this iteration
             pslow = params.sample(n)
@@ -97,7 +105,6 @@ def generate_models(
                         try:
                             # Run the model to generate predictions for this parameter set
                             state = model.generate_training_data(like, pars)
-
                             # Check if multiple observables are requested for this likelihood
                             if hasattr(emu_info["likelihood"][like], "__iter__"):
                                 # Multiple observables: extract each one
@@ -130,11 +137,16 @@ def generate_models(
                                     [tsize.append(d) for d in pred.shape]
                                     out[name] = np.zeros(tsize)
                                 out[name][count] = pred
-                        except Exception:
-                            # Skip this parameter set if model evaluation fails
+                        except Exception as e:
+                            print(e, flush=True)
+                            print(
+                                f"params for failed eval: {pars}",
+                                flush=True,
+                            )
                             continue
-
+            
                 count += 1  
+            end = time()                
 
     # Save this rank's results to a separate HDF5 file
     for k in out:
@@ -165,6 +177,7 @@ def generate_training_data():
     parameter sampling design, then calls generate_models to evaluate
     the model at each design point in parallel across MPI ranks.
     """
+
     info_txt = sys.argv[1]
     with open(info_txt, "rb") as fp:
         info = yaml.load(fp, Loader=Loader)
@@ -175,6 +188,9 @@ def generate_training_data():
     
     # Set up parameter configuration for training
     param_names = model.setup_training_config(emu_info["likelihood"])
+    if rank == 0:
+        print("Sampling over parameters:", param_names, flush=True)
+        
     bounds = np.array(model.prior.get_minimizer_bounds())
     
     # Extract sampling configuration with defaults

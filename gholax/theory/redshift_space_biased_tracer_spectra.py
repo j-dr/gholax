@@ -102,17 +102,6 @@ class RedshiftSpaceBiasedTracerSpectra(LikelihoodModule):
                 "logmnu",
                 "z",
             ]
-            self.output_requirements["p_ij_ell_redshift_space_bias_grid"] = [
-                "As",
-                "ns",
-                "omch2",
-                "ombh2",
-                "H0",
-                "w",
-                "logmnu",
-                "e_z",
-                "chi_z",
-            ]
 
             for ell in range(self.n_ell_noap):
                 self.emulators[ell] = MultiSpectrumEmulator(
@@ -126,6 +115,13 @@ class RedshiftSpaceBiasedTracerSpectra(LikelihoodModule):
                 "e_z",
                 "chi_z",
             ]
+            
+            self.output_requirements["p_ij_ell_no_ap_redshift_space_bias_grid"] = [
+                "f_z",
+                "Pcb_lin_z",
+                "e_z",
+                "chi_z",
+            ]            
         self.kIR = config.get("kIR", 0.2)
         self.interpolation_order = config.get("interpolation_order", "cubic")
 
