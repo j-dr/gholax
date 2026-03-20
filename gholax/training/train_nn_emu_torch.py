@@ -339,7 +339,90 @@ class Emulator(nn.Module):
         # Print summary
         total_params = sum(p.numel() for p in self.parameters())
         print(f"Total parameters saved: {total_params:,}")
-        print(f"File size: {os.path.getsize(filepath+'.json') / 1024 / 1024:.2f} MB")    
+        print(f"File size: {os.path.getsize(filepath+'.json') / 1024 / 1024:.2f} MB")
+
+    def save_h5(self, filepath, is_scalar=False):
+        """Save model weights to HDF5 in the format expected by the JAX inference emulator.
+
+        PCA components are trimmed to n_components. For scalar emulators,
+        v/mean/sigmas/fstd are omitted.
+
+        Args:
+            filepath: Output path (without extension; .h5 will be appended).
+            is_scalar: If True, skip spectrum-only keys (v, mean, sigmas, fstd).
+        """
+        h5path = filepath + '.h5'
+
+        W_list = []
+        b_list = []
+        alphas_list = []
+        betas_list = []
+
+        state_dict = self.state_dict()
+        for name, param in state_dict.items():
+            p = param.cpu().numpy()
+            if 'weight' in name:
+                W_list.append(p.T.astype(np.float32))
+            elif 'bias' in name:
+                b_list.append(p.astype(np.float32))
+            elif 'alpha' in name:
+                val = float(p)
+                val = max(-5.0, min(5.0, val))
+                alphas_list.append(np.array([val], dtype=np.float32))
+            elif 'beta' in name:
+                val = float(p)
+                val = max(0.1, min(0.9, val))
+                betas_list.append(np.array([val], dtype=np.float32))
+
+        nc = self.n_components
+
+        with h5py.File(h5path, 'w') as f:
+            g = f.create_group('W')
+            for i, w in enumerate(W_list):
+                g.create_dataset(f'W_{i}', data=w)
+
+            g = f.create_group('b')
+            for i, b in enumerate(b_list):
+                g.create_dataset(f'b_{i}', data=b)
+
+            g = f.create_group('alphas')
+            for i, a in enumerate(alphas_list):
+                g.create_dataset(f'alphas_{i}', data=a)
+
+            g = f.create_group('betas')
+            for i, b in enumerate(betas_list):
+                g.create_dataset(f'betas_{i}', data=b)
+
+            g = f.create_group('pc_mean')
+            g.create_dataset('pc_mean_0', data=self.pc_mean.cpu().numpy()[:nc].astype(np.float32))
+
+            g = f.create_group('pc_sigmas')
+            g.create_dataset('pc_sigmas_0', data=self.pc_sigmas.cpu().numpy()[:nc].astype(np.float32))
+
+            g = f.create_group('param_mean')
+            g.create_dataset('param_mean_0', data=self.param_mean.cpu().numpy().astype(np.float32))
+
+            g = f.create_group('param_sigmas')
+            g.create_dataset('param_sigmas_0', data=self.param_sigmas.cpu().numpy().astype(np.float32))
+
+            if not is_scalar:
+                g = f.create_group('v')
+                g.create_dataset('v_0', data=self.v.cpu().numpy()[:, :nc].astype(np.float32))
+
+                g = f.create_group('mean')
+                g.create_dataset('mean_0', data=self.mean.cpu().numpy().astype(np.float32))
+
+                g = f.create_group('sigmas')
+                g.create_dataset('sigmas_0', data=self.sigmas.cpu().numpy().astype(np.float32))
+
+                if hasattr(self, 'fstd'):
+                    g = f.create_group('fstd')
+                    g.create_dataset('fstd_0', data=self.fstd.cpu().numpy().astype(np.float32))
+
+        print(f"Model saved to {h5path}")
+        total_params = sum(p.numel() for p in self.parameters())
+        print(f"Total parameters saved: {total_params:,}")
+        print(f"File size: {os.path.getsize(h5path) / 1024 / 1024:.2f} MB")
 
 _TARGET_NSPEC = {
     'p_cleft': 19, 'p_density_shape': 21,
@@ -562,7 +645,7 @@ def train_emulator():
                    param_mean=torch.Tensor(Pmean), param_sigmas=torch.Tensor(Psigmas),
                    fstd=torch.Tensor(Fstd) if Fstd is not None else None)
     emu.train_with_adaptive_batching(torch.Tensor(Ptrain), torch.Tensor(Ftrain), torch.Tensor(Pval), torch.Tensor(Fval), phases=phases)
-    emu.save(output_path)
+    emu.save_h5(output_path, is_scalar=is_scalar)
 
     # Generate residual diagnostic plots
     z_plot = None
