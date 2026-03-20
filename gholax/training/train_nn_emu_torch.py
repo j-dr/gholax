@@ -501,12 +501,15 @@ def train_emulator():
     # data should already be cleaned
     Ptrain = training_data[emu_params][::downsample]
     Ftrain = training_data[emu_target][::downsample]
+    is_scalar = emu_target not in _TARGET_NSPEC
+    if Ftrain.ndim == 1:
+        Ftrain = Ftrain[:, None]
     idx = np.isfinite(Ftrain).all(axis=1)
     Ftrain = Ftrain[idx]
     Ptrain = Ptrain[idx]
 
     Fstd = None
-    if use_asinh:
+    if not is_scalar and use_asinh:
         if scale_by_std:
             print('use asinh, scaled', flush=True)
             Fstd = np.std(Ftrain, axis=0)
@@ -531,14 +534,19 @@ def train_emulator():
     Ftrain = Ftrain[iis, :]
 
     # Construct Principle Components
-    mean = np.mean(Ftrain, axis=0)
-    mean = np.array(mean, dtype='float32')
-    sigmas = np.std(Ftrain, axis=0)
-    sigmas = np.array(sigmas, dtype='float32')
-    Ftrain = (Ftrain - mean) / sigmas
-    Fval = (Fval - mean) / sigmas
+    if is_scalar:
+        mean = np.zeros(Ftrain.shape[-1], dtype='float32')
+        sigmas = np.ones(Ftrain.shape[-1], dtype='float32')
+    else:
+        mean = np.mean(Ftrain, axis=0).astype('float32')
+        sigmas = np.std(Ftrain, axis=0).astype('float32')
+        Ftrain = (Ftrain - mean) / sigmas
+        Fval = (Fval - mean) / sigmas
 
-    cov_matrix = np.cov(Ftrain.T)
+    if is_scalar:
+        n_pcs = min(n_pcs, Ftrain.shape[-1])
+
+    cov_matrix = np.atleast_2d(np.cov(Ftrain.T))
     w, v = np.linalg.eigh(cov_matrix)
     # flip to rank in ascending eigenvalue
     w = np.flip(w)
