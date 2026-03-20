@@ -289,6 +289,10 @@ def _link_rank_files(master_filename):
     master file with ``{key}_{rank}`` external links, replicating the
     linking step from ``generate_training_data``.
 
+    External link paths use the basename only, since rank files always
+    sit alongside the master file.  HDF5 resolves external link paths
+    relative to the directory containing the master file.
+
     Returns True if linking was performed, False if no rank files found.
     """
     import glob as globmod
@@ -308,14 +312,30 @@ def _link_rank_files(master_filename):
     with h5py.File(rank_files[0], 'r') as fp:
         dataset_keys = list(fp.keys())
 
+    # Use basename so links resolve relative to the master file's directory
+    master_basename = os.path.basename(master_filename)
     with h5py.File(master_filename, 'w') as fp:
         for k in dataset_keys:
             for n in range(nproc):
-                rank_path = f"{master_filename}.{n}"
-                fp[f"{k}_{n}"] = h5py.ExternalLink(rank_path, k)
+                fp[f"{k}_{n}"] = h5py.ExternalLink(
+                    f"{master_basename}.{n}", k)
 
     print(f"Linked {nproc} rank files into {master_filename}", flush=True)
     return True
+
+
+def _check_external_links(training_data_filename):
+    """Return True if the master file's external links are resolvable."""
+    try:
+        with h5py.File(training_data_filename, 'r') as fp:
+            keys = list(fp.keys())
+            if not keys:
+                return False
+            # Try to access the first key to verify external links work
+            fp[keys[0]][:]
+        return True
+    except Exception:
+        return False
 
 
 def reformat(training_data_filename, config_filename, target):
@@ -329,14 +349,12 @@ def reformat(training_data_filename, config_filename, target):
     Returns:
         The training_data_filename (reformatted datasets are written in-place).
     """
-    # Auto-detect missing master file and link rank files if needed
+    # Auto-detect missing/empty/broken master file and link rank files if needed
     needs_linking = False
     if not os.path.exists(training_data_filename):
         needs_linking = True
-    else:
-        with h5py.File(training_data_filename, 'r') as fp:
-            if len(fp.keys()) == 0:
-                needs_linking = True
+    elif not _check_external_links(training_data_filename):
+        needs_linking = True
     if needs_linking:
         if not _link_rank_files(training_data_filename):
             raise FileNotFoundError(
