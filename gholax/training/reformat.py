@@ -282,6 +282,42 @@ def generate_training_configs(generation_config_filename, output_dir=None, **tra
     return config_paths
 
 
+def _link_rank_files(master_filename):
+    """Create a master HDF5 file with external links to per-rank files.
+
+    Detects rank files matching ``{master_filename}.{N}`` and creates the
+    master file with ``{key}_{rank}`` external links, replicating the
+    linking step from ``generate_training_data``.
+
+    Returns True if linking was performed, False if no rank files found.
+    """
+    import glob as globmod
+
+    rank_files = sorted(globmod.glob(f"{master_filename}.*"))
+    # Filter to only numeric suffixes (rank files)
+    rank_files = [f for f in rank_files
+                  if f.rsplit('.', 1)[-1].isdigit()]
+    if not rank_files:
+        return False
+
+    nproc = len(rank_files)
+    print(f"Master file missing or empty; linking {nproc} rank files...",
+          flush=True)
+
+    # Read dataset keys from the first rank file
+    with h5py.File(rank_files[0], 'r') as fp:
+        dataset_keys = list(fp.keys())
+
+    with h5py.File(master_filename, 'w') as fp:
+        for k in dataset_keys:
+            for n in range(nproc):
+                rank_path = f"{master_filename}.{n}"
+                fp[f"{k}_{n}"] = h5py.ExternalLink(rank_path, k)
+
+    print(f"Linked {nproc} rank files into {master_filename}", flush=True)
+    return True
+
+
 def reformat(training_data_filename, config_filename, target):
     """Reformat raw training data in-place for a given target quantity.
 
@@ -293,6 +329,20 @@ def reformat(training_data_filename, config_filename, target):
     Returns:
         The training_data_filename (reformatted datasets are written in-place).
     """
+    # Auto-detect missing master file and link rank files if needed
+    needs_linking = False
+    if not os.path.exists(training_data_filename):
+        needs_linking = True
+    else:
+        with h5py.File(training_data_filename, 'r') as fp:
+            if len(fp.keys()) == 0:
+                needs_linking = True
+    if needs_linking:
+        if not _link_rank_files(training_data_filename):
+            raise FileNotFoundError(
+                f"No training data found: {training_data_filename} does not "
+                f"exist and no rank files ({training_data_filename}.N) found")
+
     lik_name, pipe_idx, data_key, sigma8_key, reformatter = _get_target_config(target)
 
     model = Model(config_filename)
