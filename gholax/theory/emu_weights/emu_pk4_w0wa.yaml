@@ -1,8 +1,8 @@
 kmax: 0.601
 kmin: 1e-3
 nspec: 13
-param_order_spec:  ['As', 'H0', 'logmnu', 'ns', 'ombh2', 'omch2', 'w', 'wa']
-param_order_d:  ['As', 'H0', 'logmnu', 'ns', 'ombh2', 'omch2', 'w', 'wa']
+param_order_spec:  ['As', 'H0', 'logmnu', 'ns', 'ombh2', 'omch2', 'w', 'wa', 'z']
+param_order_d:  ['As', 'H0', 'logmnu', 'ns', 'ombh2', 'omch2', 'w', 'wa', 'z']
 spec_base: pkell4_w0wa_emu 
 s8z_base: sigma8z_w0wa_emu
 scale_As_spec: False
