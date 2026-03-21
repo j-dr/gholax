@@ -532,6 +532,9 @@ class PijEmulator(object):
         self.n_spec = len(pij_emu_bases)
         self.s8_tvar = s8_tvar
 
+        self.input_param_order = cfg.get("param_order_spec", None)
+        self.param_order_d = cfg.get("param_order_d", None)
+
         self.pij_emus = []
 
         for i in range(self.n_spec):

@@ -92,16 +92,13 @@ class RedshiftSpaceBiasedTracerSpectra(LikelihoodModule):
         if self.use_emulator:
             self.emulator_file_names = config["emulator_file_names"]
             self.emulators = {}
-            self.input_param_order = [
-                "As",
-                "ns",
-                "omch2",
-                "ombh2",
-                "H0",
-                "w",
-                "logmnu",
-                "z",
-            ]
+
+            # Read param order from first emulator config
+            first_emu = MultiSpectrumEmulator(self.emulator_file_names[0])
+            self.input_param_order = first_emu.input_param_order
+            if self.input_param_order[-1] != 'z':
+                self.input_param_order.remove('z')
+                self.input_param_order.append('z')
 
             for ell in range(self.n_ell_noap):
                 self.emulators[ell] = MultiSpectrumEmulator(

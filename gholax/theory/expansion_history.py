@@ -100,28 +100,19 @@ class ExpansionHistory(LikelihoodModule):
 
         self.output_requirements = {}
         if self.use_emulator:
-            self.output_requirements["chi_z"] = [
-                "As",
-                "ns",
-                "H0",
-                "w",
-                "ombh2",
-                "omch2",
-                "mnu",
-            ]
-            self.output_requirements["e_z"] = [
-                "As",
-                "ns",
-                "H0",
-                "w",
-                "ombh2",
-                "omch2",
-                "mnu",
-            ]
             self.emulator_file_names = config["emulator_file_names"]
             self.emulators = {}
             self.emulators["chi_z"] = ScalarEmulator(self.emulator_file_names["chi_z"])
             self.emulators["e_z"] = ScalarEmulator(self.emulator_file_names["e_z"])
+
+            # Detect if emulators accept wa
+            ipo = getattr(self.emulators["chi_z"], 'input_param_order', None)
+            self.emulator_input_param_order = ipo
+            params = ["As", "ns", "H0", "w", "ombh2", "omch2", "mnu"]
+            if ipo is not None and "wa" in ipo:
+                params.append("wa")
+            self.output_requirements["chi_z"] = list(params)
+            self.output_requirements["e_z"] = list(params)
 
         elif self.use_boltzmann:
             self.output_requirements["chi_z"] = ["boltzmann_results"]
@@ -227,7 +218,10 @@ class ExpansionHistory(LikelihoodModule):
         from .spectral_equivalence import build_equiv_cparam_grid
         if state is None:
             state = {}
-        cparam_grid = build_equiv_cparam_grid(params_values, self.z, state, scale_As=1e9)
+        cparam_grid = build_equiv_cparam_grid(
+            params_values, self.z, state, scale_As=1e9,
+            input_param_order=self.emulator_input_param_order,
+        )
 
         chi_z = self.emulators["chi_z"].predict(cparam_grid)
         e_z = self.emulators["e_z"].predict(cparam_grid)

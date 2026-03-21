@@ -191,7 +191,8 @@ class SpectralEquivalence(LikelihoodModule):
         return state
 
 
-def build_equiv_cparam_grid(params_values, z, state, As_key="As", scale_As=1.0):
+def build_equiv_cparam_grid(params_values, z, state, As_key="As", scale_As=1.0,
+                            input_param_order=None):
     """Build cparam_grid, using z-dependent w/As if spectral equivalence is active.
 
     Args:
@@ -204,6 +205,12 @@ def build_equiv_cparam_grid(params_values, z, state, As_key="As", scale_As=1.0):
     Returns:
         cparam_grid: Array of shape (nz, 8) with [As, ns, H0, w, ombh2, omch2, log10(mnu), z].
     """
+    # If the emulator accepts wa directly, bypass spectral equivalence
+    if input_param_order is not None and "wa" in input_param_order:
+        return build_equiv_cparam_grid_custom_order(
+            params_values, z, state, input_param_order
+        )
+
     nz = len(z)
     As_val = params_values[As_key] * scale_As
 
@@ -263,7 +270,7 @@ def build_equiv_cparam_grid_custom_order(params_values, z, state, input_param_or
         for p in input_param_order[:-1]
     ])
 
-    if "w_equiv_z" not in state:
+    if "wa" in input_param_order or "w_equiv_z" not in state:
         cparam_grid = jnp.zeros((nz, len(cosmo_params) + 1))
         cparam_grid = cparam_grid.at[:, :-1].set(cosmo_params)
         cparam_grid = cparam_grid.at[:, -1].set(z)

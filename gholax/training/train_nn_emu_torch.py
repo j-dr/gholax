@@ -430,6 +430,46 @@ _TARGET_NSPEC = {
     'pkell0': 13, 'pkell1': 13, 'pkell2': 13, 'pkell3': 13,
 }
 
+_DEFAULT_PARAM_ORDER_SPEC = ["As", "ns", "omch2", "ombh2", "H0", "w", "logmnu", "z"]
+_DEFAULT_PARAM_ORDER_D = ["As", "ns", "H0", "w", "ombh2", "omch2", "logmnu", "z"]
+
+
+def save_emu_config(output_path, emu_target, emu_info, k=None):
+    """Write emulator inference YAML config alongside the trained weights.
+
+    Args:
+        output_path: Base path for the emulator (without extension).
+        emu_target: Target name (e.g. 'pkell0', 'p_cleft').
+        emu_info: Training config dictionary.
+        k: Optional k-grid array from the generation config pipeline module.
+    """
+    spec_base = os.path.basename(output_path)
+
+    kmin = float(k[0]) if k is not None else emu_info.get('kmin', 1e-3)
+    kmax = float(k[-1]) if k is not None else emu_info.get('kmax', 0.601)
+
+    param_order_spec = emu_info.get('param_order_spec', _DEFAULT_PARAM_ORDER_SPEC)
+    param_order_d = emu_info.get('param_order_d', _DEFAULT_PARAM_ORDER_D)
+
+    config = {
+        'kmax': kmax,
+        'kmin': kmin,
+        'nspec': _TARGET_NSPEC[emu_target],
+        'param_order_spec': param_order_spec,
+        'param_order_d': param_order_d,
+        'spec_base': spec_base,
+        's8z_base': emu_info.get('s8z_base', 'aemulus_nu_tier1_cosmo_only_heft_sigma8z_emu'),
+        'scale_As_spec': emu_info.get('scale_As_spec', False),
+        'scale_As_d': emu_info.get('scale_As_d', True),
+        's8_tvar': emu_info.get('s8_tvar', True),
+        'scale_by_s8zsq': emu_info.get('scale_by_s8zsq', True),
+    }
+
+    config_path = f"{output_path}_config.yaml"
+    with open(config_path, 'w') as f:
+        yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+    print(f"Emulator config saved to {config_path}")
+
 
 def plot_residuals(emu, Pval, Fval, mean, sigmas, Fstd, use_asinh,
                    target, output_path, z_idx_val=None, z=None, k=None,
@@ -647,7 +687,7 @@ def train_emulator():
     emu.train_with_adaptive_batching(torch.Tensor(Ptrain), torch.Tensor(Ftrain), torch.Tensor(Pval), torch.Tensor(Fval), phases=phases)
     emu.save_h5(output_path, is_scalar=is_scalar)
 
-    # Generate residual diagnostic plots
+    # Extract k/z from generation config (used for emu config and residual plots)
     z_plot = None
     k_plot = None
     z_idx_val = None
@@ -665,6 +705,9 @@ def train_emulator():
             z_idx_val = z_idx[~iis]
         except Exception as e:
             print(f"Warning: could not load z/k for residual plots: {e}")
+
+    if not is_scalar:
+        save_emu_config(output_path, emu_target, emu_info, k=k_plot)
 
     try:
         plot_residuals(emu, Pval, Fval, mean, sigmas, Fstd, use_asinh,

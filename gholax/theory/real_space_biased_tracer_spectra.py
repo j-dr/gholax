@@ -65,24 +65,14 @@ class RealSpaceBiasedTracerSpectra(LikelihoodModule):
         if self.use_emulator:
             self.emulator_file_names = config["emulator_file_names"]
             self.emulator = PijEmulator(self.emulator_file_names)
-            self.output_requirements["p_ij_real_space_bias_grid"] = [
-                "As",
-                "ns",
-                "H0",
-                "w",
-                "ombh2",
-                "omch2",
-                "mnu",
-            ]
-            self.output_requirements["p_11_real_space_bias_grid"] = [
-                "As",
-                "ns",
-                "H0",
-                "w",
-                "ombh2",
-                "omch2",
-                "mnu",
-            ]
+            self.emulator_input_param_order = getattr(
+                self.emulator, 'input_param_order', None
+            )
+            params = ["As", "ns", "H0", "w", "ombh2", "omch2", "mnu"]
+            if self.emulator_input_param_order and "wa" in self.emulator_input_param_order:
+                params.append("wa")
+            self.output_requirements["p_ij_real_space_bias_grid"] = list(params)
+            self.output_requirements["p_11_real_space_bias_grid"] = list(params)
 
         else:
             self.output_requirements["p_ij_real_space_bias_grid"] = [
@@ -256,8 +246,14 @@ class RealSpaceBiasedTracerSpectra(LikelihoodModule):
 
     def compute_emulator(self, state, params_values):
         """Compute P_ij basis spectra using the neural network emulator."""
-        from .spectral_equivalence import build_equiv_cparam_grid
-        cparam_grid = build_equiv_cparam_grid(params_values, self.z, state)
+        if self.emulator_input_param_order is not None:
+            from .spectral_equivalence import build_equiv_cparam_grid_custom_order
+            cparam_grid = build_equiv_cparam_grid_custom_order(
+                params_values, self.z, state, self.emulator_input_param_order,
+            )
+        else:
+            from .spectral_equivalence import build_equiv_cparam_grid
+            cparam_grid = build_equiv_cparam_grid(params_values, self.z, state)
         pk_ij = self.emulator.predict(cparam_grid).T
         n_spec = len(self.emulator.pij_emus)
 
@@ -380,15 +376,10 @@ class RealSpaceMatterPowerSpectrum(RealSpaceBiasedTracerSpectra):
         self.use_boltzmann = config.get("use_boltzmann", False)
 
         if self.use_emulator:
-            self.output_requirements["p_11_real_space_bias_grid"] = [
-                "As",
-                "ns",
-                "H0",
-                "w",
-                "ombh2",
-                "omch2",
-                "mnu",
-            ]
+            params = ["As", "ns", "H0", "w", "ombh2", "omch2", "mnu"]
+            if self.emulator_input_param_order and "wa" in self.emulator_input_param_order:
+                params.append("wa")
+            self.output_requirements["p_11_real_space_bias_grid"] = params
         else:
             self.output_requirements["p_11_real_space_bias_grid"] = [
                 "Pm_lin_z",
