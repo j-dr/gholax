@@ -73,7 +73,7 @@ def _get_target_config(target):
     elif target == 'f_z':
         return ('RSDPK', 3, 'RSDPK.f_z', None, 'f_z')
     elif target == 'sigma8z':
-        return ('RSDPK', 3, 'RSDPK.sigma8_z', None, 'sigma8z')
+        return ('Nx2PTAngularPowerSpectrum', 3, 'Nx2PTAngularPowerSpectrum.sigma8_z', None, 'sigma8z')
     else:
         raise ValueError(f"Unknown target: {target}. Expected one of: p_cleft, p_density_shape, "
                          f"p{{0,1,2}}_shape_shape, pkell{{0,1,2,3}}, f_z, sigma8z")

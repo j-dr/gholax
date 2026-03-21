@@ -1,11 +1,11 @@
 kmax: 0.601
 kmin: 1e-3
 nspec: 13
-param_order_spec: ["As", "ns", "omch2", "ombh2", "H0", "w", "logmnu", "z"]
-param_order_d: ["As", "ns", "H0", "w", "ombh2", "omch2", "logmnu", "z"]
-spec_base: aemulus_nu_tier1_cosmo_only_pkell0_no_pzel_emu_light
-s8z_base: aemulus_nu_tier1_cosmo_only_heft_sigma8z_emu
+param_order_spec:  ['As', 'H0', 'logmnu', 'ns', 'ombh2', 'omch2', 'w', 'wa', 'z']
+param_order_d:  ['As', 'H0', 'logmnu', 'ns', 'ombh2', 'omch2', 'w', 'wa', 'z']
+spec_base: pkell0_w0wa_emu 
+s8z_base: sigma8z_w0wa_emu
 scale_As_spec: False
-scale_As_d: True
+scale_As_d: False
 s8_tvar: True
 scale_by_s8zsq: True
