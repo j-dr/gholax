@@ -118,8 +118,11 @@ class LinearGrowth(LikelihoodModule):
         if self.use_emulator:
             self.emulator_file_name = config["emulator_file_name"]
             self.emulator = ScalarEmulator(self.emulator_file_name)
+            # Detect if emulator accepts wa natively
+            ipo = getattr(self.emulator, 'input_param_order', None)
+            self.emulator_accepts_wa = (ipo is not None and "wa" in ipo)
             # these are the parameters that are checked in order to decide whether quantities need to be recomputed
-            if self.compute_w0wa:
+            if self.compute_w0wa or self.emulator_accepts_wa:
                 params = ["As", "ns", "H0", "w", "wa", "ombh2", "omch2", "mnu"]
             else:
                 params = ["As", "ns", "H0", "w", "ombh2", "omch2", "mnu"]
@@ -199,7 +202,10 @@ class LinearGrowth(LikelihoodModule):
 
     def compute_emulator(self, state, params_values):
         from .spectral_equivalence import build_equiv_cparam_grid
-        cparam_grid = build_equiv_cparam_grid(params_values, self.z, state)
+        ipo = getattr(self.emulator, 'input_param_order', None)
+        cparam_grid = build_equiv_cparam_grid(
+            params_values, self.z, state, input_param_order=ipo,
+        )
 
         sigma8_z = self.emulator.predict(cparam_grid)[:, 0]
         Dz = sigma8_z / sigma8_z[0]
@@ -263,9 +269,11 @@ class LinearGrowth(LikelihoodModule):
 
 
     def compute(self, state, params_values):
-        if self.use_emulator and self.compute_w0wa:
+        if self.use_emulator and self.compute_w0wa and not self.emulator_accepts_wa:
+            # wCDM emulator + ODE growth correction for w0wa
             state = self.compute_w0wa_emulator(state, params_values)
         elif self.use_emulator:
+            # Emulator handles w0wa natively, or wa=0 (standard wCDM)
             state = self.compute_emulator(state, params_values)
         elif self.use_boltzmann:
             state = self.compute_boltzmann(state, params_values)
