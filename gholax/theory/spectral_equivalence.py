@@ -23,7 +23,7 @@ class SpectralEquivalence(LikelihoodModule):
     """
 
     def __init__(self, z, z_lss=1089.0, n_newton=15, n_int_chi=4096,
-                 sigma8_emulator_file_name=None, **config):
+                 n_gl_chi=64, sigma8_emulator_file_name=None, **config):
         self.z = jnp.array(z)
         self.nz = len(z)
         self.z_lss = z_lss
@@ -33,6 +33,12 @@ class SpectralEquivalence(LikelihoodModule):
         _gl_nu_nodes_np, _gl_nu_weights_np = roots_laguerre(32)
         self.gl_nu_nodes = jnp.array(_gl_nu_nodes_np)
         self.gl_nu_weights = jnp.array(_gl_nu_weights_np)
+
+        # GL quadrature nodes/weights for chi integrals inside Newton loop
+        from scipy.special import roots_legendre as _roots_legendre
+        _gl_chi_nodes_np, _gl_chi_weights_np = _roots_legendre(n_gl_chi)
+        self.gl_chi_nodes = jnp.array(_gl_chi_nodes_np)
+        self.gl_chi_weights = jnp.array(_gl_chi_weights_np)
 
         self.sigma8_emu = None
         if sigma8_emulator_file_name is not None:
@@ -67,15 +73,28 @@ class SpectralEquivalence(LikelihoodModule):
 
     def _chi_z_to_zlss(self, z_start, w_const, Omega_cb, Omega_Lambda,
                        Omega_r_photon, mnu_per_species, h):
-        """Comoving distance from z_start to z_LSS for wCDM with constant w."""
+        """Comoving distance from z_start to z_LSS for wCDM with constant w.
+
+        Uses Gauss-Legendre quadrature in log(1+z) space for efficiency
+        inside Newton iterations (avoids building a full cumulative grid).
+        """
         E_z_func = self._build_E_z_func(
             Omega_cb, Omega_Lambda, Omega_r_photon, mnu_per_species, h, w_const, 0.0
         )
 
-        # chi(0 -> z_LSS) - chi(0 -> z_start) = chi(z_start -> z_LSS)
-        z_targets = jnp.array([z_start, self.z_lss])
-        chi_targets, _ = comoving_distance_integral_full(z_targets, E_z_func, self.n_int_chi)
-        return chi_targets[1] - chi_targets[0]
+        # GL quadrature in u = log(1+z) space:
+        # chi = (c/H0) * int_{u_start}^{u_LSS} exp(u) / E(exp(u)-1) du
+        u_start = jnp.log1p(z_start)
+        u_lss = jnp.log1p(self.z_lss)
+        half_width = 0.5 * (u_lss - u_start)
+        mid = 0.5 * (u_lss + u_start)
+        u_nodes = half_width * self.gl_chi_nodes + mid
+        z_nodes = jnp.expm1(u_nodes)
+        E_vals = jax.vmap(E_z_func)(z_nodes)
+        # Jacobian: dz/du = exp(u) = 1+z
+        integrand = (1.0 + z_nodes) / E_vals
+        chi = (speed_of_light / 100.0) * half_width * jnp.dot(self.gl_chi_weights, integrand)
+        return chi
 
     def _compute_D_unnorm(self, Omega_m, Omega_Lambda, f_nu, w0, wa, z_arr):
         """Compute unnormalized growth factor D(z) via ODE."""
