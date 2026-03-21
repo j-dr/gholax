@@ -1,0 +1,11 @@
+kmax: 3.9355007545577743
+kmin: 1e-3
+nspec: 21
+param_order_spec:  ['As', 'H0', 'logmnu', 'ns', 'ombh2', 'omch2', 'w', 'wa']
+param_order_d:  ['As', 'H0', 'logmnu', 'ns', 'ombh2', 'omch2', 'w', 'wa']
+spec_base: p_density_shape_w0wa_emu 
+s8z_base: sigma8z_w0wa_emu
+scale_As_spec: False
+scale_As_d: False
+s8_tvar: True
+scale_by_s8zsq: True
