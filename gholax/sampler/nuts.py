@@ -17,6 +17,8 @@ class NUTS(object):
     checking via R-hat, parallel chains via jax.pmap, and checkpoint restart.
     """
 
+    WARMUP_ALGORITHMS = ("window", "adaptive_window", "meads")
+
     def __init__(self, config):
         """Initialize NUTS sampler from config.
 
@@ -37,6 +39,148 @@ class NUTS(object):
         self.target_acceptance_rate = c.get("target_acceptance_rate", 0.65)
         self.step_size_init = c.get("step_size_init", 0.05)
         self.parallel_warmup = c.get("parallel_warmup", False)
+
+        self.warmup_algorithm = c.get("warmup_algorithm", "window")
+        if self.warmup_algorithm not in self.WARMUP_ALGORITHMS:
+            raise ValueError(
+                f"warmup_algorithm must be one of {self.WARMUP_ALGORITHMS}, "
+                f"got '{self.warmup_algorithm}'"
+            )
+
+        # Adaptive window parameters
+        self.adaptive_warmup_stage_steps = c.get("adaptive_warmup_stage_steps", 100)
+        self.adaptive_warmup_max_steps = c.get("adaptive_warmup_max_steps", 1000)
+        self.adaptive_warmup_min_steps = c.get("adaptive_warmup_min_steps", 200)
+        self.adaptive_warmup_rtol_mass = c.get("adaptive_warmup_rtol_mass", 0.05)
+        self.adaptive_warmup_rtol_step = c.get("adaptive_warmup_rtol_step", 0.05)
+
+        # MEADS parameters
+        self.meads_warmup_steps = c.get("meads_warmup_steps", 500)
+        self.meads_step_size_tuning_steps = c.get("meads_step_size_tuning_steps", 100)
+
+    def _adaptive_window_warmup(self, jlp, rng_key, initial_position):
+        """Run window adaptation in stages, stopping when mass matrix and step size converge."""
+        prev_mass = None
+        prev_step = None
+        position = initial_position
+        total_steps = 0
+
+        while total_steps < self.adaptive_warmup_max_steps:
+            rng_key, sub_key = jax.random.split(rng_key)
+
+            warmup = blackjax.window_adaptation(
+                blackjax.nuts,
+                jlp,
+                is_mass_matrix_diagonal=self.diagonal_mass_matrix,
+                progress_bar=False,
+                initial_step_size=self.step_size_init,
+                target_acceptance_rate=self.target_acceptance_rate,
+            )
+            (state, parameters), _ = warmup.run(
+                sub_key, position, self.adaptive_warmup_stage_steps
+            )
+
+            mass = parameters["inverse_mass_matrix"]
+            step = parameters["step_size"]
+            total_steps += self.adaptive_warmup_stage_steps
+
+            if prev_mass is not None and total_steps >= self.adaptive_warmup_min_steps:
+                mass_change = float(
+                    jnp.max(jnp.abs(mass - prev_mass) / (jnp.abs(prev_mass) + 1e-10))
+                )
+                step_change = float(
+                    jnp.abs(step - prev_step) / (jnp.abs(prev_step) + 1e-10)
+                )
+
+                print(
+                    f"Adaptive warmup step {total_steps}: "
+                    f"max_rel_mass_change={mass_change:.4f}, "
+                    f"rel_step_change={step_change:.4f}",
+                    flush=True,
+                )
+
+                if (
+                    mass_change < self.adaptive_warmup_rtol_mass
+                    and step_change < self.adaptive_warmup_rtol_step
+                ):
+                    print(
+                        f"Warmup converged after {total_steps} steps", flush=True
+                    )
+                    return state, parameters
+
+            prev_mass = mass
+            prev_step = step
+            position = state.position
+
+        print(
+            f"Warmup reached max {self.adaptive_warmup_max_steps} steps "
+            f"without convergence",
+            flush=True,
+        )
+        return state, parameters
+
+    def _meads_warmup(self, jlp, rng_key, initial_positions):
+        """Use MEADS cross-chain adaptation to estimate mass matrix, then
+        tune NUTS step size via dual averaging."""
+        from blackjax.adaptation.step_size import dual_averaging_adaptation
+
+        n_chains = initial_positions.shape[0]
+
+        print(
+            f"Running MEADS warmup ({self.meads_warmup_steps} steps, "
+            f"{n_chains} chains)",
+            flush=True,
+        )
+
+        meads = blackjax.meads_adaptation(jlp, num_chains=n_chains)
+        rng_key, meads_key = jax.random.split(rng_key)
+        (meads_states, meads_params), _ = meads.run(
+            meads_key, initial_positions, self.meads_warmup_steps
+        )
+
+        # Use MEADS position_sigma^2 as diagonal inverse mass matrix
+        position_sigma = meads_params["momentum_inverse_scale"]
+        inverse_mass_matrix = position_sigma**2
+
+        print(
+            f"MEADS complete. Tuning NUTS step size "
+            f"({self.meads_step_size_tuning_steps} steps)",
+            flush=True,
+        )
+
+        # Tune NUTS step size via dual averaging on a single chain
+        nuts = blackjax.nuts(
+            jlp,
+            inverse_mass_matrix=inverse_mass_matrix,
+            step_size=float(meads_params["step_size"]),
+        )
+
+        da_init, da_update, da_final = dual_averaging_adaptation(
+            target=self.target_acceptance_rate
+        )
+        da_state = da_init(float(meads_params["step_size"]))
+
+        # Use the first chain's final position
+        state = nuts.init(meads_states.position[0])
+
+        for i in range(self.meads_step_size_tuning_steps):
+            rng_key, step_key = jax.random.split(rng_key)
+            nuts_kernel = blackjax.nuts(
+                jlp,
+                inverse_mass_matrix=inverse_mass_matrix,
+                step_size=jnp.exp(da_state.log_step_size),
+            )
+            state, info = nuts_kernel.step(step_key, state)
+            da_state = da_update(da_state, info.acceptance_rate)
+
+        step_size = da_final(da_state)
+        print(f"Tuned step size: {float(step_size):.6f}", flush=True)
+
+        parameters = {
+            "inverse_mass_matrix": inverse_mass_matrix,
+            "step_size": step_size,
+        }
+        return state, parameters
 
     def run(self, model, output_file):
         """Run the NUTS sampler until convergence.
@@ -132,15 +276,80 @@ class NUTS(object):
                     initial_positions,
                 )
 
-            if self.pathfinder_adaptation:
+            if self.warmup_algorithm == "adaptive_window":
+                print("Running adaptive window warmup", flush=True)
+                keys = jax.random.split(rng_key, 2)
+                rng_key = keys[0]
+                state, parameters = self._adaptive_window_warmup(
+                    jlp, keys[1], initial_positions[0]
+                )
+                inverse_mass_matrix = parameters["inverse_mass_matrix"]
+                step_size = parameters["step_size"]
+                states = jnp.tile(state.position, (n_devices, 1))
+                nuts = blackjax.nuts(
+                    jlp, inverse_mass_matrix=inverse_mass_matrix, step_size=step_size
+                )
+                init_pmap = jax.pmap(nuts.init, in_axes=(0))
+                states = init_pmap(states)
+
+            elif self.warmup_algorithm == "meads":
+                keys = jax.random.split(rng_key, 2)
+                rng_key = keys[0]
+                state, parameters = self._meads_warmup(
+                    jlp, keys[1], initial_positions
+                )
+                inverse_mass_matrix = parameters["inverse_mass_matrix"]
+                step_size = parameters["step_size"]
+                states = jnp.tile(state.position, (n_devices, 1))
+                nuts = blackjax.nuts(
+                    jlp, inverse_mass_matrix=inverse_mass_matrix, step_size=step_size
+                )
+                init_pmap = jax.pmap(nuts.init, in_axes=(0))
+                states = init_pmap(states)
+
+            elif self.pathfinder_adaptation:
                 print("Running pathfinder adaptation", flush=True)
 
                 warmup = blackjax.pathfinder_adaptation(
                     blackjax.nuts,
                     jlp,
-                    # is_mass_matrix_diagonal=self.diagonal_mass_matrix,
-                    # progress_bar=False,
                 )
+                if self.parallel_warmup:
+                    warmup_pmap = jax.pmap(
+                        warmup.run, in_axes=(0, 0, None), static_broadcasted_argnums=2
+                    )
+                    keys = jax.random.split(rng_key, 1 + n_devices)
+                    rng_key = keys[0]
+                    warmup_keys = keys[1:]
+                    (states, parameters), _ = warmup_pmap(
+                        warmup_keys, initial_positions, self.n_steps_warmup
+                    )
+                    inverse_mass_matrix = jnp.median(
+                        parameters["inverse_mass_matrix"], axis=0
+                    )
+                    step_size = jnp.median(parameters["step_size"], axis=0)
+
+                    with open(f"{output_file}.nuts_inverse_mass_matrix.json", "w") as fp:
+                        json.dump(parameters["inverse_mass_matrix"].tolist(), fp)
+
+                    with open(f"{output_file}.nuts_step_size.json", "w") as fp:
+                        json.dump(parameters["step_size"].tolist(), fp)
+                else:
+                    keys = jax.random.split(rng_key, 2)
+                    (state, parameters), _ = warmup.run(
+                        keys[0],
+                        initial_positions[0],
+                        self.n_steps_warmup,
+                    )
+                    inverse_mass_matrix = parameters["inverse_mass_matrix"]
+                    step_size = parameters["step_size"]
+                    states = jnp.tile(state.position, (n_devices, 1))
+                    nuts = blackjax.nuts(
+                        jlp, inverse_mass_matrix=inverse_mass_matrix, step_size=step_size
+                    )
+                    init_pmap = jax.pmap(nuts.init, in_axes=(0))
+                    states = init_pmap(states)
+
             else:
                 print("Running window adaptation", flush=True)
 
@@ -152,41 +361,41 @@ class NUTS(object):
                     initial_step_size=self.step_size_init,
                     target_acceptance_rate=self.target_acceptance_rate,
                 )
-            if self.parallel_warmup:
-                warmup_pmap = jax.pmap(
-                    warmup.run, in_axes=(0, 0, None), static_broadcasted_argnums=2
-                )
-                keys = jax.random.split(rng_key, 1 + n_devices)
-                rng_key = keys[0]
-                warmup_keys = keys[1:]
-                (states, parameters), _ = warmup_pmap(
-                    warmup_keys, initial_positions, self.n_steps_warmup
-                )
-                inverse_mass_matrix = jnp.median(
-                    parameters["inverse_mass_matrix"], axis=0
-                )
-                step_size = jnp.median(parameters["step_size"], axis=0)
+                if self.parallel_warmup:
+                    warmup_pmap = jax.pmap(
+                        warmup.run, in_axes=(0, 0, None), static_broadcasted_argnums=2
+                    )
+                    keys = jax.random.split(rng_key, 1 + n_devices)
+                    rng_key = keys[0]
+                    warmup_keys = keys[1:]
+                    (states, parameters), _ = warmup_pmap(
+                        warmup_keys, initial_positions, self.n_steps_warmup
+                    )
+                    inverse_mass_matrix = jnp.median(
+                        parameters["inverse_mass_matrix"], axis=0
+                    )
+                    step_size = jnp.median(parameters["step_size"], axis=0)
 
-                with open(f"{output_file}.nuts_inverse_mass_matrix.json", "w") as fp:
-                    json.dump(parameters["inverse_mass_matrix"].tolist(), fp)
+                    with open(f"{output_file}.nuts_inverse_mass_matrix.json", "w") as fp:
+                        json.dump(parameters["inverse_mass_matrix"].tolist(), fp)
 
-                with open(f"{output_file}.nuts_step_size.json", "w") as fp:
-                    json.dump(parameters["step_size"].tolist(), fp)
-            else:
-                keys = jax.random.split(rng_key, 2)
-                (state, parameters), _ = warmup.run(
-                    keys[0],
-                    initial_positions[0],
-                    self.n_steps_warmup,
-                )
-                inverse_mass_matrix = parameters["inverse_mass_matrix"]
-                step_size = parameters["step_size"]
-                states = jnp.tile(state.position, (n_devices, 1))
-                nuts = blackjax.nuts(
-                    jlp, inverse_mass_matrix=inverse_mass_matrix, step_size=step_size
-                )
-                init_pmap = jax.pmap(nuts.init, in_axes=(0))
-                states = init_pmap(states)
+                    with open(f"{output_file}.nuts_step_size.json", "w") as fp:
+                        json.dump(parameters["step_size"].tolist(), fp)
+                else:
+                    keys = jax.random.split(rng_key, 2)
+                    (state, parameters), _ = warmup.run(
+                        keys[0],
+                        initial_positions[0],
+                        self.n_steps_warmup,
+                    )
+                    inverse_mass_matrix = parameters["inverse_mass_matrix"]
+                    step_size = parameters["step_size"]
+                    states = jnp.tile(state.position, (n_devices, 1))
+                    nuts = blackjax.nuts(
+                        jlp, inverse_mass_matrix=inverse_mass_matrix, step_size=step_size
+                    )
+                    init_pmap = jax.pmap(nuts.init, in_axes=(0))
+                    states = init_pmap(states)
 
             warmup_parameters = {
                 "inverse_mass_matrix": inverse_mass_matrix.tolist(),
