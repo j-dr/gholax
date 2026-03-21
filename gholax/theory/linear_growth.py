@@ -167,18 +167,14 @@ class LinearGrowth(LikelihoodModule):
 
     def compute_w0wa_emulator(self, state, params_values):
         # Run wCDM emulator with w=w0, wa=0
-        cosmo_params = jnp.array([
-            params_values["As"],
-            params_values["ns"],
-            params_values["H0"],
-            params_values["w"],
-            params_values["ombh2"],
-            params_values["omch2"],
-            jnp.log10(params_values["mnu"]),
-        ])
-        cparam_grid = jnp.zeros((self.nz, len(cosmo_params) + 1))
-        cparam_grid = cparam_grid.at[:, :-1].set(cosmo_params)
-        cparam_grid = cparam_grid.at[:, -1].set(self.z)
+        from .spectral_equivalence import build_equiv_cparam_grid_custom_order
+        order = getattr(
+            self.emulator, 'input_param_order',
+            ["As", "ns", "H0", "w", "ombh2", "omch2", "logmnu", "z"],
+        )
+        cparam_grid = build_equiv_cparam_grid_custom_order(
+            params_values, self.z, state, order,
+        )
         sigma8_z = self.emulator.predict(cparam_grid)[:, 0]
 
         # Growth factor correction: unnormalized ODE ratio D_w0wa / D_wCDM

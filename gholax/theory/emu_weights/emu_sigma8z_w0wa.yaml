@@ -1,0 +1,3 @@
+filebase: sigma8z_w0wa_emu
+scale_As: false
+param_order: ["As", "H0", "logmnu", "ns", "ombh2", "omch2", "w", "wa", "z"]

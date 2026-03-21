@@ -364,8 +364,8 @@ class ScalarEmulator(object):
 
     def __init__(
         self,
-        filebase,
-        scale_As=True,
+        filebase_or_config,
+        scale_As=None,
         data_dir=None,
         input_param_order=None,
         weight_param_order=None,
@@ -373,14 +373,50 @@ class ScalarEmulator(object):
         """Initialize the scalar emulator.
 
         Args:
-            filebase: Name of the weight file (resolved relative to data_dir).
+            filebase_or_config: Name of the weight file (resolved relative to
+                data_dir), a YAML config filename (ending in .yaml), or a dict
+                with keys 'filebase', 'scale_As', and 'param_order'.
             scale_As: If True, scale As by 1e9 in normalization parameters.
+                Overrides config value when explicitly provided.
             data_dir: Directory containing weight files (default: emu_weights/).
             input_param_order: Ordering of input parameters at call time.
+                Overrides config value when explicitly provided.
             weight_param_order: Ordering of parameters used during training.
+                Overrides config value when explicitly provided.
         """
         super(ScalarEmulator, self).__init__()
-        self.scale_As = scale_As
+
+        # Resolve config
+        if isinstance(filebase_or_config, dict):
+            cfg = filebase_or_config
+            filebase = cfg["filebase"]
+            cfg_param_order = cfg.get("param_order", None)
+            cfg_scale_As = cfg.get("scale_As", True)
+        elif isinstance(filebase_or_config, str) and filebase_or_config.endswith(".yaml"):
+            cfg_path = filebase_or_config
+            if data_dir is None:
+                cfg_dir = os.path.join(
+                    os.path.dirname(os.path.realpath(__file__)), "emu_weights"
+                )
+            else:
+                cfg_dir = data_dir
+            with open(os.path.join(cfg_dir, cfg_path), "r") as f:
+                cfg = yaml.safe_load(f)
+            filebase = cfg["filebase"]
+            cfg_param_order = cfg.get("param_order", None)
+            cfg_scale_As = cfg.get("scale_As", True)
+        else:
+            filebase = filebase_or_config
+            cfg_param_order = None
+            cfg_scale_As = True
+
+        # Apply config defaults, kwargs override
+        self.scale_As = cfg_scale_As if scale_As is None else scale_As
+
+        if weight_param_order is None and cfg_param_order is not None:
+            weight_param_order = cfg_param_order
+        if input_param_order is None and cfg_param_order is not None:
+            input_param_order = cfg_param_order
 
         self.input_param_order = input_param_order
         self.weight_param_order = weight_param_order

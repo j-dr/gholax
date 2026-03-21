@@ -28,16 +28,11 @@ class LinearGrowthRate(LikelihoodModule):
         if self.use_emulator:
             self.emulator_file_name = config["emulator_file_name"]
             self.emulator = ScalarEmulator(self.emulator_file_name)
-            # these are the parameters that are checked in order to decide whether quantities need to be recomputed
-            self.output_requirements["f_z"] = [
-                "As",
-                "ns",
-                "H0",
-                "w",
-                "ombh2",
-                "omch2",
-                "mnu",
-            ]
+            ipo = getattr(self.emulator, 'input_param_order', None)
+            params = ["As", "ns", "H0", "w", "ombh2", "omch2", "mnu"]
+            if ipo is not None and "wa" in ipo:
+                params.append("wa")
+            self.output_requirements["f_z"] = params
 
         elif self.use_boltzmann:
             self.output_requirements["f_z"] = ["boltzmann_results"]
@@ -52,9 +47,12 @@ class LinearGrowthRate(LikelihoodModule):
     def compute_emulator(self, state, params_values):
         """Compute f(z) using the neural network emulator."""
         from .spectral_equivalence import build_equiv_cparam_grid_custom_order
-        cparam_grid = build_equiv_cparam_grid_custom_order(
-            params_values, self.z, state,
+        order = getattr(
+            self.emulator, 'input_param_order',
             ["As", "ns", "omch2", "ombh2", "H0", "w", "logmnu", "z"],
+        )
+        cparam_grid = build_equiv_cparam_grid_custom_order(
+            params_values, self.z, state, order,
         )
 
         f_z = self.emulator.predict(cparam_grid)[:, 0]
