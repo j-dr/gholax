@@ -168,9 +168,9 @@ class LinearGrowth(LikelihoodModule):
     def compute_w0wa_emulator(self, state, params_values):
         # Run wCDM emulator with w=w0, wa=0
         from .spectral_equivalence import build_equiv_cparam_grid_custom_order
-        order = getattr(
-            self.emulator, 'input_param_order',
-            ["As", "ns", "H0", "w", "ombh2", "omch2", "logmnu", "z"],
+        order = (
+            self.emulator.input_param_order
+            or ["As", "ns", "H0", "w", "ombh2", "omch2", "logmnu", "z"]
         )
         cparam_grid = build_equiv_cparam_grid_custom_order(
             params_values, self.z, state, order,

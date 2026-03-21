@@ -47,9 +47,9 @@ class LinearGrowthRate(LikelihoodModule):
     def compute_emulator(self, state, params_values):
         """Compute f(z) using the neural network emulator."""
         from .spectral_equivalence import build_equiv_cparam_grid_custom_order
-        order = getattr(
-            self.emulator, 'input_param_order',
-            ["As", "ns", "omch2", "ombh2", "H0", "w", "logmnu", "z"],
+        order = (
+            self.emulator.input_param_order
+            or ["As", "ns", "omch2", "ombh2", "H0", "w", "logmnu", "z"]
         )
         cparam_grid = build_equiv_cparam_grid_custom_order(
             params_values, self.z, state, order,
