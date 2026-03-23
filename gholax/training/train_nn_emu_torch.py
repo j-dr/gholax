@@ -145,17 +145,19 @@ class Emulator(nn.Module):
                     nn.init.uniform_(module.beta, 0.4, 0.6)
     
     def forward(self, x):
-        # Forward through network
-        y = self.network(x)
+        # Forward through network — returns raw (normalized) PC coefficients
+        return self.network(x)
 
+    def predict(self, x):
+        """Full forward pass with PC denormalization and reconstruction."""
+        y = self.network(x)
         y = y * self.pc_sigmas[:self.n_components] + self.pc_mean[:self.n_components]
         y = torch.matmul(y, self.v[:, :self.n_components].T)
-        
         return y
     
     def train_with_adaptive_batching(self, X, y, Xtest, ytest, patience=400, min_delta=1e-5,
                                     phases=None, use_gradient_accumulation=True,
-                                    accumulation_steps=4):
+                                    accumulation_steps=4, pc_weights=None):
         
         if phases is None:
             phases = [
@@ -181,8 +183,14 @@ class Emulator(nn.Module):
         n_samples = X.shape[0]
         best_val_loss = float('inf')
         
-        # Use Huber loss for robustness
-        loss_fn = nn.HuberLoss(delta=1.0)
+        # Weighted Huber loss for robustness with per-component weighting
+        base_loss_fn = nn.HuberLoss(delta=1.0, reduction='none')
+        if pc_weights is not None:
+            pc_weights = pc_weights.to(self.device)
+            def loss_fn(pred, target):
+                return (base_loss_fn(pred, target) * pc_weights).mean()
+        else:
+            loss_fn = nn.HuberLoss(delta=1.0)
         
         for phase_idx, phase in enumerate(phases):
             print(f"\nPhase {phase_idx + 1}/{len(phases)}", flush=True)
@@ -482,7 +490,7 @@ def plot_residuals(emu, Pval, Fval, mean, sigmas, Fstd, use_asinh,
 
     emu.eval()
     with torch.no_grad():
-        pred = emu(torch.tensor(Pval, dtype=torch.float32).to(emu.device)).cpu().numpy()
+        pred = emu.predict(torch.tensor(Pval, dtype=torch.float32).to(emu.device)).cpu().numpy()
 
     # pred and Fval are in normalized space: (F - mean) / sigmas
     pred_unnorm = pred * sigmas + mean
@@ -616,7 +624,7 @@ def train_emulator():
     training_data = h5py.File(training_data_filename, 'r')
 
     n_hidden = emu_info['n_hidden']
-    n_pcs = emu_info['n_pcs']
+    n_pcs = emu_info.get('n_pcs', None)
     use_asinh = emu_info['use_asinh']
     scale_by_std = emu_info['scale_by_std']
     downsample = int(emu_info.pop('downsample', 1))
@@ -671,20 +679,37 @@ def train_emulator():
 
     cov_matrix = np.atleast_2d(np.cov(Ftrain.T))
     w, v = np.linalg.eigh(cov_matrix)
-    # flip to rank in ascending eigenvalue
+    # flip to rank in descending eigenvalue
     w = np.flip(w)
     v = np.flip(v, axis=1)
     v = np.array(v, dtype='float32')
+
+    if n_pcs is None:
+        cumulative = np.cumsum(w) / np.sum(w)
+        n_pcs = int(np.searchsorted(cumulative, 0.9999) + 1)
+        print(f"Auto-selected n_pcs={n_pcs} (explained variance ratio >= 0.9999)")
+
     pc_train = np.dot(Ftrain, v)
 
     pc_mean = np.mean(pc_train, axis=0)
     pc_sigmas = np.std(pc_train, axis=0)
 
+    # Project training/validation targets to normalized PC space
+    pc_train_targets = (np.dot(Ftrain, v[:, :n_pcs]) - pc_mean[:n_pcs]) / pc_sigmas[:n_pcs]
+    pc_val_targets = (np.dot(Fval, v[:, :n_pcs]) - pc_mean[:n_pcs]) / pc_sigmas[:n_pcs]
+
+    # Weighted loss: inversely proportional to pc_sigmas so fractional accuracy is equalized
+    pc_w = 1.0 / pc_sigmas[:n_pcs]
+    pc_w = pc_w / pc_w.sum() * n_pcs
+    pc_weights = torch.Tensor(pc_w)
+
     emu = Emulator(Ptrain.shape[-1], torch.Tensor(pc_sigmas), torch.Tensor(pc_mean), torch.Tensor(v), n_components=n_pcs,
                    n_hidden=n_hidden, mean=torch.Tensor(mean), sigmas=torch.Tensor(sigmas),
                    param_mean=torch.Tensor(Pmean), param_sigmas=torch.Tensor(Psigmas),
                    fstd=torch.Tensor(Fstd) if Fstd is not None else None)
-    emu.train_with_adaptive_batching(torch.Tensor(Ptrain), torch.Tensor(Ftrain), torch.Tensor(Pval), torch.Tensor(Fval), phases=phases)
+    emu.train_with_adaptive_batching(torch.Tensor(Ptrain), torch.Tensor(pc_train_targets),
+                                     torch.Tensor(Pval), torch.Tensor(pc_val_targets),
+                                     phases=phases, pc_weights=pc_weights)
     emu.save_h5(output_path, is_scalar=is_scalar)
 
     # Extract k/z from generation config (used for emu config and residual plots)
