@@ -72,9 +72,10 @@ class Model:
 
         self.param_names = list(prior_info.keys())
         joint_priors = cfg.get("joint_priors", {})
+        linear_constraint_priors = cfg.get("linear_constraint_priors", {})
         self.prior = Prior(
             prior_info, derived_params=derived_params, fixed_params=fixed_params,
-            joint_priors=joint_priors
+            joint_priors=joint_priors, linear_constraint_priors=linear_constraint_priors
         )
         self.likelihood_param_index = param_idx
 

@@ -13,7 +13,8 @@ class Prior(object):
     and initial position generation for samplers.
     """
 
-    def __init__(self, config, derived_params=[], fixed_params=[], joint_priors={}):
+    def __init__(self, config, derived_params=[], fixed_params=[], joint_priors={},
+                 linear_constraint_priors={}):
         """Initialize priors from parameter configuration.
 
         Args:
@@ -69,6 +70,19 @@ class Prior(object):
                 if "proposal" in existing:
                     self.prior_info[p]["proposal"] = existing["proposal"]
 
+        self.linear_constraint_groups = {}
+        for name, group in linear_constraint_priors.items():
+            params = group["params"]
+            coeffs = jnp.array(group["coeffs"], dtype=float)
+            bound = float(group["bound"])
+            L = float(group.get("L", 10))
+            self.linear_constraint_groups[name] = {
+                "params": params,
+                "coeffs": coeffs,
+                "bound": bound,
+                "L": L,
+            }
+
         self.get_prior_sigmas()
         self.get_reference_values()
 
@@ -103,6 +117,18 @@ class Prior(object):
                  for i, p in enumerate(group["params"])]
             )
             logp += -0.5 * residual @ group["cinv"] @ residual + group["log_norm"]
+
+        for group in self.linear_constraint_groups.values():
+            linear_combo = jnp.sum(jnp.stack(
+                [group["coeffs"][i] * params_values[p]
+                 for i, p in enumerate(group["params"])]
+            ))
+            scale = jnp.sum(jnp.abs(group["coeffs"]) * self.prior_sigmas[
+                jnp.array([self.params.index(p) for p in group["params"]])
+            ])
+            logp += jnp.log(0.5 * (1 - jax.lax.erf(
+                group["L"] * (linear_combo - group["bound"]) / scale
+            )))
 
         return logp
 
