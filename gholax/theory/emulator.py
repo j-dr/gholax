@@ -169,10 +169,10 @@ class MultiSpectrumEmulator(object):
         input_param_order=None,
         abspath=False,
         data_dir=None,
-        s8_tvar=True,
-        scale_As_spec=False,
-        scale_As_d=True,
-        scale_by_s8zsq=True,
+        s8_tvar=None,
+        scale_As_spec=None,
+        scale_As_d=None,
+        scale_by_s8zsq=None,
     ):
         """Initialize the multi-spectrum emulator.
 
