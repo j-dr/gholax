@@ -196,7 +196,7 @@ class Emulator(tf.keras.Model):
                 setattr(self,k, weights[k])
                 
 def train_emu(Ptrain, Ftrain, validation_frac=0.2,
-              n_hidden=[100, 100, 100], n_pcs=20,
+              n_hidden=[100, 100, 100], n_pcs=None,
               n_epochs=1000, fstd=None, pmean=None,
               pstd=None, outfile=None, lrs=None,
               nbatchs=None, restart_file=None):
@@ -237,10 +237,16 @@ def train_emu(Ptrain, Ftrain, validation_frac=0.2,
 
     cov_matrix = np.cov(Ftrain.T)
     w, v = np.linalg.eigh(cov_matrix)
-    # flip to rank in ascending eigenvalue
+    # flip to rank in descending eigenvalue
     w = np.flip(w)
     v = np.flip(v, axis=1)
     v = np.array(v, dtype='float32')
+
+    if n_pcs is None:
+        cumulative = np.cumsum(w) / np.sum(w)
+        n_pcs = int(np.searchsorted(cumulative, 0.9999) + 1)
+        print(f"Auto-selected n_pcs={n_pcs} (explained variance ratio >= 0.9999)")
+
     pc_train = np.dot(Ftrain, v)
 
     pc_mean = np.mean(pc_train, axis=0)
@@ -291,7 +297,7 @@ if __name__ == '__main__':
     training_data = h5py.File(training_data_filename, 'r')
 
     n_hidden = emu_info['n_hidden']
-    n_pcs = emu_info['n_pcs']
+    n_pcs = emu_info.get('n_pcs', None)
     n_epochs = emu_info['n_epochs']
     use_asinh = emu_info['use_asinh']
     scale_by_std = emu_info['scale_by_std']
