@@ -4,6 +4,35 @@ import h5py as h5
 import json
 import jax.numpy as jnp
 
+def _build_emu_input(samples_i, names, cosmo_params, like):
+    """Build emulator input array from chain samples using the emulator's parameter order.
+
+    Args:
+        samples_i: Array of shape (n_samples, n_params) with chain samples.
+        names: List of sampled parameter names.
+        cosmo_params: List of cosmological parameter names expected by the emulator (excluding 'z').
+        like: Likelihood object with fixed_params for non-sampled parameters.
+
+    Returns:
+        Array of shape (n_samples, len(cosmo_params) + 1) with z=0 appended.
+    """
+    samps = []
+    for p in cosmo_params:
+        if p in names:
+            samps.append(samples_i[:, names.index(p)])
+        elif p == 'logmnu':
+            if 'logmnu' in names:
+                samps.append(samples_i[:, names.index('logmnu')])
+            elif 'mnu' in names:
+                samps.append(np.log10(samples_i[:, names.index('mnu')]))
+            else:
+                samps.append(np.log10(np.ones(len(samples_i)) * like.fixed_params.get('mnu', 0.06)))
+        else:
+            samps.append(np.ones(len(samples_i)) * like.fixed_params[p])
+    samps.append(np.zeros(len(samples_i)))
+    return jnp.array(samps).T
+
+
 def load_samples_checkpoint_nuts(output_file, model, likelihood_name, s8_module_index=1, burn_in_frac=0, ignore_chains=[], smooth_scale=-1):
     """
     Load samples from a NUTS checkpoint file and return a GetDist MCSamples object along with best-fit parameters.
@@ -38,37 +67,24 @@ def load_samples_checkpoint_nuts(output_file, model, likelihood_name, s8_module_
     with open(f'{output_file}.minimization_results.json', 'r') as fp:
         opt = json.load(fp)
     samples_i = np.array(opt['x_opt'])*sigmas + reference
-    cosmo_params = ['As', 'ns', 'H0', 'w', 'ombh2', 'omch2', 'logmnu']
-    samps = []
     like = model.likelihoods[likelihood_name]
+    s8_emu = like.likelihood_pipeline[s8_module_index].emulator
+    ipo = getattr(s8_emu, 'input_param_order', ['As', 'ns', 'H0', 'w', 'ombh2', 'omch2', 'logmnu', 'z'])
+    # cosmo_params is everything except the trailing 'z'
+    cosmo_params = [p for p in ipo if p != 'z']
 
-    for p in cosmo_params:
-        if p in names:
-            samps.append(samples_i[:, names.index(p)])
-        else:
-            samps.append(np.ones(len(samples_i)) * like.fixed_params[p])
-    
-    samps.append(np.zeros(len(samples_i)))
-    x =  jnp.array(samps)
-    
+    x = _build_emu_input(samples_i, names, cosmo_params, like)
+
     om_bf = (samples_i[:, names.index('omch2')]+samples_i[:, names.index('ombh2')])/(samples_i[:, names.index('H0')]/100)**2
-    sigma8_bf = like.likelihood_pipeline[s8_module_index].emulator.predict(x.T)
-    
+    sigma8_bf = s8_emu.predict(x)
+
     log_post = []
     for i in range(samples.shape[0]):
         if i in ignore_chains: continue
         samples_i = samples[i,:,:]
-        samps = []
-        for p in cosmo_params:
-            if p in names:
-                samps.append(samples_i[:, names.index(p)])
-            else:
-                samps.append(np.ones(len(samples_i)) * like.fixed_params[p])
-        
-        samps.append(np.zeros(len(samples_i)))
-        x =  jnp.array(samps)
+        x = _build_emu_input(samples_i, names, cosmo_params, like)
         om = (samples_i[:, names.index('omch2')]+samples_i[:, names.index('ombh2')])/(samples_i[:, names.index('H0')]/100)**2
-        sigma8 = like.likelihood_pipeline[s8_module_index].emulator.predict(x.T)
+        sigma8 = s8_emu.predict(x)
         s8 = sigma8[:,0] * np.sqrt(om/0.3)
         log_post.append(log_posterior[i,:])
         samples_i = np.hstack([samples_i, om[:,None], sigma8, s8[:,None]])
@@ -114,17 +130,14 @@ def load_samples_emcee(output_file, model, likelihood_name, s8_module_index=1, s
     like = model.likelihoods[likelihood_name]
 
     samples_i = samples[:,:]
-    x =  jnp.array([samples_i[:,names.index('As')], 
-                    samples_i[:,names.index('ns')],
-                    samples_i[:,names.index('H0')],
-                    -np.ones_like(samples_i[:,names.index('As')]),
-                    samples_i[:,names.index('ombh2')],
-                    samples_i[:, names.index('omch2')],
-                    -2*np.ones_like(samples_i[:,names.index('As')]),
-                    np.zeros_like(samples_i[:, names.index('As')])])
-    
+    s8_emu = like.likelihood_pipeline[s8_module_index].emulator
+    ipo = getattr(s8_emu, 'input_param_order', ['As', 'ns', 'H0', 'w', 'ombh2', 'omch2', 'logmnu', 'z'])
+    cosmo_params = [p for p in ipo if p != 'z']
+
+    x = _build_emu_input(samples_i, names, cosmo_params, like)
+
     om = (samples_i[:, names.index('omch2')]+samples_i[:, names.index('ombh2')])/(samples_i[:, names.index('H0')]/100)**2
-    sigma8 = like.likelihood_pipeline[s8_module_index].emulator.predict(x.T)
+    sigma8 = s8_emu.predict(x)
     s8 = sigma8[:,0] * np.sqrt(om/0.3)    
     
     samples = np.hstack([samples_i, om[:,None], sigma8, s8[:,None]])
