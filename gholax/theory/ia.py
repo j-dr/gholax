@@ -363,6 +363,15 @@ class RealSpaceIAExpansion(LikelihoodModule):
             "save_spherical_harmonic_spectra", False
         )
         self.no_ia = config.get("no_ia", False)
+        self.independent_p_mi_ct = config.get('independent_pmi_ct')
+#        self.include_ia_shapenoise = config.get('include_ia_shapenoise')
+        
+        if self.independent_p_mi_ct:
+            p_mi_ct = 'alpha_s_mi'
+        else:
+            p_mi_ct = 'alpha_s'
+            
+            
 
         self.output_requirements = {}
         if self.scale_by_s8z:
@@ -392,35 +401,35 @@ class RealSpaceIAExpansion(LikelihoodModule):
 
         self.spectrum_params = {
             "p_ii_ee": [
-                ["c_s", "c_ds", "c_s2", "c_L2", "c_3", "c_dt", "alpha_s"],
-                ["c_s", "c_ds", "c_s2", "c_L2", "c_3", "c_dt", "alpha_s"],
+                ["c_s", "c_ds", "c_s2", "c_L2", "c_3", "c_dt", "alpha_s", "sigma_s_i"],
+                ["c_s", "c_ds", "c_s2", "c_L2", "c_3", "c_dt", "alpha_s", "sigma_s_i"],
             ],
             "p_ii_bb": [
-                ["c_s", "c_ds", "c_s2", "c_L2", "c_3", "c_dt", "alpha_s"],
-                ["c_s", "c_ds", "c_s2", "c_L2", "c_3", "c_dt", "alpha_s"],
+                ["c_s", "c_ds", "c_s2", "c_L2", "c_3", "c_dt", "alpha_s", "sigma_s_i"],
+                ["c_s", "c_ds", "c_s2", "c_L2", "c_3", "c_dt", "alpha_s", "sigma_s_i"],
             ],
             "p_ii_22_0": [
-                ["c_s", "c_ds", "c_s2", "c_L2", "c_3", "c_dt", "alpha_s"],
-                ["c_s", "c_ds", "c_s2", "c_L2", "c_3", "c_dt", "alpha_s"],
+                ["c_s", "c_ds", "c_s2", "c_L2", "c_3", "c_dt", "alpha_s", "sigma_s_i"],
+                ["c_s", "c_ds", "c_s2", "c_L2", "c_3", "c_dt", "alpha_s", "sigma_s_i"],
             ],
             "p_ii_22_1": [
-                ["c_s", "c_ds", "c_s2", "c_L2", "c_3", "c_dt", "alpha_s"],
-                ["c_s", "c_ds", "c_s2", "c_L2", "c_3", "c_dt", "alpha_s"],
+                ["c_s", "c_ds", "c_s2", "c_L2", "c_3", "c_dt", "alpha_s", "sigma_s_i"],
+                ["c_s", "c_ds", "c_s2", "c_L2", "c_3", "c_dt", "alpha_s", "sigma_s_i"],
             ],
             "p_ii_22_2": [
-                ["c_s", "c_ds", "c_s2", "c_L2", "c_3", "c_dt", "alpha_s"],
-                ["c_s", "c_ds", "c_s2", "c_L2", "c_3", "c_dt", "alpha_s"],
+                ["c_s", "c_ds", "c_s2", "c_L2", "c_3", "c_dt", "alpha_s", "sigma_s_i"],
+                ["c_s", "c_ds", "c_s2", "c_L2", "c_3", "c_dt", "alpha_s", "sigma_s_i"],
             ],
             "p_mi": [
-                ["c_s", "c_ds", "c_s2", "c_L2", "c_3", "c_dt", "alpha_s"],
-                ["c_s", "c_ds", "c_s2", "c_L2", "c_3", "c_dt", "alpha_s"],
+                ["c_s", "c_ds", "c_s2", "c_L2", "c_3", "c_dt", p_mi_ct, "sigma_s_i"],
+                ["c_s", "c_ds", "c_s2", "c_L2", "c_3", "c_dt", p_mi_ct, "sigma_s_i"],
             ],
             "p_gi": [
-                ["b_1", "b_2", "b_s", "b_3"],
-                ["c_s", "c_ds", "c_s2", "c_L2", "c_3", "c_dt", "alpha_s"],
+                ["b_1", "b_2", "b_s", "b_3", "b_ka"],
+                ["c_s", "c_ds", "c_s2", "c_L2", "c_3", "c_dt", "alpha_s", "sigma_s_i"],
             ],
         }
-
+        
         self.spectrum_basis = {
             "p_ii_ee": "p_mij_real_space_shape_shape_grid",
             "p_ii_22_0": "p_mij_real_space_shape_shape_grid",
@@ -1166,13 +1175,14 @@ def combine_density_shape_spectra(
     Returns:
         Dictionary of combined density-shape power spectra
     """
-    b1, b2, bs, b3 = bvec_d  # absorb alpha_d into alpha_s for now.
-    c_s, c_ds, c_s2, c_L2, c_3, c_dt, alpha_s = bvec_ia
+    b1, b2, bs, b3, bk2 = bvec_d  
+    c_s, c_ds, c_s2, c_L2, c_3, c_dt, alpha_s, sigma_s = bvec_ia
 
     if s8z_d is not None:
         b1 = b1 / s8z_d
         b2 = b2 / s8z_d**2
         b3 = b3 / s8z_d**3
+
         # alpha_d = alpha_d / s8z_d**2
 
     if s8z_s is not None:
@@ -1182,10 +1192,13 @@ def combine_density_shape_spectra(
         c_L2 = c_L2 / s8z_s**2
         c_3 = c_3 / s8z_s**3
         c_dt = c_dt / s8z_s**3
-        alpha_s = alpha_s / s8z_s**2
+        #alpha_s = alpha_s / s8z_s**2
 
     if b1e:
         b1 = b1 - 1
+    
+    bk2 = 0.5 * c_s * (1 + b1) * bk2 / 0.4**2
+    alpha_s = 0.5 * c_s * (1 + b1) * alpha_s / 0.4**2
 
     # The table is listed in order (1, Oab), (delta, Oab), (s2, Oab)
     bias_poly = jnp.array(
@@ -1210,7 +1223,7 @@ def combine_density_shape_spectra(
             b1 * c_3 + b3 * c_s,
             c_dt,
             b1 * c_dt,
-            alpha_s,
+            bk2 + alpha_s,
         ]
     )
 
@@ -1221,7 +1234,7 @@ def combine_density_shape_spectra(
 
 
 def combine_shape_shape_spectra(
-    k, spectra, shape_bvec1, shape_bvec2, Pshot=0, s8z_i=None, s8z_j=None
+    k, spectra, shape_bvec1, shape_bvec2, s8z_i=None, s8z_j=None
 ):
     """
     Combine shape-shape spectra with intrinsic alignment bias parameters.
@@ -1240,8 +1253,8 @@ def combine_shape_shape_spectra(
     """
     # Here we have to specify spectra for a specific helicity
 
-    c_s, c_ds, c_s2, c_L2, c_3, c_dt, alpha_s1 = shape_bvec1
-    b_s, b_ds, b_s2, b_L2, b_3, b_dt, alpha_s2 = shape_bvec2
+    c_s, c_ds, c_s2, c_L2, c_3, c_dt, alpha_s1, sigma_s1 = shape_bvec1
+    b_s, b_ds, b_s2, b_L2, b_3, b_dt, alpha_s2, sigma_s2 = shape_bvec2
 
     if s8z_i is not None:
         c_s /= s8z_i
@@ -1250,7 +1263,7 @@ def combine_shape_shape_spectra(
         c_L2 /= s8z_i**2
         c_3 /= s8z_i**3
         c_dt /= s8z_i**3
-        alpha_s1 /= s8z_i**2
+        alpha_s1 = 0.5 * c_s * b_s * alpha_s1 / 0.4**2
 
     if s8z_j is not None:
         b_s /= s8z_j
@@ -1259,7 +1272,7 @@ def combine_shape_shape_spectra(
         b_L2 /= s8z_j**2
         b_3 /= s8z_j**3
         b_dt /= s8z_j**3
-        alpha_s2 /= s8z_j**2
+        alpha_s2 /= 0.5 * c_s * b_s * alpha_s2 / 0.4**2
 
     # The table is listed in order (s_ab, Ocd), (delta sab, Ocd), (s^2_ab, Ocd)
     bias_poly = jnp.array(
@@ -1283,7 +1296,7 @@ def combine_shape_shape_spectra(
     if len(bias_poly.shape) == 1:
         bias_poly = bias_poly.reshape(-1, 1)
 
-    p = jnp.sum(bias_poly[:, None, :] * spectra, axis=0)
+    p = jnp.sum(bias_poly[:, None, :] * spectra, axis=0) + sigma_s1 * sigma_s2
 
     #    add_sn = lambda p, sn_a: p + sn_a
     # noadd_sn = lambda p, sn_a: p
