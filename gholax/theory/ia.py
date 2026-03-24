@@ -1263,7 +1263,7 @@ def combine_shape_shape_spectra(
         c_L2 /= s8z_i**2
         c_3 /= s8z_i**3
         c_dt /= s8z_i**3
-        alpha_s1 = 0.5 * c_s * b_s * alpha_s1 / 0.4**2
+
 
     if s8z_j is not None:
         b_s /= s8z_j
@@ -1272,7 +1272,9 @@ def combine_shape_shape_spectra(
         b_L2 /= s8z_j**2
         b_3 /= s8z_j**3
         b_dt /= s8z_j**3
-        alpha_s2 /= 0.5 * c_s * b_s * alpha_s2 / 0.4**2
+
+    alpha_s1 = 0.5 * c_s * b_s * alpha_s1 / 0.4**2
+    alpha_s2 = 0.5 * c_s * b_s * alpha_s2 / 0.4**2
 
     # The table is listed in order (s_ab, Ocd), (delta sab, Ocd), (s^2_ab, Ocd)
     bias_poly = jnp.array(
