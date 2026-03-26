@@ -24,6 +24,7 @@ class ShearMultiplicativeBias(LikelihoodModule):
         self.spectrum_info = spectrum_info
         self.cl_tag = config.get("cl_tag", "_w_lensing_ct")
 
+        self.source_bin_mapping = config.get("source_bin_mapping", {})
         self.all_spectra = {}
         self.output_requirements = {}
         self.indexed_params = {}
@@ -34,16 +35,18 @@ class ShearMultiplicativeBias(LikelihoodModule):
             if "gamma" in field_types[t][0]:
                 for i in range(self.observed_data_vector.nz_s.shape[0]):
                     if i in self.spectrum_info[t]["bins0"]:
-                        self.output_requirements[f"{t}_mbias"].append(f"m_bias_{i}")
-                        self.indexed_params[t].append(f"m_bias_{i}")
+                        mi = self.source_bin_mapping.get(i, i)
+                        self.output_requirements[f"{t}_mbias"].append(f"m_bias_{mi}")
+                        self.indexed_params[t].append(f"m_bias_{mi}")
                     else:
                         self.indexed_params[t].append(f"NA")
 
             elif "gamma" in field_types[t][1]:
                 for i in range(self.observed_data_vector.nz_s.shape[0]):
                     if i in self.spectrum_info[t]["bins1"]:
-                        self.output_requirements[f"{t}_mbias"].append(f"m_bias_{i}")
-                        self.indexed_params[t].append(f"m_bias_{i}")
+                        mi = self.source_bin_mapping.get(i, i)
+                        self.output_requirements[f"{t}_mbias"].append(f"m_bias_{mi}")
+                        self.indexed_params[t].append(f"m_bias_{mi}")
                     else:
                         self.indexed_params[t].append(f"NA")
 

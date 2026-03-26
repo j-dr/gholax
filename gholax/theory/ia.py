@@ -363,6 +363,8 @@ class RealSpaceIAExpansion(LikelihoodModule):
             "save_spherical_harmonic_spectra", False
         )
         self.no_ia = config.get("no_ia", False)
+        self.lens_bin_mapping = config.get("lens_bin_mapping", {})
+        self.source_bin_mapping = config.get("source_bin_mapping", {})
         self.independent_p_mi_ct = config.get('independent_p_mi_ct', False)
 #        self.include_ia_shapenoise = config.get('include_ia_shapenoise')
         
@@ -561,26 +563,30 @@ class RealSpaceIAExpansion(LikelihoodModule):
             s_idx = (i, j)
             pars[s_idx] = []
             if p_type == "p_gi":
+                mi = self.lens_bin_mapping.get(i, i)
+                mj = self.source_bin_mapping.get(j, j)
                 pars[s_idx].append(
                     [
-                        f"{p}_{i}" if ((i in self.dbins) & (j in self.sbins)) else "NA"
+                        f"{p}_{mi}" if ((i in self.dbins) & (j in self.sbins)) else "NA"
                         for p in self.spectrum_params[p_type][0]
                     ]
                 )
 
                 pars[s_idx].append(
                     [
-                        f"{p}_{i}_{j}"
+                        f"{p}_{mi}_{mj}"
                         if ((i in self.dbins) & (j in self.sbins))
                         else "NA"
                         for p in self.spectrum_params[p_type][1]
                     ]
                 )
             else:
+                msi = self.source_bin_mapping.get(i, i)
+                msj = self.source_bin_mapping.get(j, j)
                 pars[s_idx].append(
                     [
                         (
-                            f"{p}_{i}_{j}"
+                            f"{p}_{msi}_{msj}"
                             if ((i in self.sbins) & (j in self.sbins))
                             else "NA"
                         )
@@ -590,7 +596,7 @@ class RealSpaceIAExpansion(LikelihoodModule):
                 pars[s_idx].append(
                     [
                         (
-                            f"{p}_{i}_{j}"
+                            f"{p}_{msi}_{msj}"
                             if ((i in self.sbins) & (j in self.sbins))
                             else "NA"
                         )
@@ -602,20 +608,22 @@ class RealSpaceIAExpansion(LikelihoodModule):
 
         elif self.z_evolution_model == "per_source_bin_spline":
             if (p_type == "p_mi") & (c_type == "c_kk"):
+                msi = self.source_bin_mapping.get(i, i)
                 s_idx = (i,)
                 pars[s_idx] = [
                     [
-                        f"{p}_{i}_{n}" if i in self.sbins else "NA"
+                        f"{p}_{msi}_{n}" if i in self.sbins else "NA"
                         for p in self.spectrum_params[p_type][0]
                         for n in range(self.spline_N)
                     ],
                     [],
                 ]
+                msj = self.source_bin_mapping.get(j, j)
                 s_idx = (j,)
                 pars[s_idx] = [
                     [],
                     [
-                        f"{p}_{j}_{n}" if j in self.sbins else "NA"
+                        f"{p}_{msj}_{n}" if j in self.sbins else "NA"
                         for p in self.spectrum_params[p_type][0]
                         for n in range(self.spline_N)
                     ],
@@ -625,10 +633,11 @@ class RealSpaceIAExpansion(LikelihoodModule):
                 s_idx = (i, j)
                 pars[s_idx] = []
                 if p_type == "p_gi":
+                    mi = self.lens_bin_mapping.get(i, i)
                     pars[s_idx].append(
                         [
                             (
-                                f"{p}_{i}"
+                                f"{p}_{mi}"
                                 if ((i in self.dbins) & (j in self.sbins))
                                 else "NA"
                             )
@@ -636,16 +645,18 @@ class RealSpaceIAExpansion(LikelihoodModule):
                         ]
                     )
                 else:
+                    msi = self.source_bin_mapping.get(i, i)
                     pars[s_idx].append(
                         [
-                            f"{p}_{i}_{n}" if (i in self.sbins) else "NA"
+                            f"{p}_{msi}_{n}" if (i in self.sbins) else "NA"
                             for p in self.spectrum_params[p_type][0]
                             for n in range(self.spline_N)
                         ]
                     )
+                msj = self.source_bin_mapping.get(j, j)
                 pars[s_idx].append(
                     [
-                        f"{p}_{j}_{n}" if (j in self.sbins) else "NA"
+                        f"{p}_{msj}_{n}" if (j in self.sbins) else "NA"
                         for p in self.spectrum_params[p_type][1]
                         for n in range(self.spline_N)
                     ]
@@ -676,9 +687,10 @@ class RealSpaceIAExpansion(LikelihoodModule):
                 s_idx = (i, j)
                 pars[s_idx] = []
                 if p_type == "p_gi":
+                    mi = self.lens_bin_mapping.get(i, i)
                     pars[s_idx].append(
                         [
-                            f"{p}_{i}" if i in self.dbins else "NA"
+                            f"{p}_{mi}" if i in self.dbins else "NA"
                             for p in self.spectrum_params[p_type][0]
                         ]
                     )
@@ -697,23 +709,25 @@ class RealSpaceIAExpansion(LikelihoodModule):
                         for n in range(self.spline_N)
                     ]
                 )
-                
+
         elif self.z_evolution_model == "per_source_bin_const":
             if (p_type == "p_mi") & (c_type == "c_kk"):
+                msi = self.source_bin_mapping.get(i, i)
                 s_idx = (i,)
                 pars[s_idx] = [
                     [
-                        f"{p}_{i}" if i in self.sbins else "NA"
+                        f"{p}_{msi}" if i in self.sbins else "NA"
                         for p in self.spectrum_params[p_type][0]
                     ],
                     [],
                 ]
                 if i != j:
+                    msj = self.source_bin_mapping.get(j, j)
                     s_idx = (j,)
                     pars[s_idx] = [
                         [],
                         [
-                            f"{p}_{j}" if j in self.sbins else "NA"
+                            f"{p}_{msj}" if j in self.sbins else "NA"
                             for p in self.spectrum_params[p_type][0]
                         ],
                     ]
@@ -722,26 +736,29 @@ class RealSpaceIAExpansion(LikelihoodModule):
                 s_idx = (i, j)
                 pars[s_idx] = []
                 if p_type == "p_gi":
+                    mi = self.lens_bin_mapping.get(i, i)
                     pars[s_idx].append(
                         [
-                            f"{p}_{i}" if i in self.dbins else "NA"
+                            f"{p}_{mi}" if i in self.dbins else "NA"
                             for p in self.spectrum_params[p_type][0]
                         ]
                     )
                 else:
+                    msi = self.source_bin_mapping.get(i, i)
                     pars[s_idx].append(
                         [
-                            f"{p}_{i}" if i in self.sbins else "NA"
+                            f"{p}_{msi}" if i in self.sbins else "NA"
                             for p in self.spectrum_params[p_type][0]
                         ]
                     )
+                msj = self.source_bin_mapping.get(j, j)
                 pars[s_idx].append(
                     [
-                        f"{p}_{j}" if j in self.sbins else "NA"
+                        f"{p}_{msj}" if j in self.sbins else "NA"
                         for p in self.spectrum_params[p_type][1]
                     ]
-                ) 
-                
+                )
+
         elif self.z_evolution_model == "const":
             if (p_type == "p_mi") & (c_type == "c_kk"):
                 s_idx = (i,)
@@ -764,9 +781,10 @@ class RealSpaceIAExpansion(LikelihoodModule):
                 s_idx = (i, j)
                 pars[s_idx] = []
                 if p_type == "p_gi":
+                    mi = self.lens_bin_mapping.get(i, i)
                     pars[s_idx].append(
                         [
-                            f"{p}_{i}" if i in self.dbins else "NA"
+                            f"{p}_{mi}" if i in self.dbins else "NA"
                             for p in self.spectrum_params[p_type][0]
                         ]
                     )
@@ -780,7 +798,7 @@ class RealSpaceIAExpansion(LikelihoodModule):
                     [
                         p if j in self.sbins else "NA" for p in self.spectrum_params[p_type][1]
                     ]
-                )                               
+                )
 
         elif self.z_evolution_model == "powerlaw":
             assert self.spline_N == 2, (
@@ -812,9 +830,10 @@ class RealSpaceIAExpansion(LikelihoodModule):
                 s_idx = (i, j)
                 pars[s_idx] = []
                 if p_type == "p_gi":
+                    mi = self.lens_bin_mapping.get(i, i)
                     pars[s_idx].append(
                         [
-                            f"{p}_{i}" if i in self.dbins else "NA"
+                            f"{p}_{mi}" if i in self.dbins else "NA"
                             for p in self.spectrum_params[p_type][0]
                         ]
                     )
@@ -833,7 +852,7 @@ class RealSpaceIAExpansion(LikelihoodModule):
                         for n in range(self.spline_N)
                     ]
                 )
-                
+
         elif self.z_evolution_model == "tabulated":
 
             if p_type == "p_mi":
@@ -844,10 +863,11 @@ class RealSpaceIAExpansion(LikelihoodModule):
                     pars[s_idx] = []
             elif p_type == "p_gi":
                 s_idx = (i, j)
-                pars[s_idx] = []               
+                pars[s_idx] = []
+                mi = self.lens_bin_mapping.get(i, i)
                 pars[s_idx].append(
                     [
-                        f"{p}_{i}" if i in self.dbins else "NA"
+                        f"{p}_{mi}" if i in self.dbins else "NA"
                         for p in self.spectrum_params[p_type][0]
                     ]
                 )                

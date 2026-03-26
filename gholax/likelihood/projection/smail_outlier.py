@@ -56,14 +56,16 @@ class SmailOutlier(LikelihoodModule):
         self.nbins = len(self.bins)
         self.nbins_all = nz.shape[0]
         self.param_name_base = param_name
+        self.source_bin_mapping = config.get("source_bin_mapping", {})
         self.output_requirements[f"{self.nz_name}_shifted"] = []
         for i in self.bins:
+            mi = self.source_bin_mapping.get(int(i), int(i))
             self.output_requirements[f'{self.nz_name}_shifted'].extend(
             [
-                f"delta_z_{self.param_name_base}_{i}",
-                f"sigma_z_{self.param_name_base}_{i}",
-                f"f_out_z_{self.param_name_base}_{i}",
-                f"delta_z_out_{self.param_name_base}_{i}",
+                f"delta_z_{self.param_name_base}_{mi}",
+                f"sigma_z_{self.param_name_base}_{mi}",
+                f"f_out_z_{self.param_name_base}_{mi}",
+                f"delta_z_out_{self.param_name_base}_{mi}",
             ])
 
 
@@ -71,10 +73,10 @@ class SmailOutlier(LikelihoodModule):
             self.indexed_params = np.array(
                 [
                     [
-                        f"delta_z_{self.param_name_base}_{i}",
-                        f"sigma_z_{self.param_name_base}_{i}",
-                        f"f_out_z_{self.param_name_base}_{i}",
-                        f"delta_z_out_{self.param_name_base}_{i}",                       
+                        f"delta_z_{self.param_name_base}_{self.source_bin_mapping.get(i, i)}",
+                        f"sigma_z_{self.param_name_base}_{self.source_bin_mapping.get(i, i)}",
+                        f"f_out_z_{self.param_name_base}_{self.source_bin_mapping.get(i, i)}",
+                        f"delta_z_out_{self.param_name_base}_{self.source_bin_mapping.get(i, i)}",
                     ]
                     if i in self.bins
                     else ["NA", "NA", "NA", "NA"]

@@ -51,7 +51,19 @@ class Model:
         for lname in cfg["likelihood"]:
             if lname == 'params':
                 continue
-            like = getattr(likelihood, lname)(cfg)
+            like_cls = getattr(likelihood, lname, None)
+            if like_cls is not None:
+                like = like_cls(cfg)
+            else:
+                lcfg = cfg["likelihood"][lname]
+                like_type = lcfg["likelihood_type"]
+                like_cls = getattr(likelihood, like_type)
+                # Build a config where the class name key points to this
+                # alias's config, so the likelihood __init__ can find it.
+                cfg_alias = dict(cfg)
+                cfg_alias["likelihood"] = dict(cfg["likelihood"])
+                cfg_alias["likelihood"][like_type] = lcfg
+                like = like_cls(cfg_alias)
             self.likelihoods[lname] = like
 
             sampled_params.extend(list(like.sampled_params.keys()))

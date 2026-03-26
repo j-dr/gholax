@@ -49,14 +49,15 @@ class DeltaZ(LikelihoodModule):
         self.nbins = len(self.bins)
         self.nbins_all = nz.shape[0]
         self.param_name_base = param_name
+        self.source_bin_mapping = config.get("source_bin_mapping", {})
         self.output_requirements[f"{self.nz_name}_shifted"] = [
-            f"{param_name}_{i}" for i in self.bins
+            f"{param_name}_{self.source_bin_mapping.get(int(i), int(i))}" for i in self.bins
         ]
 
         if self.do_shift:
             self.indexed_params = np.array(
                 [
-                    f"{self.param_name_base}_{i}" if i in self.bins else "NA"
+                    f"{self.param_name_base}_{self.source_bin_mapping.get(i, i)}" if i in self.bins else "NA"
                     for i in range(self.nbins_all)
                 ]
             )[:, None]

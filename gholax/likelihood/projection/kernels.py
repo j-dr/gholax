@@ -82,6 +82,7 @@ class ProjectionKernels(LikelihoodModule):
                     all_kernels.append(k)
 
         self.all_kernels = list(np.unique(all_kernels))
+        self.lens_bin_mapping = config.get("lens_bin_mapping", {})
         self.indexed_params = {}
         self.output_requirements = {}
         for k in self.all_kernels:
@@ -92,13 +93,14 @@ class ProjectionKernels(LikelihoodModule):
             if "mag" in k:
                 self.output_requirements[k].extend(
                     [
-                        f"smag_{i}"
+                        f"smag_{self.lens_bin_mapping.get(i, i)}"
                         for i in self.observed_data_vector.spectrum_info[
                             self.mag_spec[0]
                         ]["bins0"]
                     ]
                 )
                 for i in range(self.observed_data_vector.nz_d.shape[0]):
+                    mi = self.lens_bin_mapping.get(i, i)
                     if k == "w_mag_dk":
                         for j in range(self.observed_data_vector.nz_s.shape[0]):
                             if (
@@ -107,7 +109,7 @@ class ProjectionKernels(LikelihoodModule):
                                     self.mag_spec[0]
                                 ]["bins0"]
                             ):
-                                self.indexed_params[k].append(f"smag_{i}")
+                                self.indexed_params[k].append(f"smag_{mi}")
                             else:
                                 self.indexed_params[k].append("NA")  # returns zero
                     else:
@@ -117,7 +119,7 @@ class ProjectionKernels(LikelihoodModule):
                                 self.mag_spec[0]
                             ]["bins0"]
                         ):
-                            self.indexed_params[k].append(f"smag_{i}")
+                            self.indexed_params[k].append(f"smag_{mi}")
                         else:
                             self.indexed_params[k].append("NA")  # returns zero
             self.indexed_params[k] = np.array(self.indexed_params[k])[:, None]

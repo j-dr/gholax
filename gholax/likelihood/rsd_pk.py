@@ -38,6 +38,7 @@ class RSDPK(GaussianLikelihood):
         self.kmax = c.get("kmax", 0.6 + 1e-3)
         self.nk = c.get("nk", 200)
         self.use_boltzmann = c.get("use_boltzmann", False)
+        lens_bin_mapping = c.get("lens_bin_mapping", {})
 
         self.observed_data_vector = RedshiftSpaceMultipoles(
             zmin=self.zmin_proj,
@@ -114,6 +115,7 @@ class RSDPK(GaussianLikelihood):
                     kmin=self.kmin,
                     kmax=self.kmax,
                     nk=self.nk,
+                    lens_bin_mapping=lens_bin_mapping,
                     **config_theory.get("RedshiftSpaceBiasExpansion", {}),
                 ),
                 RedshiftSpaceMultipolePowerSpectrumWindow(

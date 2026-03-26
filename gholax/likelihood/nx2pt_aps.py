@@ -44,6 +44,8 @@ class Nx2PTAngularPowerSpectrum(GaussianLikelihood):
         self.nk = c.get("nk", 200)
         self.use_boltzmann = c.get("use_boltzmann", False)
         self.redshift_uncertainty = c.get('redshift_uncertainty', 'delta_z')
+        lens_bin_mapping = c.get("lens_bin_mapping", {})
+        source_bin_mapping = c.get("source_bin_mapping", {})
 
         self.observed_data_vector = TwoPointSpectrum(
             zmin=self.zmin_proj,
@@ -83,16 +85,18 @@ class Nx2PTAngularPowerSpectrum(GaussianLikelihood):
                     nz=self.nz_proj,
                     param_name="delta_z_source",
                     nz_name="nz_s",
+                    source_bin_mapping=source_bin_mapping,
                     **config_proj.get("DeltaZ", {}),
                 )
         elif self.redshift_uncertainty == 'smail_outlier':
             dz_mod = SmailOutlier(
-                    self.observed_data_vector, 
+                    self.observed_data_vector,
                     zmin=self.zmin_proj,
                     zmax=self.zmax_proj,
                     nz=self.nz_proj,
                     param_name='source',
                     nz_name='nz_s',
+                    source_bin_mapping=source_bin_mapping,
                     **config_proj.get('SmailOutlier', {}),
                 )
         
@@ -129,6 +133,7 @@ class Nx2PTAngularPowerSpectrum(GaussianLikelihood):
                     zmax=self.zmax_proj,
                     nz=self.nz_proj,
                     shifted_nz="nz_s",
+                    lens_bin_mapping=lens_bin_mapping,
                     **config_proj.get("ProjectionKernels", {}),
                 ),
                 RealSpaceBiasedTracerSpectra(
@@ -162,6 +167,7 @@ class Nx2PTAngularPowerSpectrum(GaussianLikelihood):
                     kmax=self.kmax,
                     nk=self.nk,
                     k_cutoff=self.k_cutoff,
+                    lens_bin_mapping=lens_bin_mapping,
                     **config_theory.get("RealSpaceBiasExpansion", {}),
                 ),
                 DensityShapeIA(
@@ -192,6 +198,8 @@ class Nx2PTAngularPowerSpectrum(GaussianLikelihood):
                     kmin=self.kmin,
                     kmax=self.kmax,
                     nk=self.nk,
+                    lens_bin_mapping=lens_bin_mapping,
+                    source_bin_mapping=source_bin_mapping,
                     **config_theory.get("RealSpaceIAExpansion", {}),
                 ),
                 Limber(
@@ -233,6 +241,7 @@ class Nx2PTAngularPowerSpectrum(GaussianLikelihood):
                     self.observed_data_vector,
                     spectrum_types,
                     spectrum_info,
+                    source_bin_mapping=source_bin_mapping,
                     **config_proj.get("ShearMultiplicativeBias", {}),
                 ),
                 AngularPowerSpectrumWindow(

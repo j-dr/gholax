@@ -472,6 +472,7 @@ class RedshiftSpaceBiasExpansion(LikelihoodModule):
         self.scale_by_s8z = config.get("scale_by_s8z", True)
         self.scale_by_aap = config.get("scale_by_aap", True)
         self.det_bias_aap = config.get("det_bias_aap", False)
+        self.lens_bin_mapping = config.get("lens_bin_mapping", {})
         self.hz_fid =  jnp.array(spectrum_info["p_gg_ell"]["hz_fid"])
         self.chiz_fid = jnp.array(spectrum_info["p_gg_ell"]["chiz_fid"])
 
@@ -521,10 +522,10 @@ class RedshiftSpaceBiasExpansion(LikelihoodModule):
             if self.spectrum_info["p_gg_ell"]["use_cross"]:
                 self.all_spectra["p_gg_ell"].append((i, j))
                 self.output_requirements["p_gg_ell"].extend(
-                    [p.format(i=i) for p in self.spectrum_params["p_gg_ell"]]
+                    [p.format(i=self.lens_bin_mapping.get(i, i)) for p in self.spectrum_params["p_gg_ell"]]
                 )
                 self.output_requirements["p_gg_ell"].extend(
-                    [p.format(i=j) for p in self.spectrum_params["p_gg_ell"]]
+                    [p.format(i=self.lens_bin_mapping.get(j, j)) for p in self.spectrum_params["p_gg_ell"]]
                 )
                 self.output_requirements["p_gg_ell"].append(
                     self.spectrum_basis["p_gg_ell"]
@@ -536,7 +537,7 @@ class RedshiftSpaceBiasExpansion(LikelihoodModule):
                 if (i,) not in self.all_spectra["p_gg_ell"]:
                     self.all_spectra["p_gg_ell"].append((i,))
                     self.output_requirements["p_gg_ell"].extend(
-                        [p.format(i=i) for p in self.spectrum_params["p_gg_ell"]]
+                        [p.format(i=self.lens_bin_mapping.get(i, i)) for p in self.spectrum_params["p_gg_ell"]]
                     )
                     self.output_requirements["p_gg_ell"].append(
                         self.spectrum_basis["p_gg_ell"]
@@ -554,14 +555,14 @@ class RedshiftSpaceBiasExpansion(LikelihoodModule):
             ):  # self.observed_data_vector.spectrum_info[spec_type]["bins0"]:
                 if self.spectrum_info["p_gg_ell"]["use_cross"]:
                     for j in self.dbins:
-                        pars = [p.format(i=i) for p in self.spectrum_params["p_gg_ell"]]
+                        pars = [p.format(i=self.lens_bin_mapping.get(i, i)) for p in self.spectrum_params["p_gg_ell"]]
                         pars.extend(
-                            [p.format(i=j) for p in self.spectrum_params["p_gg_ell"]]
+                            [p.format(i=self.lens_bin_mapping.get(int(j), int(j))) for p in self.spectrum_params["p_gg_ell"]]
                         )
                         self.indexed_params["p_gg_ell"].append(pars)
                 else:
                     self.indexed_params["p_gg_ell"].append(
-                        [p.format(i=i) for p in self.spectrum_params["p_gg_ell"]]
+                        [p.format(i=self.lens_bin_mapping.get(i, i)) for p in self.spectrum_params["p_gg_ell"]]
                     )
             else:
                 self.indexed_params["p_gg_ell"].append(
