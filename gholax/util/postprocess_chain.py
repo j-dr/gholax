@@ -103,6 +103,74 @@ def load_samples_checkpoint_nuts(output_file, model, likelihood_name, s8_module_
 
     return gds, params_bf_chain, reference, names, opt
 
+def load_samples_checkpoint_mh(output_file, model, likelihood_name, s8_module_index=1, burn_in_frac=0, ignore_chains=[], smooth_scale=-1):
+    """
+    Load samples from a MH checkpoint file and return a GetDist MCSamples object along with best-fit parameters.
+    output_file: str
+        Base name of the output files (without extensions).
+    model: object
+        The model object containing prior and likelihood information.
+    likelihood_name: str
+        The name of the likelihood to be used from the model.likelihoods dictionary.
+    s8_module_index: int
+        Index of the module in the likelihood pipeline that computes sigma8.
+    burn_in_frac: float
+        Fraction of samples to discard as burn-in.
+    ignore_chains: list
+        List of chain indices to ignore. 
+    smooth_scale: float
+        Smoothing scale for GetDist plots.
+    """
+    samples = np.load(f'{output_file}.samples_chk.npy')
+    
+    samples_list = []
+
+    params = model.prior.get_reference_point()
+    sigmas = model.prior.get_prior_sigmas()
+    reference = jnp.array(list(model.prior.get_reference_point().values()))
+    names = list(params.keys())
+    
+    like = model.likelihoods[likelihood_name]
+    labels = [model.prior.config[p]['latex'] if 'latex' in model.prior.config[p] else p for p in names]
+
+    with open(f'{output_file}.minimization_results.json', 'r') as fp:
+        opt = json.load(fp)
+    samples_i = np.array(opt['x_opt'])*sigmas + reference
+    like = model.likelihoods[likelihood_name]
+    s8_emu = like.likelihood_pipeline[s8_module_index].emulator
+    ipo = getattr(s8_emu, 'input_param_order', ['As', 'ns', 'H0', 'w', 'ombh2', 'omch2', 'logmnu', 'z'])
+    # cosmo_params is everything except the trailing 'z'
+    cosmo_params = [p for p in ipo if p != 'z']
+
+    x = _build_emu_input(samples_i, names, cosmo_params, like)
+
+    om_bf = (samples_i[:, names.index('omch2')]+samples_i[:, names.index('ombh2')])/(samples_i[:, names.index('H0')]/100)**2
+    sigma8_bf = s8_emu.predict(x)
+
+    log_post = []
+    for i in range(samples.shape[0]):
+        if i in ignore_chains: continue
+        samples_i = samples[i,:,:]
+        x = _build_emu_input(samples_i, names, cosmo_params, like)
+        om = (samples_i[:, names.index('omch2')]+samples_i[:, names.index('ombh2')])/(samples_i[:, names.index('H0')]/100)**2
+        sigma8 = s8_emu.predict(x)
+        s8 = sigma8[:,0] * np.sqrt(om/0.3)
+        samples_i = np.hstack([samples_i, om[:,None], sigma8, s8[:,None]])
+        samples_list.append(samples_i)
+
+    names.extend(['omegam', 'sigma8', 's8'])
+    labels.extend([r'\Omega_m', r'\sigma_8', r'S_8'])
+    samples = np.array(samples_list)
+    log_post = np.array(log_post)
+    gds = MCSamples(samples=samples[:,:,:], names = names, labels=labels, ignore_rows=burn_in_frac, settings={'smooth_scale_2D':smooth_scale, 'smooth_scale_1D':smooth_scale})
+
+    params_bf_chain = dict(zip(names, np.array(opt['x_opt'][0])*sigmas + reference))    
+    params_bf_chain['sigma8'] = sigma8_bf[0]
+    params_bf_chain['omegam'] = om_bf[0]
+    params_bf_chain['s8'] = sigma8_bf[0] * np.sqrt(om_bf[0]/0.3)
+
+    return gds, params_bf_chain, reference, names, opt
+
 def load_samples_emcee(output_file, model, likelihood_name, s8_module_index=1, smooth_scale=-1, burn_in_frac=0.33):
     """Load samples from an emcee checkpoint and return a GetDist MCSamples object.
 
@@ -339,5 +407,7 @@ def load_samples_from_checkpoint(output_file, model, likelihood_name, sampler, s
         return load_samples_checkpoint_nuts(output_file, model, likelihood_name, s8_module_index=s8_module_index, burn_in_frac=burn_in_frac, ignore_chains=ignore_chains, smooth_scale=smooth_scale)
     elif sampler == 'emcee':
         return load_samples_emcee(output_file, model, likelihood_name, s8_module_index=s8_module_index, smooth_scale=smooth_scale, burn_in_frac=burn_in_frac)
+    elif sampler == 'MetropolisHastings':
+        return load_samples_checkpoint_mh(output_file, model, likelihood_name, s8_module_index=s8_module_index, burn_in_frac=burn_in_frac, ignore_chains=ignore_chains, smooth_scale=smooth_scale)        
     else:
         raise NotImplementedError(f"Sampler {sampler} not recognized.")

@@ -14,9 +14,9 @@ required_components = {
         (("w_mag", "w_mag"), ("p_mm",0), "z_limber"),
     ],
     "c_dk": [
-        (("w_d_dk", "w_k"), ("p_gm",0), "zeff_w_d"),
+        (("w_d_dk", "w_k"), ("p_gm",0), "zeff_w_d_dk"),
         (("w_mag_dk", "w_k"), ("p_mm",0), "z_limber"),
-        (("w_d_dk", "w_ia"), ("p_gi",0), "zeff_w_d"),
+        (("w_d_dk", "w_ia"), ("p_gi",0), "zeff_w_d_dk"),
         (("w_mag_dk", "w_ia"), ("p_mi",1), "z_limber"),
     ],
     "c_dcmbk": [
@@ -105,14 +105,14 @@ class Limber(LikelihoodModule):
 
         if (not self.magnification_x_ia) & (not self.no_ia):
             required_components["c_dk"] = [
-                (("w_d_dk", "w_k"), ("p_gm",0), "zeff_w_d"),
+                (("w_d_dk", "w_k"), ("p_gm",0), "zeff_w_d_dk"),
                 (("w_mag_dk", "w_k"), ("p_mm",0), "z_limber"),
-                (("w_d_dk", "w_ia"), ("p_gi",0), "zeff_w_d"),
+                (("w_d_dk", "w_ia"), ("p_gi",0), "zeff_w_d_dk"),
             ]
 
         if self.no_ia:
             required_components["c_dk"] = [
-                (("w_d_dk", "w_k"), ("p_gm",0), "zeff_w_d"),
+                (("w_d_dk", "w_k"), ("p_gm",0), "zeff_w_d_dk"),
                 (("w_mag_dk", "w_k"), ("p_mm",0), "z_limber"),
             ]
 

@@ -363,7 +363,7 @@ class RealSpaceIAExpansion(LikelihoodModule):
             "save_spherical_harmonic_spectra", False
         )
         self.no_ia = config.get("no_ia", False)
-        self.independent_p_mi_ct = config.get('independent_pmi_ct')
+        self.independent_p_mi_ct = config.get('independent_p_mi_ct', False)
 #        self.include_ia_shapenoise = config.get('include_ia_shapenoise')
         
         if self.independent_p_mi_ct:
@@ -401,32 +401,32 @@ class RealSpaceIAExpansion(LikelihoodModule):
 
         self.spectrum_params = {
             "p_ii_ee": [
-                ["c_s", "c_ds", "c_s2", "c_L2", "c_3", "c_dt", "alpha_s", "sigma_s_i"],
-                ["c_s", "c_ds", "c_s2", "c_L2", "c_3", "c_dt", "alpha_s", "sigma_s_i"],
+                ["c_s", "c_ds", "c_s2", "c_L2", "c_3", "c_dt", "alpha_s", "sigma_s"],
+                ["c_s", "c_ds", "c_s2", "c_L2", "c_3", "c_dt", "alpha_s", "sigma_s"],
             ],
             "p_ii_bb": [
-                ["c_s", "c_ds", "c_s2", "c_L2", "c_3", "c_dt", "alpha_s", "sigma_s_i"],
-                ["c_s", "c_ds", "c_s2", "c_L2", "c_3", "c_dt", "alpha_s", "sigma_s_i"],
+                ["c_s", "c_ds", "c_s2", "c_L2", "c_3", "c_dt", "alpha_s", "sigma_s"],
+                ["c_s", "c_ds", "c_s2", "c_L2", "c_3", "c_dt", "alpha_s", "sigma_s"],
             ],
             "p_ii_22_0": [
-                ["c_s", "c_ds", "c_s2", "c_L2", "c_3", "c_dt", "alpha_s", "sigma_s_i"],
-                ["c_s", "c_ds", "c_s2", "c_L2", "c_3", "c_dt", "alpha_s", "sigma_s_i"],
+                ["c_s", "c_ds", "c_s2", "c_L2", "c_3", "c_dt", "alpha_s", "sigma_s"],
+                ["c_s", "c_ds", "c_s2", "c_L2", "c_3", "c_dt", "alpha_s", "sigma_s"],
             ],
             "p_ii_22_1": [
-                ["c_s", "c_ds", "c_s2", "c_L2", "c_3", "c_dt", "alpha_s", "sigma_s_i"],
-                ["c_s", "c_ds", "c_s2", "c_L2", "c_3", "c_dt", "alpha_s", "sigma_s_i"],
+                ["c_s", "c_ds", "c_s2", "c_L2", "c_3", "c_dt", "alpha_s", "sigma_s"],
+                ["c_s", "c_ds", "c_s2", "c_L2", "c_3", "c_dt", "alpha_s", "sigma_s"],
             ],
             "p_ii_22_2": [
-                ["c_s", "c_ds", "c_s2", "c_L2", "c_3", "c_dt", "alpha_s", "sigma_s_i"],
-                ["c_s", "c_ds", "c_s2", "c_L2", "c_3", "c_dt", "alpha_s", "sigma_s_i"],
+                ["c_s", "c_ds", "c_s2", "c_L2", "c_3", "c_dt", "alpha_s", "sigma_s"],
+                ["c_s", "c_ds", "c_s2", "c_L2", "c_3", "c_dt", "alpha_s", "sigma_s"],
             ],
             "p_mi": [
-                ["c_s", "c_ds", "c_s2", "c_L2", "c_3", "c_dt", p_mi_ct, "sigma_s_i"],
-                ["c_s", "c_ds", "c_s2", "c_L2", "c_3", "c_dt", p_mi_ct, "sigma_s_i"],
+                ["c_s", "c_ds", "c_s2", "c_L2", "c_3", "c_dt", p_mi_ct, "sigma_s"],
+                ["c_s", "c_ds", "c_s2", "c_L2", "c_3", "c_dt", p_mi_ct, "sigma_s"],
             ],
             "p_gi": [
                 ["b_1", "b_2", "b_s", "b_3", "b_ka"],
-                ["c_s", "c_ds", "c_s2", "c_L2", "c_3", "c_dt", "alpha_s", "sigma_s_i"],
+                ["c_s", "c_ds", "c_s2", "c_L2", "c_3", "c_dt", "alpha_s", "sigma_s"],
             ],
         }
         
@@ -1092,7 +1092,7 @@ class RealSpaceIAExpansion(LikelihoodModule):
                     0,
                     (
                         self.param_indices[s][0],
-                        jnp.repeat(state["zeff_w_d"][:, None], n_sbins_tot),
+                        state["zeff_w_d_dk"],
                         jnp.tile(
                             state["sigma8_z"], len(self.param_indices[s][0])
                         ).reshape(len(self.param_indices[s][0]), -1),
@@ -1104,7 +1104,7 @@ class RealSpaceIAExpansion(LikelihoodModule):
                     0,
                     (
                         self.param_indices[s][1],
-                        jnp.repeat(state["zeff_w_d"][:, None], n_sbins_tot),
+                        state["zeff_w_d_dk"][:, None],
                         jnp.tile(
                             state["sigma8_z"], len(self.param_indices[s][0])
                         ).reshape(len(self.param_indices[s][0]), -1),

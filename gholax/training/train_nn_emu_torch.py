@@ -636,6 +636,7 @@ def train_emulator():
     if Ftrain.ndim == 1:
         Ftrain = Ftrain[:, None]
     idx = np.isfinite(Ftrain).all(axis=1)
+    idx &= ((Ptrain[:,-3] + Ptrain[:,-2])<-0.34)
     Ftrain = Ftrain[idx]
     Ptrain = Ptrain[idx]
 
@@ -686,8 +687,8 @@ def train_emulator():
 
     if n_pcs is None:
         cumulative = np.cumsum(w) / np.sum(w)
-        n_pcs = int(np.searchsorted(cumulative, 0.9999) + 1)
-        print(f"Auto-selected n_pcs={n_pcs} (explained variance ratio >= 0.9999)")
+        n_pcs = int(np.searchsorted(cumulative, 0.999999) + 1)
+        print(f"Auto-selected n_pcs={n_pcs} (explained variance ratio >= 0.999999)")
 
     pc_train = np.dot(Ftrain, v)
 
@@ -699,7 +700,7 @@ def train_emulator():
     pc_val_targets = (np.dot(Fval, v[:, :n_pcs]) - pc_mean[:n_pcs]) / pc_sigmas[:n_pcs]
 
     # Weighted loss: inversely proportional to pc_sigmas so fractional accuracy is equalized
-    pc_w = 1.0 / pc_sigmas[:n_pcs]
+    pc_w = pc_sigmas[:n_pcs] ** 2
     pc_w = pc_w / pc_w.sum() * n_pcs
     pc_weights = torch.Tensor(pc_w)
 

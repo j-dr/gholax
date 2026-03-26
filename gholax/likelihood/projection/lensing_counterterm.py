@@ -79,9 +79,9 @@ class LensingCounterterm(LikelihoodModule):
         self.all_spectra = {}
         if not self.magnification_x_ia:
             required_components["c_dk"] = [
-                (("w_d_dk", "w_k"), ("p_gm",0), "zeff_w_d"),
+                (("w_d_dk", "w_k"), ("p_gm",0), "zeff_w_d_dk"),
                 (("w_mag_dk", "w_k"), ("p_mm",0), "z_limber"),
-                (("w_d_dk", "w_ia"), ("p_gi",0), "zeff_w_d"),
+                (("w_d_dk", "w_ia"), ("p_gi",0), "zeff_w_d_dk"),
             ]
 
         self.lensing_kernels = ["w_mag", "w_mag_dk", "w_mag_dcmbk", "w_k", "w_cmbk"]

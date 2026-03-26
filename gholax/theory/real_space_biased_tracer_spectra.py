@@ -561,7 +561,7 @@ class RealSpaceBiasExpansion(LikelihoodModule):
                     if (
                         i in self.dbins
                     ):  # self.observed_data_vector.spectrum_info[spec_type]["bins0"]:
-                        if (s == "p_gg") & self.spectrum_info["c_dd"]["use_cross"]:
+                        if (s == "p_gg") and self.spectrum_info["c_dd"]["use_cross"]:
                             for j in self.dbins:
                                 pars = [p.format(i=i) for p in self.spectrum_params[s]]
                                 pars.extend(

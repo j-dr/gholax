@@ -18,7 +18,10 @@ def load_training_data(key, dataset, downsample=None, spec_idx=None):
     print(key in keys)
     for i, k in enumerate(keys):
         rank = k.split('_')[-1]
-        d = dataset[k][:]
+        try:
+            d = dataset[k][:]
+        except:
+            print('error', k, flush=True)
         p = dataset['params_{}'.format(rank)][:]
         if i == 0:
             if spec_idx is not None:
