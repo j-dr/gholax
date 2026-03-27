@@ -467,7 +467,6 @@ class RedshiftSpaceMultipoles(DataVector):
         if len(cov_raw.shape)<2:
             cov_raw = cov_raw.reshape(
                 int(cov_raw.shape[0] ** 0.5), int(cov_raw.shape[0] ** 0.5)
-            )
 
         cov_slice = cov_raw[0, :]
         idxi = np.zeros(len(self.spectra), dtype=int)
