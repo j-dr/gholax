@@ -1,9 +1,10 @@
 #!/bin/bash
 module load python
-conda create --prefix /global/common/software/cosmosim/jaxeft --clone base
+#conda create --prefix /global/common/software/cosmosim/jaxeft --clone base
+conda create gholax --clone base
 mamba install pip
-#mamba create gholax --clone base
-mamba activate /global/common/software/cosmosim/jaxeft
+#mamba activate /global/common/software/cosmosim/jaxeft
+mamba activate gholax
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
 pip install --upgrade "jax[cuda12]==0.6.2"
 pip install blackjax
