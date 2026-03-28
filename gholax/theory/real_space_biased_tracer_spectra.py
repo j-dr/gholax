@@ -259,19 +259,15 @@ class RealSpaceBiasedTracerSpectra(LikelihoodModule):
 
         logk_emu = jnp.log10(self.emulator.pij_emus[0].k)
         if self.save_p_ij:
-            state["p_ij_real_space_bias_grid"] = jnp.zeros((n_spec, self.nk, self.nz))
-            for i in range(n_spec):
-                p = interp1d(
-                    self.logk,
-                    logk_emu,
-                    pk_ij[:, i, :],
-                    extrap=0,
-                    method=self.interpolation_order,
-                )
-
-                state["p_ij_real_space_bias_grid"] = (
-                    state["p_ij_real_space_bias_grid"].at[i, ...].set(p)
-                )
+            # interp1d handles trailing batch dims, so no per-spectrum loop needed
+            p_all = interp1d(
+                self.logk,
+                logk_emu,
+                pk_ij,  # (nk_emu, n_spec, nz)
+                extrap=0,
+                method=self.interpolation_order,
+            )  # (nk, n_spec, nz)
+            state["p_ij_real_space_bias_grid"] = p_all.transpose(1, 0, 2)
 
         if self.save_p_11_separately:
             state["p_11_real_space_bias_grid"] = interp1d(

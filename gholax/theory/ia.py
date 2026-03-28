@@ -80,27 +80,22 @@ class DensityShapeIA(LikelihoodModule):
         cparam_grid = build_equiv_cparam_grid_custom_order(
             params_values, self.z, state, self.input_param_order,
         )
-        n_spec = self.emulator.n_spec
 
         # assume same k values for density shape and shape shape.
         logk_emu = jnp.log10(self.emulator.k)
-        state["p_ij_real_space_density_shape_grid"] = jnp.zeros(
-            (n_spec, self.nk, self.nz)
-        )
 
-        pk_ij = self.emulator.predict(cparam_grid).T
+        pk_ij = self.emulator.predict(cparam_grid).T  # (nk_emu, n_spec, nz)
 
-        for i in range(n_spec):
-            p = interp1d(
-                self.logk,
-                logk_emu,
-                pk_ij[:, i, :],
-                extrap=0,
-                method=self.interpolation_order,
-            )
-            state["p_ij_real_space_density_shape_grid"] = (
-                state["p_ij_real_space_density_shape_grid"].at[i, ...].set(p)
-            )
+        # interp1d handles trailing batch dims, so no per-spectrum loop needed
+        p_all = interp1d(
+            self.logk,
+            logk_emu,
+            pk_ij,
+            extrap=0,
+            method=self.interpolation_order,
+        )  # (nk, n_spec, nz)
+
+        state["p_ij_real_space_density_shape_grid"] = p_all.transpose(1, 0, 2)
 
         return state
 
@@ -236,29 +231,28 @@ class ShapeShapeIA(LikelihoodModule):
         cparam_grid = build_equiv_cparam_grid_custom_order(
             params_values, self.z, state, self.input_param_order,
         )
-        n_spec = self.emulators[0].n_spec
 
         # assume same k values same for all m.
         logk_emu = jnp.log10(self.emulators[0].k)
-        state["p_mij_real_space_shape_shape_grid"] = jnp.zeros(
-            (3, n_spec, self.nk, self.nz)
+        result = jnp.zeros(
+            (3, self.emulators[0].n_spec, self.nk, self.nz)
         )
 
         for m in [0, 1, 2]:
-            pk_ij = self.emulators[m].predict(cparam_grid).T
+            pk_ij = self.emulators[m].predict(cparam_grid).T  # (nk_emu, n_spec, nz)
 
-            for i in range(n_spec):
-                p = interp1d(
-                    self.logk,
-                    logk_emu,
-                    pk_ij[:, i, :],
-                    extrap=0,
-                    method=self.interpolation_order,
-                )
+            # interp1d handles trailing batch dims, so no per-spectrum loop needed
+            p_all = interp1d(
+                self.logk,
+                logk_emu,
+                pk_ij,
+                extrap=0,
+                method=self.interpolation_order,
+            )  # (nk, n_spec, nz)
 
-                state["p_mij_real_space_shape_shape_grid"] = (
-                    state["p_mij_real_space_shape_shape_grid"].at[m, i, ...].set(p)
-                )
+            result = result.at[m, ...].set(p_all.transpose(1, 0, 2))
+
+        state["p_mij_real_space_shape_shape_grid"] = result
 
         return state
 

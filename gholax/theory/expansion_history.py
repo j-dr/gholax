@@ -51,7 +51,7 @@ def comoving_distance_integral(z_targets, n_int=4096,\
     return chi_targets, E_targets, chi_derivs
 
 
-def comoving_distance_integral_full(z_targets, E_z_func, n_int=4096):
+def comoving_distance_integral_full(z_targets, E_z_func, n_int=2048):
     """
     Compute chi(z) and E(z) for an arbitrary scalar E(z) callable.
 
@@ -203,9 +203,15 @@ class ExpansionHistory(LikelihoodModule):
 
         # chi_derivs: Taylor coefficients of chi(z) at z=0, expressed via dE/da|_{a=1}.
         # Convention matches comoving_distance_integral (lines ~38-46 above).
-        dEda    = jax.grad(E_a_full)(1.0)
-        d2Eda2  = jax.grad(jax.grad(E_a_full))(1.0)
-        d3Eda3  = jax.grad(jax.grad(jax.grad(E_a_full)))(1.0)
+        # Use forward-mode AD (jvp) instead of nested reverse-mode (grad) to avoid
+        # tracing E_a_full 6 times — forward-mode traces once per derivative order.
+        _, dEda = jax.jvp(E_a_full, (1.0,), (1.0,))
+        def _dE(a):
+            return jax.jvp(E_a_full, (a,), (1.0,))[1]
+        _, d2Eda2 = jax.jvp(_dE, (1.0,), (1.0,))
+        def _d2E(a):
+            return jax.jvp(_dE, (a,), (1.0,))[1]
+        _, d3Eda3 = jax.jvp(_d2E, (1.0,), (1.0,))
         dchidz  = 1.0
         d2chidz2 = dEda
         d3chidz3 = -2*dEda + 2*dEda**2 - d2Eda2

@@ -287,6 +287,20 @@ class MultiSpectrumEmulator(object):
         self.nk = self.sigmas.shape[0] // self.n_spec
         self.k = jnp.logspace(jnp.log10(kmin), jnp.log10(kmax), self.nk)
 
+        # Pre-stack hidden layer weights for scan-based forward pass
+        # (only if all middle hidden layers have the same shape)
+        mid_W = self.W[1:-1]
+        self._use_scan = (
+            self.n_layers > 2
+            and len(mid_W) > 0
+            and all(w.shape == mid_W[0].shape for w in mid_W)
+        )
+        if self._use_scan:
+            self._W_hidden = jnp.stack(mid_W)
+            self._b_hidden = jnp.stack(self.b[1:-1])
+            self._alphas_hidden = jnp.stack(self.alphas[1:])
+            self._betas_hidden = jnp.stack(self.betas[1:])
+
     def load_spec(self, filebase):
         """Load spectrum emulator weights from an HDF5 file.
 
@@ -336,14 +350,28 @@ class MultiSpectrumEmulator(object):
 
         x = (parameters - self.param_mean) / self.param_sigmas
 
-        for i in range(self.n_layers - 1):
-            # linear network operation
-            x = x @ self.W[i] + self.b[i]
+        if self._use_scan:
+            # First hidden layer
+            x = x @ self.W[0] + self.b[0]
+            x = activation(x, self.alphas[0], self.betas[0])
 
-            # non-linear activation function
-            x = activation(x, self.alphas[i], self.betas[i])
+            # Middle hidden layers via scan
+            def _mlp_step(x, wandb):
+                W_i, b_i, alpha_i, beta_i = wandb
+                x = x @ W_i + b_i
+                x = activation(x, alpha_i, beta_i)
+                return x, None
 
-        # linear output layer
+            x, _ = jax.lax.scan(
+                _mlp_step, x,
+                (self._W_hidden, self._b_hidden, self._alphas_hidden, self._betas_hidden),
+            )
+        else:
+            for i in range(self.n_layers - 1):
+                x = x @ self.W[i] + self.b[i]
+                x = activation(x, self.alphas[i], self.betas[i])
+
+        # Linear output layer
         x = ((x @ self.W[-1]) + self.b[-1]) * self.pc_sigmas[
             : self.n_components
         ] + self.pc_mean[: self.n_components]
@@ -431,6 +459,20 @@ class ScalarEmulator(object):
         self.n_components = self.W[-1].shape[-1]
         self.n_layers = len(self.W)
 
+        # Pre-stack hidden layer weights for scan-based forward pass
+        # (only if all middle hidden layers have the same shape)
+        mid_W = self.W[1:-1]
+        self._use_scan = (
+            self.n_layers > 2
+            and len(mid_W) > 0
+            and all(w.shape == mid_W[0].shape for w in mid_W)
+        )
+        if self._use_scan:
+            self._W_hidden = jnp.stack(mid_W)
+            self._b_hidden = jnp.stack(self.b[1:-1])
+            self._alphas_hidden = jnp.stack(self.alphas[1:])
+            self._betas_hidden = jnp.stack(self.betas[1:])
+
     def load(self, filebase, data_dir=None):
         """Load neural network weights from an HDF5 file.
 
@@ -493,12 +535,26 @@ class ScalarEmulator(object):
         """
         x = (parameters - self.param_mean) / self.param_sigmas
 
-        for i in range(self.n_layers - 1):
-            # linear network operation
-            x = x @ self.W[i] + self.b[i]
+        if self._use_scan:
+            # First hidden layer
+            x = x @ self.W[0] + self.b[0]
+            x = activation(x, self.alphas[0], self.betas[0])
 
-            # non-linear activation function
-            x = activation(x, self.alphas[i], self.betas[i])
+            # Middle hidden layers via scan
+            def _mlp_step(x, wandb):
+                W_i, b_i, alpha_i, beta_i = wandb
+                x = x @ W_i + b_i
+                x = activation(x, alpha_i, beta_i)
+                return x, None
+
+            x, _ = jax.lax.scan(
+                _mlp_step, x,
+                (self._W_hidden, self._b_hidden, self._alphas_hidden, self._betas_hidden),
+            )
+        else:
+            for i in range(self.n_layers - 1):
+                x = x @ self.W[i] + self.b[i]
+                x = activation(x, self.alphas[i], self.betas[i])
 
         # linear output layer
         x = ((x @ self.W[-1]) + self.b[-1]) * self.pc_sigmas + self.pc_mean
@@ -595,6 +651,31 @@ class PijEmulator(object):
         else:
             self.sigma8z_emu = ScalarEmulator(s8z_base, scale_As=scale_As)
 
+        # Pre-stack weights across all n_spec emulators for scan-based predict.
+        self._stacked_weights = self._stack_emulator_weights()
+
+    def _stack_emulator_weights(self):
+        """Stack weights from all individual emulators into arrays for scan."""
+        emus = self.pij_emus
+        nc = emus[0].n_components
+        return (
+            jnp.stack([e.param_mean for e in emus]),
+            jnp.stack([e.param_sigmas for e in emus]),
+            jnp.stack([e.W[0] for e in emus]),
+            jnp.stack([e.W[-1] for e in emus]),
+            jnp.stack([jnp.stack(e.W[1:-1]) for e in emus]),
+            jnp.stack([e.b[-1] for e in emus]),
+            jnp.stack([jnp.stack(e.b[:-1]) for e in emus]),
+            jnp.stack([jnp.stack(e.alphas) for e in emus]),
+            jnp.stack([jnp.stack(e.betas) for e in emus]),
+            jnp.stack([e.pc_sigmas[:nc] for e in emus]),
+            jnp.stack([e.pc_mean[:nc] for e in emus]),
+            jnp.stack([e.v[:, :nc] for e in emus]),
+            jnp.stack([e.sigmas for e in emus]),
+            jnp.stack([e.mean for e in emus]),
+            jnp.stack([e.fstd for e in emus]),
+        )
+
     def predict(self, parameters):
         """Predict all P_ij components for the given parameters.
 
@@ -608,15 +689,13 @@ class PijEmulator(object):
             s8z = self.sigma8z_emu.predict(parameters)[:, 0]
             parameters = parameters.at[:, -1].set(s8z)
 
-        npred = len(parameters)
+        def scan_fn(carry, xs_i):
+            _, pred = predict_scan(parameters, xs_i)
+            return carry, pred
 
-        pij = jnp.zeros((npred, self.n_spec, len(self.pij_emus[0].k)))
-
-        for i in range(self.n_spec):
-            pij_temp = self.pij_emus[i].predict(parameters)
-            pij = pij.at[:, i, :].set(pij_temp)
-
-        return pij
+        _, pij = jax.lax.scan(scan_fn, None, self._stacked_weights)
+        # pij shape: (n_spec, n_samples, nk)
+        return pij.transpose(1, 0, 2)
 
 
 def predict_scan(parameters, xs):

@@ -134,6 +134,32 @@ class LensingCounterterm(LikelihoodModule):
         for o in self.output_requirements:
             self.output_requirements[o] = list(np.unique(self.output_requirements[o]))
 
+        # Precompute constants used in sigma_N_o to avoid recomputing inside JIT trace.
+        if self.lensing_counterterm_order > 0:
+            from scipy.special import comb as scipy_comb
+
+            ct_order = self.lensing_counterterm_order
+            max_points = ct_order + 1
+
+            import math
+            self._ct_factorials = jnp.array(
+                [float(math.factorial(o)) for o in range(ct_order)]
+            )
+
+            fd_coeffs = np.zeros((ct_order, max_points))
+            for o in range(ct_order):
+                for i in range(min(o + 1, max_points)):
+                    if o == 0:
+                        fd_coeffs[0, 0] = 1.0
+                    else:
+                        fd_coeffs[o, i] = (-1) ** (o - i) * scipy_comb(o, i, exact=True)
+            self._ct_fd_coeffs = jnp.array(fd_coeffs)
+
+            self._ct_N_all = jnp.arange(2, 2 + ct_order)
+            self._ct_dz = 0.01
+            self._ct_eps = 0.001
+            self._ct_z_all = self._ct_eps + jnp.arange(max_points) * self._ct_dz
+
     def sigma_N_o(self, state, lk):
         """Compute sigma_N_o integrals from the matter power spectrum above k_cutoff."""
         k = 10**lk
@@ -142,11 +168,8 @@ class LensingCounterterm(LikelihoodModule):
         else:
             mask = (self.k_cutoff < k) * (k <= self.kmax_emu)
 
-        dz = 0.01
-        eps = 0.001
+        dz = self._ct_dz
         D_grid = state["sigma8_z"] / state["sigma8_z"][0]
-    
-
 
         if self.mean_model == "dmo":
             p_mm = state["p_11_real_space_bias_grid"]
@@ -158,10 +181,10 @@ class LensingCounterterm(LikelihoodModule):
 
         def compute_pk(z):
             D_z = interp1d(z, self.z_pk, D_grid, extrap=0)
-            
+
             if self.non_parametric_growth:
                 D_z = D_z * jnp.interp(z, state['z_limber'], state['A_growth_chi'])
-                
+
             return (
                 jnp.exp(
                     interp2d(
@@ -176,29 +199,16 @@ class LensingCounterterm(LikelihoodModule):
                 * D_z**2
             )
 
+        # vmap over z values instead of tracing compute_pk separately per z
+        pk_all = vmap(compute_pk)(self._ct_z_all)
+
+        # Use precomputed constants
+        fd_coeffs = self._ct_fd_coeffs
+        factorials = self._ct_factorials
+        N_all = self._ct_N_all
         max_points = self.lensing_counterterm_order + 1
-        z_all = eps + jnp.arange(max_points) * dz
-        pk_all = jnp.stack([compute_pk(z) for z in z_all])
+        k_powers_all = k[jnp.newaxis, :] ** (-N_all[:, jnp.newaxis])
 
-        factorials = jnp.array(
-            [factorial(o) for o in range(self.lensing_counterterm_order)]
-        )
-
-        from scipy.special import comb
-
-        fd_coeffs = jnp.zeros((self.lensing_counterterm_order, max_points))
-        for o in range(self.lensing_counterterm_order):
-            for i in range(min(o + 1, max_points)):
-                if o == 0:
-                    fd_coeffs = fd_coeffs.at[0, 0].set(1.0)
-                else:
-                    fd_coeffs = fd_coeffs.at[o, i].set(
-                        (-1) ** (o - i) * comb(o, i, exact=True)
-                    )
-
-        N_all = jnp.arange(2, 2 + self.lensing_counterterm_order)
-        k_powers_all = jnp.array([k ** (-N) for N in N_all])
-        
         if self.integration_method == "trapezoid":
             vint = vmap(lambda integrand: trapezoid(integrand, x=k))
         else:

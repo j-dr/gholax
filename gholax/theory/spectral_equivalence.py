@@ -22,8 +22,8 @@ class SpectralEquivalence(LikelihoodModule):
     Reference: arXiv:2510.09503
     """
 
-    def __init__(self, z, z_lss=1089.0, n_newton=15, n_int_chi=4096,
-                 n_gl_chi=64, sigma8_emulator_file_name=None, **config):
+    def __init__(self, z, z_lss=1089.0, n_newton=5, n_int_chi=2048,
+                 n_gl_chi=32, sigma8_emulator_file_name=None, **config):
         self.z = jnp.array(z)
         self.nz = len(z)
         self.z_lss = z_lss

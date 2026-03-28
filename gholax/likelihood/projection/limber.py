@@ -1,6 +1,7 @@
+import jax
 import jax.numpy as jnp
 import numpy as np
-from interpax import interp2d
+from interpax import interp1d, interp2d
 from jax.lax import scan
 from jax.scipy.integrate import trapezoid
 from ...theory.spline import spline_func_vec
@@ -159,26 +160,45 @@ class Limber(LikelihoodModule):
         chi_z_proj = state["chi_z_limber"]
         k = (self.ell[:, np.newaxis] + 0.5) / chi_z_proj[None, :]
         log_kval = jnp.log10((k))
-        
+
+        # Helper for factored k-interpolation: vmap interp1d over z_proj columns
+        logk_grid = self.logk
+        interp_method = self.interpolation_order
+
+        def _interp_k_column(kq, fq):
+            return interp1d(kq, logk_grid, fq, extrap=0.0, method=interp_method)
+
+        _interp_k_all_columns = jax.vmap(
+            _interp_k_column, in_axes=(1, 1), out_axes=1
+        )
+
+        nz_proj = self.nz_proj
+
         def compute_component_c_l_chi(carry, x):
             w_i, w_j, s, zfield = x
 
-            p_ij = interp2d(
-                log_kval.reshape(-1),
-                zfield.reshape(-1),
-                self.logk,
-                self.z_pk,
-                s,
-                extrap=0.0,
-                method=self.interpolation_order,
-            ).reshape(self.n_ell, self.nz_proj)
+            # Factor 2D interpolation into two 1D steps:
+            # Step 1: interpolate s(k, z_pk) along z at the projection redshifts.
+            # zfield is either (n_ell, nz_proj) or scalar (zeff per bin pair).
+            if zfield.ndim >= 2:
+                z_query = zfield[0, :]  # (nz_proj,) — constant across ells
+            else:
+                z_query = jnp.broadcast_to(zfield.reshape(1), (nz_proj,))
+
+            s_at_zproj = interp1d(
+                z_query, self.z_pk, s.T, extrap=0.0, method=interp_method,
+            ).T  # (nk, nz_proj)
+
+            # Step 2: for each z_proj column, interpolate in k at k=(ell+0.5)/chi.
+            # log_kval[:, j] differs per column; vmap over the nz_proj axis.
+            p_ij = _interp_k_all_columns(log_kval, s_at_zproj)  # (n_ell, nz_proj)
 
             if self.k_cutoff is not None:
                 mask = k < self.k_cutoff
             else:
                 mask = jnp.ones_like(k)
 
-            c_l_chi = w_i * w_j * p_ij / state["chi_z_limber"][None, :] ** 2 * mask     
+            c_l_chi = w_i * w_j * p_ij / state["chi_z_limber"][None, :] ** 2 * mask
             if self.non_parametric_growth:
                 A_growth_chi = state['A_growth_chi']
                 c_l_chi = c_l_chi * (A_growth_chi[None, :] ** 2)

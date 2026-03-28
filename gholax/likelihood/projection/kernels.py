@@ -158,25 +158,27 @@ class ProjectionKernels(LikelihoodModule):
 
     def compute_w_k(self, e_z, chi_z, omega_m, nz, smags, z, chi_star):
         """Compute the lensing convergence kernel W_kappa(chi)."""
-        w_k = jnp.zeros_like(nz)
-        cmax = jnp.max(chi_z) * 1.1  # what is the point of the * 1.1
+        nchi = chi_z.shape[0]
+        cmax = jnp.max(chi_z) * 1.1
 
-        def zupper(carry, x):
-            return carry, jnp.linspace(x, cmax, chi_z.shape[0])
+        # Build integration grid via broadcasting instead of scan-of-linspace
+        t = jnp.linspace(0.0, 1.0, nchi)
+        chivalp = (chi_z[:, None] + (cmax - chi_z[:, None]) * t[None, :]).T
 
-        _, chivalp = jax.lax.scan(zupper, None, chi_z)
-        chivalp = chivalp.T
         zvalp = interp1d(
             chivalp.reshape(-1), chi_z, z, extrap=True, method="linear"
         ).reshape(chivalp.shape)
 
+        # Precompute E(z) on the integration grid outside the source-bin scan
+        Ez = interp1d(
+            zvalp.reshape(-1), z, e_z, extrap=True, method="linear"
+        ).reshape(zvalp.shape)
+
+        g_geom = (chivalp - chi_z[None, :]) / chivalp
+
         def f(carry, nz_i):
             dndz_n = jnp.interp(zvalp, z, nz_i, left=0, right=0)
-            Ez = interp1d(
-                zvalp.reshape(-1), z, e_z, extrap=True, method="linear"
-            ).reshape(zvalp.shape)
-            g = (chivalp - chi_z[None, :]) / chivalp
-            g = g * dndz_n * Ez / 2997.925
+            g = g_geom * dndz_n * Ez / 2997.925
             g = chi_z * trapezoid(g, x=chivalp, axis=0)
             w_k = 1.5 * omega_m / 2997.925**2 * (1 + z) * g
             return carry, w_k

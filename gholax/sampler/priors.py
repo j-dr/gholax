@@ -86,6 +86,29 @@ class Prior(object):
         self.get_prior_sigmas()
         self.get_reference_values()
 
+        # Precompute vectorized prior arrays to avoid per-parameter loop in log_prior.
+        uniform_params, normal_params = [], []
+        uniform_mins, uniform_maxs = [], []
+        normal_locs, normal_scales = [], []
+        for p in self.params:
+            if p in self.joint_prior_params:
+                continue
+            pi = self.prior_info[p]
+            if pi["dist"] == "uniform":
+                uniform_params.append(p)
+                uniform_mins.append(pi["min"])
+                uniform_maxs.append(pi["max"])
+            elif pi["dist"] == "norm":
+                normal_params.append(p)
+                normal_locs.append(pi["loc"])
+                normal_scales.append(pi["scale"])
+        self._uniform_params = uniform_params
+        self._normal_params = normal_params
+        self._uniform_mins = jnp.array(uniform_mins) if uniform_mins else None
+        self._uniform_maxs = jnp.array(uniform_maxs) if uniform_maxs else None
+        self._normal_locs = jnp.array(normal_locs) if normal_locs else None
+        self._normal_scales = jnp.array(normal_scales) if normal_scales else None
+
     def uniform(self, x, x_l, x_r, L=10):
         """Compute log-probability of a smooth uniform prior using error functions."""
         delta = (x_r - x_l)
@@ -97,19 +120,17 @@ class Prior(object):
 
     def log_prior(self, params_values):
         """Compute the total log-prior for all parameters."""
-        logp = 0
-        for p in params_values:
-            if p in self.joint_prior_params:
-                continue  # handled by joint prior below
-            pi = self.prior_info[p]
-            if pi["dist"] == "uniform":
-                logp += self.uniform(params_values[p], pi["min"], pi["max"])
-            elif pi["dist"] == "norm":
-                logp += self.normal(params_values[p], pi["loc"], pi["scale"])
-            else:
-                raise (
-                    NotImplementedError(f"Prior form {pi['dist']} is not implemented.")
-                )
+        logp = 0.0
+
+        # Vectorized uniform priors
+        if self._uniform_mins is not None:
+            x_u = jnp.stack([params_values[p] for p in self._uniform_params])
+            logp += jnp.sum(self.uniform(x_u, self._uniform_mins, self._uniform_maxs))
+
+        # Vectorized normal priors
+        if self._normal_locs is not None:
+            x_n = jnp.stack([params_values[p] for p in self._normal_params])
+            logp += jnp.sum(self.normal(x_n, self._normal_locs, self._normal_scales))
 
         for group in self.joint_prior_groups.values():
             residual = jnp.stack(
