@@ -8,6 +8,7 @@ import blackjax.mcmc.integrators
 import blackjax.mcmc.mclmc
 import jax
 import jax.numpy as jnp
+import jaxopt
 import numpy as np
 from blackjax.diagnostics import potential_scale_reduction
 
@@ -36,6 +37,7 @@ class MCLMC(object):
         self.diagonal_preconditioning = c.get("diagonal_preconditioning", True)
         self.random_start = c.get("random_start", True)
         self.restart = c.get("restart", False)
+        self.minimize_and_sample = c.get("minimize_and_sample", True)
 
         # Adaptation tuning fractions
         self.frac_tune1 = c.get("frac_tune1", 0.1)
@@ -116,6 +118,36 @@ class MCLMC(object):
             kernel = sampler.step
 
         else:
+            if self.minimize_and_sample:
+                jnlp = jax.jit(lambda p: -log_posterior(p))
+                vgrad = jax.value_and_grad(jnlp)
+                solver = jaxopt.LBFGS(fun=vgrad, value_and_grad=True)
+
+                minimize_pmap = jax.pmap(solver.run, in_axes=(0))
+                print("Running minimization before sampling", flush=True)
+                res = minimize_pmap(initial_positions)
+                initial_positions = res.params
+                with open(
+                    f"{output_file}.minimization_results.json", "w"
+                ) as fp:
+                    json.dump(
+                        {
+                            "x_opt": initial_positions.tolist(),
+                            "value": res.state.value.tolist(),
+                        },
+                        fp,
+                    )
+
+                chi2_ratio = res.state.value / np.min(res.state.value)
+                initial_positions_min = jnp.tile(
+                    initial_positions[jnp.argmin(res.state.value)], n_devices
+                ).reshape(n_devices, -1)
+                initial_positions = jnp.where(
+                    (chi2_ratio[:, None] - 1) > 0,
+                    initial_positions_min,
+                    initial_positions,
+                )
+
             print(
                 f"Running MCLMC adaptation "
                 f"({'adjusted' if self.adjusted else 'unadjusted'}, "
