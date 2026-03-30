@@ -106,7 +106,7 @@ class ProjectionKernels(LikelihoodModule):
                             if (
                                 i
                                 in self.observed_data_vector.spectrum_info[
-                                    self.mag_spec[0]
+                                    'c_dk'
                                 ]["bins0"]
                             ):
                                 self.indexed_params[k].append(f"smag_{mi}")
@@ -116,7 +116,7 @@ class ProjectionKernels(LikelihoodModule):
                         if (
                             i
                             in self.observed_data_vector.spectrum_info[
-                                self.mag_spec[0]
+                                'c_dd'
                             ]["bins0"]
                         ):
                             self.indexed_params[k].append(f"smag_{mi}")
