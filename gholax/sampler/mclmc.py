@@ -10,6 +10,7 @@ import jax
 import jax.numpy as jnp
 import jaxopt
 import numpy as np
+from blackjax.adaptation.mclmc_adaptation import MCLMCAdaptationState
 from blackjax.diagnostics import potential_scale_reduction
 
 
@@ -38,6 +39,7 @@ class MCLMC(object):
         self.random_start = c.get("random_start", True)
         self.restart = c.get("restart", False)
         self.minimize_and_sample = c.get("minimize_and_sample", True)
+        self.step_size_init = c.get("step_size_init", 0.01)
 
         # Adaptation tuning fractions
         self.frac_tune1 = c.get("frac_tune1", 0.1)
@@ -169,13 +171,20 @@ class MCLMC(object):
                     rng_key=init_key,
                 )
 
+            dim = initial_positions.shape[1]
+            initial_params = MCLMCAdaptationState(
+                L=jnp.sqrt(dim),
+                step_size=self.step_size_init,
+                inverse_mass_matrix=jnp.ones((dim,)),
+            )
+
             if self.adjusted:
                 state, params = self._adapt_adjusted(
-                    jlp, initial_state, tune_key
+                    jlp, initial_state, tune_key, initial_params
                 )
             else:
                 state, params = self._adapt_unadjusted(
-                    jlp, initial_state, tune_key
+                    jlp, initial_state, tune_key, initial_params
                 )
 
             L = params.L
@@ -311,7 +320,7 @@ class MCLMC(object):
                 inverse_mass_matrix=inverse_mass_matrix,
             )
 
-    def _adapt_unadjusted(self, jlp, initial_state, rng_key):
+    def _adapt_unadjusted(self, jlp, initial_state, rng_key, initial_params):
         """Run unadjusted MCLMC adaptation."""
         kernel = lambda inverse_mass_matrix: blackjax.mcmc.mclmc.build_kernel(
             logdensity_fn=jlp,
@@ -328,11 +337,12 @@ class MCLMC(object):
             frac_tune2=self.frac_tune2,
             frac_tune3=self.frac_tune3,
             diagonal_preconditioning=self.diagonal_preconditioning,
+            params=initial_params,
         )
 
         return state, params
 
-    def _adapt_adjusted(self, jlp, initial_state, rng_key):
+    def _adapt_adjusted(self, jlp, initial_state, rng_key, initial_params):
         """Run adjusted MCLMC adaptation."""
 
         def kernel(
@@ -361,6 +371,7 @@ class MCLMC(object):
             frac_tune2=self.frac_tune2,
             frac_tune3=self.frac_tune3,
             diagonal_preconditioning=self.diagonal_preconditioning,
+            params=initial_params,
         )
 
         return state, params
