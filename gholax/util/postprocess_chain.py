@@ -129,6 +129,7 @@ def load_model_samples(config_file, compute_sigma8=False, burn_in_frac=0,
 
         x_bf = np.array(opt['x_opt'][0]) * sigmas + reference
         best_fit = dict(zip(names, x_bf))
+        best_fit['logposterior'] = opt['value'][0]
 
         if compute_sigma8 and s8_emu is not None:
             x = _build_emu_input(x_bf[None, :], names, cosmo_params, like)
