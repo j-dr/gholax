@@ -45,8 +45,8 @@ class SpectralEquivalence(LikelihoodModule):
             self.sigma8_emu = ScalarEmulator(sigma8_emulator_file_name)
 
         # ODE grid for growth factor
-        self.n_a_ode = 30
-        self.a_init_ode = 1.0 / (1.0 + 50.0)
+        self.n_a_ode = 100
+        self.a_init_ode = 1.0 / (1.0 + 200.0)
 
         self.output_requirements = {
             "w_equiv_z": ["As", "ns", "H0", "w", "wa", "ombh2", "omch2", "mnu"],

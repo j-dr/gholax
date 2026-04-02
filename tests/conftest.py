@@ -68,6 +68,11 @@ W0WA_COSMO_PARAMS = {
         "H0": 67.5, "ombh2": 0.022, "omch2": 0.12, "mnu": 0.06,
         "As": 2.1, "ns": 0.965, "w": -0.8, "wa": -0.8,
     },
+    # DESI DR2 BAO + CMB best fit (Table V of arXiv:2503.14738)
+    "desi_dr2_bao_cmb": {
+        "H0": 67.5, "ombh2": 0.02224, "omch2": 0.1177, "mnu": 0.06,
+        "As": 2.1, "ns": 0.9649, "w": -0.42, "wa": -1.75,
+    },
 }
 
 
