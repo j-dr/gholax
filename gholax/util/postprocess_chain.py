@@ -1,8 +1,88 @@
+import os
 import numpy as np
 from getdist import MCSamples
 import h5py as h5
 import json
+import yaml
 import jax.numpy as jnp
+
+from gholax.util.model import Model
+from gholax.theory.linear_growth import LinearGrowth
+
+
+def load_model_samples(config_file, compute_sigma8=False):
+    """Load model, checkpointed samples, and best-fit values from a config file.
+
+    Args:
+        config_file: Path to the YAML config file.
+        compute_sigma8: If True, compute sigma8, omegam, and S8 for the
+            best-fit point using the LinearGrowth emulator found in the
+            likelihood pipeline.
+
+    Returns:
+        Tuple of (model, samples, best_fit) where:
+            model: Instantiated Model object.
+            samples: NumPy array of chain samples, or None if no checkpoint exists.
+            best_fit: Dict mapping parameter names to best-fit values, or None
+                if no minimization results exist.
+    """
+    with open(config_file, 'r') as fp:
+        cfg = yaml.load(fp, Loader=yaml.SafeLoader)
+
+    output_file = cfg['output_file']
+    sampler = list(cfg['sampler'].keys())[0]
+    likelihood_name = [k for k in cfg['likelihood'] if k != 'params'][0]
+
+    model = Model(config_file)
+
+    # Load samples
+    samples = None
+    if sampler in ('NUTS', 'MetropolisHastings'):
+        samples_path = f'{output_file}.samples_chk.npy'
+        if os.path.exists(samples_path):
+            samples = np.load(samples_path)
+    elif sampler == 'emcee':
+        samples_path = f'{output_file}.0.samples.h5'
+        if os.path.exists(samples_path):
+            with h5.File(samples_path, 'r') as f:
+                samples = f['mcmc/chain'][:]
+
+    # Load best fit
+    best_fit = None
+    minimization_path = f'{output_file}.minimization_results.json'
+    if os.path.exists(minimization_path):
+        with open(minimization_path, 'r') as fp:
+            opt = json.load(fp)
+
+        sigmas = model.prior.get_prior_sigmas()
+        reference = jnp.array(list(model.prior.get_reference_point().values()))
+        names = model.param_names
+
+        x_bf = np.array(opt['x_opt'][0]) * sigmas + reference
+        best_fit = dict(zip(names, x_bf))
+
+        if compute_sigma8:
+            like = model.likelihoods[likelihood_name]
+            s8_emu = None
+            for module in like.likelihood_pipeline:
+                if isinstance(module, LinearGrowth):
+                    s8_emu = module.emulator
+                    break
+
+            if s8_emu is not None:
+                ipo = getattr(s8_emu, 'input_param_order',
+                              ['As', 'ns', 'H0', 'w', 'ombh2', 'omch2', 'logmnu', 'z'])
+                cosmo_params = [p for p in ipo if p != 'z']
+                x = _build_emu_input(x_bf[None, :], names, cosmo_params, like)
+                sigma8_val = float(s8_emu.predict(x)[0, 0])
+                omegam_val = float((best_fit['omch2'] + best_fit['ombh2'])
+                                   / (best_fit['H0'] / 100) ** 2)
+                best_fit['sigma8'] = sigma8_val
+                best_fit['omegam'] = omegam_val
+                best_fit['s8'] = sigma8_val * np.sqrt(omegam_val / 0.3)
+
+    return model, samples, best_fit
+
 
 def _build_emu_input(samples_i, names, cosmo_params, like):
     """Build emulator input array from chain samples using the emulator's parameter order.
