@@ -55,7 +55,7 @@ class NUTS(object):
         self.adaptive_warmup_rtol_step = c.get("adaptive_warmup_rtol_step", 0.05)
 
         # MEADS parameters
-        self.meads_warmup_steps = c.get("meads_warmup_steps", 500)
+        self.meads_warmup_steps = c.get("meads_warmup_steps", 150)
         self.meads_step_size_tuning_steps = c.get("meads_step_size_tuning_steps", 100)
 
     def _adaptive_window_warmup(self, jlp, rng_key, initial_position):
@@ -134,9 +134,23 @@ class NUTS(object):
 
         meads = blackjax.meads_adaptation(jlp, num_chains=n_chains)
         rng_key, meads_key = jax.random.split(rng_key)
-        (meads_states, meads_params), _ = meads.run(
+        (meads_states, meads_params), meads_info = meads.run(
             meads_key, initial_positions, self.meads_warmup_steps
         )
+
+        # Log convergence of the mass matrix estimate
+        position_sigmas = meads_info.adaptation_state.position_sigma
+        for i in range(1, self.meads_warmup_steps):
+            prev = position_sigmas[i - 1]
+            curr = position_sigmas[i]
+            rel_change = float(
+                jnp.max(jnp.abs(curr - prev) / (jnp.abs(prev) + 1e-10))
+            )
+            print(
+                f"  MEADS step {i}: max rel change in position_sigma = "
+                f"{rel_change:.6f}",
+                flush=True,
+            )
 
         # Use MEADS position_sigma^2 as diagonal inverse mass matrix
         position_sigma = meads_params["momentum_inverse_scale"]
