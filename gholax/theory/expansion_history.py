@@ -51,7 +51,7 @@ def comoving_distance_integral(z_targets, n_int=4096,\
     return chi_targets, E_targets, chi_derivs
 
 
-def comoving_distance_integral_full(z_targets, E_z_func, n_int=4096):
+def comoving_distance_integral_full(z_targets, E_z_func, n_int=2048):
     """
     Compute chi(z) and E(z) for an arbitrary scalar E(z) callable.
 
@@ -100,36 +100,27 @@ class ExpansionHistory(LikelihoodModule):
 
         self.output_requirements = {}
         if self.use_emulator:
-            self.output_requirements["chi_z"] = [
-                "As",
-                "ns",
-                "H0",
-                "w",
-                "ombh2",
-                "omch2",
-                "mnu",
-            ]
-            self.output_requirements["e_z"] = [
-                "As",
-                "ns",
-                "H0",
-                "w",
-                "ombh2",
-                "omch2",
-                "mnu",
-            ]
             self.emulator_file_names = config["emulator_file_names"]
             self.emulators = {}
             self.emulators["chi_z"] = ScalarEmulator(self.emulator_file_names["chi_z"])
             self.emulators["e_z"] = ScalarEmulator(self.emulator_file_names["e_z"])
+
+            # Detect if emulators accept wa
+            ipo = getattr(self.emulators["chi_z"], 'input_param_order', None)
+            self.emulator_input_param_order = ipo
+            params = ["As", "ns", "H0", "w", "ombh2", "omch2", "mnu"]
+            if ipo is not None and "wa" in ipo:
+                params.append("wa")
+            self.output_requirements["chi_z"] = list(params)
+            self.output_requirements["e_z"] = list(params)
 
         elif self.use_boltzmann:
             self.output_requirements["chi_z"] = ["boltzmann_results"]
             self.output_requirements["e_z"] = ["boltzmann_results"]
             self.output_requirements["omegam"] = ["boltzmann_results"]
         else:
-            self.output_requirements["chi_z"] = ["omch2", "ombh2", "H0", "mnu", "w"]
-            self.output_requirements["e_z"] = ["omch2", "ombh2", "H0", "mnu", "w"]
+            self.output_requirements["chi_z"] = ["omch2", "ombh2", "H0", "mnu", "w", "wa"]
+            self.output_requirements["e_z"] = ["omch2", "ombh2", "H0", "mnu", "w", "wa"]
             self.output_requirements["omegam"] = ["omch2", "ombh2", "H0", "mnu"]
 
     def T_AK(self, x):
@@ -172,6 +163,7 @@ class ExpansionHistory(LikelihoodModule):
     def compute_analytic(self, params_values):
         h = params_values['H0'] / 100.0
         w0 = params_values["w"]
+        wa = params_values.get("wa", 0.0)
         n_species = 3  # three degenerate massive neutrino species
         mnu_per_species = params_values["mnu"] / n_species
 
@@ -200,7 +192,7 @@ class ExpansionHistory(LikelihoodModule):
             y = mnu_per_species * a / _T_NU0_EV
             F_y = neutrino_density_ratio(y, gl_nodes, gl_weights)
             Omega_nu_a = n_species * (_OMEGA_NU_REL_H2_PER_SPECIES / h**2) * F_y / a**4
-            Omega_de = Omega_Lambda * dark_energy_density(a, w0, 0.0)
+            Omega_de = Omega_Lambda * dark_energy_density(a, w0, wa)
             return jnp.sqrt(Omega_r_photon / a**4 + Omega_cb / a**3 + Omega_nu_a + Omega_de)
 
         def E_z_full(z):
@@ -211,9 +203,15 @@ class ExpansionHistory(LikelihoodModule):
 
         # chi_derivs: Taylor coefficients of chi(z) at z=0, expressed via dE/da|_{a=1}.
         # Convention matches comoving_distance_integral (lines ~38-46 above).
-        dEda    = jax.grad(E_a_full)(1.0)
-        d2Eda2  = jax.grad(jax.grad(E_a_full))(1.0)
-        d3Eda3  = jax.grad(jax.grad(jax.grad(E_a_full)))(1.0)
+        # Use forward-mode AD (jvp) instead of nested reverse-mode (grad) to avoid
+        # tracing E_a_full 6 times — forward-mode traces once per derivative order.
+        _, dEda = jax.jvp(E_a_full, (1.0,), (1.0,))
+        def _dE(a):
+            return jax.jvp(E_a_full, (a,), (1.0,))[1]
+        _, d2Eda2 = jax.jvp(_dE, (1.0,), (1.0,))
+        def _d2E(a):
+            return jax.jvp(_dE, (a,), (1.0,))[1]
+        _, d3Eda3 = jax.jvp(_d2E, (1.0,), (1.0,))
         dchidz  = 1.0
         d2chidz2 = dEda
         d3chidz3 = -2*dEda + 2*dEda**2 - d2Eda2
@@ -222,22 +220,14 @@ class ExpansionHistory(LikelihoodModule):
 
         return chi_z, e_z, Omega_m, chi_derivs
     
-    def compute_emulator(self, params_values):
-        cosmo_params = jnp.array(
-            [
-                params_values["As"] * 10**9,
-                params_values["ns"],
-                params_values["H0"],
-                params_values["w"],
-                params_values["ombh2"],
-                params_values["omch2"],
-                jnp.log10(params_values["mnu"]),
-            ]
+    def compute_emulator(self, params_values, state=None):
+        from .spectral_equivalence import build_equiv_cparam_grid
+        if state is None:
+            state = {}
+        cparam_grid = build_equiv_cparam_grid(
+            params_values, self.z, state, scale_As=1e9,
+            input_param_order=self.emulator_input_param_order,
         )
-
-        cparam_grid = jnp.zeros((self.nz, len(cosmo_params) + 1))
-        cparam_grid = cparam_grid.at[:, :-1].set(cosmo_params)
-        cparam_grid = cparam_grid.at[:, -1].set(self.z)
 
         chi_z = self.emulators["chi_z"].predict(cparam_grid)
         e_z = self.emulators["e_z"].predict(cparam_grid)
@@ -260,7 +250,7 @@ class ExpansionHistory(LikelihoodModule):
             state['chi_derivs'] = chi_derivs
         
         elif self.use_emulator:
-            chi_z, e_z = self.compute_emulator(params_values)
+            chi_z, e_z = self.compute_emulator(params_values, state)
             omega_nu = params_values["mnu"] / 93.14
             h = params_values["H0"] / 100
             state["omegam"] = (

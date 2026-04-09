@@ -1,0 +1,3 @@
+filebase: aemulus_nu_tier1_cosmo_only_heft_sigma8z_emu
+scale_As: true
+param_order: ["As", "ns", "H0", "w", "ombh2", "omch2", "logmnu", "z"]

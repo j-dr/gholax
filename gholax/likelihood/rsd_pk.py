@@ -3,6 +3,7 @@ from ..theory.expansion_history import ExpansionHistory
 from ..theory.linear_growth_rate import LinearGrowthRate
 from ..theory.linear_growth import LinearGrowth
 from ..theory.linear_power_spectrum import LinearPowerSpectrum
+from ..theory.spectral_equivalence import SpectralEquivalence
 from ..theory.redshift_space_biased_tracer_spectra import (
     RedshiftSpaceBiasedTracerSpectra,
     RedshiftSpaceBiasExpansion,
@@ -37,6 +38,7 @@ class RSDPK(GaussianLikelihood):
         self.kmax = c.get("kmax", 0.6 + 1e-3)
         self.nk = c.get("nk", 200)
         self.use_boltzmann = c.get("use_boltzmann", False)
+        lens_bin_mapping = c.get("lens_bin_mapping", {})
 
         self.observed_data_vector = RedshiftSpaceMultipoles(
             zmin=self.zmin_proj,
@@ -62,6 +64,16 @@ class RSDPK(GaussianLikelihood):
         else:
             self.likelihood_pipeline = []
 
+        spectral_equiv_modules = []
+        if "SpectralEquivalence" in config_theory:
+            z_pk = jnp.linspace(self.zmin_pk, self.zmax_pk, self.nz_pk)
+            spectral_equiv_modules.append(
+                SpectralEquivalence(
+                    z=z_pk,
+                    **config_theory["SpectralEquivalence"],
+                )
+            )
+
         self.likelihood_pipeline.extend(
             [
                 ExpansionHistory(
@@ -70,6 +82,7 @@ class RSDPK(GaussianLikelihood):
                     nz=self.nz_proj,
                     **config_theory.get("ExpansionHistory", {}),
                 ),
+                *spectral_equiv_modules,
                 LinearGrowthRate(
                     zmin=self.zmin_pk,
                     zmax=self.zmax_pk,
@@ -102,6 +115,7 @@ class RSDPK(GaussianLikelihood):
                     kmin=self.kmin,
                     kmax=self.kmax,
                     nk=self.nk,
+                    lens_bin_mapping=lens_bin_mapping,
                     **config_theory.get("RedshiftSpaceBiasExpansion", {}),
                 ),
                 RedshiftSpaceMultipolePowerSpectrumWindow(

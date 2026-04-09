@@ -65,24 +65,14 @@ class RealSpaceBiasedTracerSpectra(LikelihoodModule):
         if self.use_emulator:
             self.emulator_file_names = config["emulator_file_names"]
             self.emulator = PijEmulator(self.emulator_file_names)
-            self.output_requirements["p_ij_real_space_bias_grid"] = [
-                "As",
-                "ns",
-                "H0",
-                "w",
-                "ombh2",
-                "omch2",
-                "mnu",
-            ]
-            self.output_requirements["p_11_real_space_bias_grid"] = [
-                "As",
-                "ns",
-                "H0",
-                "w",
-                "ombh2",
-                "omch2",
-                "mnu",
-            ]
+            self.emulator_input_param_order = getattr(
+                self.emulator, 'input_param_order', None
+            )
+            params = ["As", "ns", "H0", "w", "ombh2", "omch2", "mnu"]
+            if self.emulator_input_param_order and "wa" in self.emulator_input_param_order:
+                params.append("wa")
+            self.output_requirements["p_ij_real_space_bias_grid"] = list(params)
+            self.output_requirements["p_11_real_space_bias_grid"] = list(params)
 
         else:
             self.output_requirements["p_ij_real_space_bias_grid"] = [
@@ -256,39 +246,28 @@ class RealSpaceBiasedTracerSpectra(LikelihoodModule):
 
     def compute_emulator(self, state, params_values):
         """Compute P_ij basis spectra using the neural network emulator."""
-        cosmo_params = jnp.array(
-            [
-                params_values["As"],
-                params_values["ns"],
-                params_values["H0"],
-                params_values["w"],
-                params_values["ombh2"],
-                params_values["omch2"],
-                jnp.log10(params_values["mnu"]),
-            ]
-        )
-
-        cparam_grid = jnp.zeros((self.nz, len(cosmo_params) + 1))
-        cparam_grid = cparam_grid.at[:, :-1].set(cosmo_params)
-        cparam_grid = cparam_grid.at[:, -1].set(self.z)
+        if self.emulator_input_param_order is not None:
+            from .spectral_equivalence import build_equiv_cparam_grid_custom_order
+            cparam_grid = build_equiv_cparam_grid_custom_order(
+                params_values, self.z, state, self.emulator_input_param_order,
+            )
+        else:
+            from .spectral_equivalence import build_equiv_cparam_grid
+            cparam_grid = build_equiv_cparam_grid(params_values, self.z, state)
         pk_ij = self.emulator.predict(cparam_grid).T
         n_spec = len(self.emulator.pij_emus)
 
         logk_emu = jnp.log10(self.emulator.pij_emus[0].k)
         if self.save_p_ij:
-            state["p_ij_real_space_bias_grid"] = jnp.zeros((n_spec, self.nk, self.nz))
-            for i in range(n_spec):
-                p = interp1d(
-                    self.logk,
-                    logk_emu,
-                    pk_ij[:, i, :],
-                    extrap=0,
-                    method=self.interpolation_order,
-                )
-
-                state["p_ij_real_space_bias_grid"] = (
-                    state["p_ij_real_space_bias_grid"].at[i, ...].set(p)
-                )
+            # interp1d handles trailing batch dims, so no per-spectrum loop needed
+            p_all = interp1d(
+                self.logk,
+                logk_emu,
+                pk_ij,  # (nk_emu, n_spec, nz)
+                extrap=0,
+                method=self.interpolation_order,
+            )  # (nk, n_spec, nz)
+            state["p_ij_real_space_bias_grid"] = p_all.transpose(1, 0, 2)
 
         if self.save_p_11_separately:
             state["p_11_real_space_bias_grid"] = interp1d(
@@ -393,15 +372,10 @@ class RealSpaceMatterPowerSpectrum(RealSpaceBiasedTracerSpectra):
         self.use_boltzmann = config.get("use_boltzmann", False)
 
         if self.use_emulator:
-            self.output_requirements["p_11_real_space_bias_grid"] = [
-                "As",
-                "ns",
-                "H0",
-                "w",
-                "ombh2",
-                "omch2",
-                "mnu",
-            ]
+            params = ["As", "ns", "H0", "w", "ombh2", "omch2", "mnu"]
+            if self.emulator_input_param_order and "wa" in self.emulator_input_param_order:
+                params.append("wa")
+            self.output_requirements["p_11_real_space_bias_grid"] = params
         else:
             self.output_requirements["p_11_real_space_bias_grid"] = [
                 "Pm_lin_z",
@@ -467,6 +441,7 @@ class RealSpaceBiasExpansion(LikelihoodModule):
         self.p_mm_uv_behavior = config.get("p_mm_uv_behavior", "dmo")
         self.p_mm_ct_pade = config.get("p_mm_ct_pade", True)
         self.k_cutoff = k_cutoff
+        self.lens_bin_mapping = config.get("lens_bin_mapping", {})
 
         self.output_requirements = {}
         if self.scale_by_s8z:
@@ -546,10 +521,10 @@ class RealSpaceBiasExpansion(LikelihoodModule):
                         if (s == "p_gg") & (self.spectrum_info[spec_type]["use_cross"]):
                             self.all_spectra[s].append((i, j))
                             self.output_requirements["p_gg"].extend(
-                                [p.format(i=i) for p in self.spectrum_params[s]]
+                                [p.format(i=self.lens_bin_mapping.get(i, i)) for p in self.spectrum_params[s]]
                             )
                             self.output_requirements["p_gg"].extend(
-                                [p.format(i=j) for p in self.spectrum_params[s]]
+                                [p.format(i=self.lens_bin_mapping.get(j, j)) for p in self.spectrum_params[s]]
                             )
                             self.output_requirements["p_gg"].append(
                                 self.spectrum_basis[s]
@@ -565,7 +540,7 @@ class RealSpaceBiasExpansion(LikelihoodModule):
                             ):
                                 self.all_spectra[s].append((i,))
                                 self.output_requirements[s].extend(
-                                    [p.format(i=i) for p in self.spectrum_params[s]]
+                                    [p.format(i=self.lens_bin_mapping.get(i, i)) for p in self.spectrum_params[s]]
                                 )
                                 self.output_requirements[s].append(
                                     self.spectrum_basis[s]
@@ -583,16 +558,16 @@ class RealSpaceBiasExpansion(LikelihoodModule):
                     if (
                         i in self.dbins
                     ):  # self.observed_data_vector.spectrum_info[spec_type]["bins0"]:
-                        if (s == "p_gg") & self.spectrum_info["c_dd"]["use_cross"]:
+                        if (s == "p_gg") and self.spectrum_info["c_dd"]["use_cross"]:
                             for j in self.dbins:
-                                pars = [p.format(i=i) for p in self.spectrum_params[s]]
+                                pars = [p.format(i=self.lens_bin_mapping.get(i, i)) for p in self.spectrum_params[s]]
                                 pars.extend(
-                                    [p.format(i=j) for p in self.spectrum_params[s]]
+                                    [p.format(i=self.lens_bin_mapping.get(int(j), int(j))) for p in self.spectrum_params[s]]
                                 )
                                 self.indexed_params[s].append(pars)
                         else:
                             self.indexed_params[s].append(
-                                [p.format(i=i) for p in self.spectrum_params[s]]
+                                [p.format(i=self.lens_bin_mapping.get(i, i)) for p in self.spectrum_params[s]]
                             )
                     else:
                         self.indexed_params[s].append(

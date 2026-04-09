@@ -1,8 +1,176 @@
+import os
 import numpy as np
 from getdist import MCSamples
 import h5py as h5
 import json
+import yaml
 import jax.numpy as jnp
+
+from gholax.util.model import Model
+from gholax.theory.linear_growth import LinearGrowth
+
+
+def load_model_samples(config_file, compute_sigma8=False, burn_in_frac=0,
+                       ignore_chains=[], smooth_scale=-1):
+    """Load model, checkpointed samples, and best-fit values from a config file.
+
+    Args:
+        config_file: Path to the YAML config file.
+        compute_sigma8: If True, compute sigma8, omegam, and S8 for both
+            samples and best-fit using the LinearGrowth emulator.
+        burn_in_frac: Fraction of samples to discard as burn-in.
+        ignore_chains: List of chain indices to ignore (NUTS/MH only).
+        smooth_scale: Smoothing scale for GetDist plots.
+
+    Returns:
+        Tuple of (model, gds, best_fit) where:
+            model: Instantiated Model object.
+            gds: GetDist MCSamples object, or None if no checkpoint exists.
+            best_fit: Dict mapping parameter names to best-fit values, or None
+                if no minimization results exist.
+    """
+    with open(config_file, 'r') as fp:
+        cfg = yaml.load(fp, Loader=yaml.SafeLoader)
+
+    output_file = cfg['output_file']
+    sampler = list(cfg['sampler'].keys())[0]
+    likelihood_name = [k for k in cfg['likelihood'] if k != 'params'][0]
+
+    model = Model(config_file)
+
+    params = model.prior.get_reference_point()
+    sigmas = model.prior.get_prior_sigmas()
+    reference = jnp.array(list(params.values()))
+    names = list(params.keys())
+    like = model.likelihoods[likelihood_name]
+    labels = [model.prior.config[p]['latex'] if 'latex' in model.prior.config[p] else p for p in names]
+
+    # Find sigma8 emulator if needed
+    s8_emu = None
+    cosmo_params = None
+    if compute_sigma8:
+        for module in like.likelihood_pipeline:
+            if isinstance(module, LinearGrowth):
+                s8_emu = module.emulator
+                break
+        if s8_emu is not None:
+            ipo = getattr(s8_emu, 'input_param_order',
+                          ['As', 'ns', 'H0', 'w', 'ombh2', 'omch2', 'logmnu', 'z'])
+            cosmo_params = [p for p in ipo if p != 'z']
+
+    # Load samples
+    gds = None
+    if sampler in ('NUTS', 'MetropolisHastings', 'MCLMC'):
+        samples_path = f'{output_file}.samples_chk.npy'
+        logpost_path = f'{output_file}.logposterior_chk.npy'
+        if os.path.exists(samples_path):
+            raw_samples = np.load(samples_path)
+            log_posterior = np.load(logpost_path) if os.path.exists(logpost_path) else None
+
+            samples_list = []
+            log_post = []
+            for i in range(raw_samples.shape[0]):
+                if i in ignore_chains:
+                    continue
+                samples_i = raw_samples[i, :, :]
+                if compute_sigma8 and s8_emu is not None:
+                    x = _build_emu_input(samples_i, names, cosmo_params, like)
+                    om = (samples_i[:, names.index('omch2')] + samples_i[:, names.index('ombh2')]) / (samples_i[:, names.index('H0')] / 100) ** 2
+                    sigma8 = s8_emu.predict(x)
+                    s8 = sigma8[:, 0] * np.sqrt(om / 0.3)
+                    samples_i = np.hstack([samples_i, om[:, None], sigma8, s8[:, None]])
+                if log_posterior is not None:
+                    log_post.append(log_posterior[i, :])
+                samples_list.append(samples_i)
+
+            gds_names = list(names)
+            gds_labels = list(labels)
+            if compute_sigma8 and s8_emu is not None:
+                gds_names.extend(['omegam', 'sigma8', 's8'])
+                gds_labels.extend([r'\Omega_m', r'\sigma_8', r'S_8'])
+
+            samples_arr = np.array(samples_list)
+            log_post_arr = np.array(log_post) if log_post else None
+            gds = MCSamples(samples=samples_arr, names=gds_names, labels=gds_labels,
+                            ignore_rows=burn_in_frac, loglikes=log_post_arr,
+                            settings={'smooth_scale_2D': smooth_scale, 'smooth_scale_1D': smooth_scale})
+
+    elif sampler == 'emcee':
+        samples_path = f'{output_file}.0.samples.h5'
+        if os.path.exists(samples_path):
+            with h5.File(samples_path, 'r') as f:
+                nwalkers = f['mcmc/chain'].shape[1]
+                samples_flat = f['mcmc/chain'][:].reshape(-1, f['mcmc/chain'].shape[-1])
+
+            samples_i = samples_flat
+            if compute_sigma8 and s8_emu is not None:
+                x = _build_emu_input(samples_i, names, cosmo_params, like)
+                om = (samples_i[:, names.index('omch2')] + samples_i[:, names.index('ombh2')]) / (samples_i[:, names.index('H0')] / 100) ** 2
+                sigma8 = s8_emu.predict(x)
+                s8 = sigma8[:, 0] * np.sqrt(om / 0.3)
+                samples_i = np.hstack([samples_i, om[:, None], sigma8, s8[:, None]])
+
+            gds_names = list(names)
+            gds_labels = list(labels)
+            if compute_sigma8 and s8_emu is not None:
+                gds_names.extend(['omegam', 'sigma8', 's8'])
+                gds_labels.extend([r'\Omega_m', r'\sigma_8', r'S_8'])
+
+            gds = MCSamples(samples=samples_i, names=gds_names, labels=gds_labels,
+                            ignore_rows=burn_in_frac,
+                            settings={'smooth_scale_2D': smooth_scale, 'smooth_scale_1D': smooth_scale})
+
+    # Load best fit
+    best_fit = None
+    minimization_path = f'{output_file}.minimization_results.json'
+    if os.path.exists(minimization_path):
+        with open(minimization_path, 'r') as fp:
+            opt = json.load(fp)
+
+        x_bf = np.array(opt['x_opt'][0]) * sigmas + reference
+        best_fit = dict(zip(names, x_bf))
+        best_fit['logposterior'] = opt['value'][0]
+
+        if compute_sigma8 and s8_emu is not None:
+            x = _build_emu_input(x_bf[None, :], names, cosmo_params, like)
+            sigma8_val = float(s8_emu.predict(x)[0, 0])
+            omegam_val = float((best_fit['omch2'] + best_fit['ombh2'])
+                               / (best_fit['H0'] / 100) ** 2)
+            best_fit['sigma8'] = sigma8_val
+            best_fit['omegam'] = omegam_val
+            best_fit['s8'] = sigma8_val * np.sqrt(omegam_val / 0.3)
+
+    return model, gds, best_fit
+
+
+def _build_emu_input(samples_i, names, cosmo_params, like):
+    """Build emulator input array from chain samples using the emulator's parameter order.
+
+    Args:
+        samples_i: Array of shape (n_samples, n_params) with chain samples.
+        names: List of sampled parameter names.
+        cosmo_params: List of cosmological parameter names expected by the emulator (excluding 'z').
+        like: Likelihood object with fixed_params for non-sampled parameters.
+
+    Returns:
+        Array of shape (n_samples, len(cosmo_params) + 1) with z=0 appended.
+    """
+    samps = []
+    for p in cosmo_params:
+        if p in names:
+            samps.append(samples_i[:, names.index(p)])
+        elif p == 'logmnu':
+            if 'logmnu' in names:
+                samps.append(samples_i[:, names.index('logmnu')])
+            elif 'mnu' in names:
+                samps.append(np.log10(samples_i[:, names.index('mnu')]))
+            else:
+                samps.append(np.log10(np.ones(len(samples_i)) * like.fixed_params.get('mnu', 0.06)))
+        else:
+            samps.append(np.ones(len(samples_i)) * like.fixed_params[p])
+    samps.append(np.zeros(len(samples_i)))
+    return jnp.array(samps).T
+
 
 def load_samples_checkpoint_nuts(output_file, model, likelihood_name, s8_module_index=1, burn_in_frac=0, ignore_chains=[], smooth_scale=-1):
     """
@@ -38,37 +206,24 @@ def load_samples_checkpoint_nuts(output_file, model, likelihood_name, s8_module_
     with open(f'{output_file}.minimization_results.json', 'r') as fp:
         opt = json.load(fp)
     samples_i = np.array(opt['x_opt'])*sigmas + reference
-    cosmo_params = ['As', 'ns', 'H0', 'w', 'ombh2', 'omch2', 'logmnu']
-    samps = []
     like = model.likelihoods[likelihood_name]
+    s8_emu = like.likelihood_pipeline[s8_module_index].emulator
+    ipo = getattr(s8_emu, 'input_param_order', ['As', 'ns', 'H0', 'w', 'ombh2', 'omch2', 'logmnu', 'z'])
+    # cosmo_params is everything except the trailing 'z'
+    cosmo_params = [p for p in ipo if p != 'z']
 
-    for p in cosmo_params:
-        if p in names:
-            samps.append(samples_i[:, names.index(p)])
-        else:
-            samps.append(np.ones(len(samples_i)) * like.fixed_params[p])
-    
-    samps.append(np.zeros(len(samples_i)))
-    x =  jnp.array(samps)
-    
+    x = _build_emu_input(samples_i, names, cosmo_params, like)
+
     om_bf = (samples_i[:, names.index('omch2')]+samples_i[:, names.index('ombh2')])/(samples_i[:, names.index('H0')]/100)**2
-    sigma8_bf = like.likelihood_pipeline[s8_module_index].emulator.predict(x.T)
-    
+    sigma8_bf = s8_emu.predict(x)
+
     log_post = []
     for i in range(samples.shape[0]):
         if i in ignore_chains: continue
         samples_i = samples[i,:,:]
-        samps = []
-        for p in cosmo_params:
-            if p in names:
-                samps.append(samples_i[:, names.index(p)])
-            else:
-                samps.append(np.ones(len(samples_i)) * like.fixed_params[p])
-        
-        samps.append(np.zeros(len(samples_i)))
-        x =  jnp.array(samps)
+        x = _build_emu_input(samples_i, names, cosmo_params, like)
         om = (samples_i[:, names.index('omch2')]+samples_i[:, names.index('ombh2')])/(samples_i[:, names.index('H0')]/100)**2
-        sigma8 = like.likelihood_pipeline[s8_module_index].emulator.predict(x.T)
+        sigma8 = s8_emu.predict(x)
         s8 = sigma8[:,0] * np.sqrt(om/0.3)
         log_post.append(log_posterior[i,:])
         samples_i = np.hstack([samples_i, om[:,None], sigma8, s8[:,None]])
@@ -79,6 +234,74 @@ def load_samples_checkpoint_nuts(output_file, model, likelihood_name, s8_module_
     samples = np.array(samples_list)
     log_post = np.array(log_post)
     gds = MCSamples(samples=samples[:,:,:], names = names, labels=labels, ignore_rows=burn_in_frac, loglikes=log_post, settings={'smooth_scale_2D':smooth_scale, 'smooth_scale_1D':smooth_scale})
+
+    params_bf_chain = dict(zip(names, np.array(opt['x_opt'][0])*sigmas + reference))    
+    params_bf_chain['sigma8'] = sigma8_bf[0]
+    params_bf_chain['omegam'] = om_bf[0]
+    params_bf_chain['s8'] = sigma8_bf[0] * np.sqrt(om_bf[0]/0.3)
+
+    return gds, params_bf_chain, reference, names, opt
+
+def load_samples_checkpoint_mh(output_file, model, likelihood_name, s8_module_index=1, burn_in_frac=0, ignore_chains=[], smooth_scale=-1):
+    """
+    Load samples from a MH checkpoint file and return a GetDist MCSamples object along with best-fit parameters.
+    output_file: str
+        Base name of the output files (without extensions).
+    model: object
+        The model object containing prior and likelihood information.
+    likelihood_name: str
+        The name of the likelihood to be used from the model.likelihoods dictionary.
+    s8_module_index: int
+        Index of the module in the likelihood pipeline that computes sigma8.
+    burn_in_frac: float
+        Fraction of samples to discard as burn-in.
+    ignore_chains: list
+        List of chain indices to ignore. 
+    smooth_scale: float
+        Smoothing scale for GetDist plots.
+    """
+    samples = np.load(f'{output_file}.samples_chk.npy')
+    
+    samples_list = []
+
+    params = model.prior.get_reference_point()
+    sigmas = model.prior.get_prior_sigmas()
+    reference = jnp.array(list(model.prior.get_reference_point().values()))
+    names = list(params.keys())
+    
+    like = model.likelihoods[likelihood_name]
+    labels = [model.prior.config[p]['latex'] if 'latex' in model.prior.config[p] else p for p in names]
+
+    with open(f'{output_file}.minimization_results.json', 'r') as fp:
+        opt = json.load(fp)
+    samples_i = np.array(opt['x_opt'])*sigmas + reference
+    like = model.likelihoods[likelihood_name]
+    s8_emu = like.likelihood_pipeline[s8_module_index].emulator
+    ipo = getattr(s8_emu, 'input_param_order', ['As', 'ns', 'H0', 'w', 'ombh2', 'omch2', 'logmnu', 'z'])
+    # cosmo_params is everything except the trailing 'z'
+    cosmo_params = [p for p in ipo if p != 'z']
+
+    x = _build_emu_input(samples_i, names, cosmo_params, like)
+
+    om_bf = (samples_i[:, names.index('omch2')]+samples_i[:, names.index('ombh2')])/(samples_i[:, names.index('H0')]/100)**2
+    sigma8_bf = s8_emu.predict(x)
+
+    log_post = []
+    for i in range(samples.shape[0]):
+        if i in ignore_chains: continue
+        samples_i = samples[i,:,:]
+        x = _build_emu_input(samples_i, names, cosmo_params, like)
+        om = (samples_i[:, names.index('omch2')]+samples_i[:, names.index('ombh2')])/(samples_i[:, names.index('H0')]/100)**2
+        sigma8 = s8_emu.predict(x)
+        s8 = sigma8[:,0] * np.sqrt(om/0.3)
+        samples_i = np.hstack([samples_i, om[:,None], sigma8, s8[:,None]])
+        samples_list.append(samples_i)
+
+    names.extend(['omegam', 'sigma8', 's8'])
+    labels.extend([r'\Omega_m', r'\sigma_8', r'S_8'])
+    samples = np.array(samples_list)
+    log_post = np.array(log_post)
+    gds = MCSamples(samples=samples[:,:,:], names = names, labels=labels, ignore_rows=burn_in_frac, settings={'smooth_scale_2D':smooth_scale, 'smooth_scale_1D':smooth_scale})
 
     params_bf_chain = dict(zip(names, np.array(opt['x_opt'][0])*sigmas + reference))    
     params_bf_chain['sigma8'] = sigma8_bf[0]
@@ -114,17 +337,14 @@ def load_samples_emcee(output_file, model, likelihood_name, s8_module_index=1, s
     like = model.likelihoods[likelihood_name]
 
     samples_i = samples[:,:]
-    x =  jnp.array([samples_i[:,names.index('As')], 
-                    samples_i[:,names.index('ns')],
-                    samples_i[:,names.index('H0')],
-                    -np.ones_like(samples_i[:,names.index('As')]),
-                    samples_i[:,names.index('ombh2')],
-                    samples_i[:, names.index('omch2')],
-                    -2*np.ones_like(samples_i[:,names.index('As')]),
-                    np.zeros_like(samples_i[:, names.index('As')])])
-    
+    s8_emu = like.likelihood_pipeline[s8_module_index].emulator
+    ipo = getattr(s8_emu, 'input_param_order', ['As', 'ns', 'H0', 'w', 'ombh2', 'omch2', 'logmnu', 'z'])
+    cosmo_params = [p for p in ipo if p != 'z']
+
+    x = _build_emu_input(samples_i, names, cosmo_params, like)
+
     om = (samples_i[:, names.index('omch2')]+samples_i[:, names.index('ombh2')])/(samples_i[:, names.index('H0')]/100)**2
-    sigma8 = like.likelihood_pipeline[s8_module_index].emulator.predict(x.T)
+    sigma8 = s8_emu.predict(x)
     s8 = sigma8[:,0] * np.sqrt(om/0.3)    
     
     samples = np.hstack([samples_i, om[:,None], sigma8, s8[:,None]])
@@ -326,5 +546,7 @@ def load_samples_from_checkpoint(output_file, model, likelihood_name, sampler, s
         return load_samples_checkpoint_nuts(output_file, model, likelihood_name, s8_module_index=s8_module_index, burn_in_frac=burn_in_frac, ignore_chains=ignore_chains, smooth_scale=smooth_scale)
     elif sampler == 'emcee':
         return load_samples_emcee(output_file, model, likelihood_name, s8_module_index=s8_module_index, smooth_scale=smooth_scale, burn_in_frac=burn_in_frac)
+    elif sampler == 'MetropolisHastings':
+        return load_samples_checkpoint_mh(output_file, model, likelihood_name, s8_module_index=s8_module_index, burn_in_frac=burn_in_frac, ignore_chains=ignore_chains, smooth_scale=smooth_scale)        
     else:
         raise NotImplementedError(f"Sampler {sampler} not recognized.")

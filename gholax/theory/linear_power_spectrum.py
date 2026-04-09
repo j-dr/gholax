@@ -58,24 +58,8 @@ class LinearPowerSpectrum(LikelihoodModule):
             self.z = np.linspace(zmin, zmax, self.nz)
             self.k = np.logspace(np.log10(self.kmin), np.log10(self.kmax), self.nk)
 
-            self.output_requirements["Pm_lin_z"] = [
-                "As",
-                "ns",
-                "H0",
-                "w",
-                "ombh2",
-                "omch2",
-                "mnu",
-            ]
-            self.output_requirements["Pcb_lin_z"] = [
-                "As",
-                "ns",
-                "H0",
-                "w",
-                "ombh2",
-                "omch2",
-                "mnu",
-            ]
+            self.output_requirements["Pm_lin_z"] = ["boltzmann_results", "H0"]
+            self.output_requirements["Pcb_lin_z"] = ["boltzmann_results", "H0"]
 
         else:
             raise (
@@ -86,21 +70,8 @@ class LinearPowerSpectrum(LikelihoodModule):
 
     def compute_emulator(self, state, params_values):
         """Compute P_m and P_cb using the neural network emulator."""
-        cosmo_params = jnp.array(
-            [
-                params_values["As"],
-                params_values["ns"],
-                params_values["H0"],
-                params_values["w"],
-                params_values["ombh2"],
-                params_values["omch2"],
-                jnp.log10(params_values["mnu"]),
-            ]
-        )
-
-        cparam_grid = jnp.zeros((self.nz, len(cosmo_params) + 1))
-        cparam_grid = cparam_grid.at[:, :-1].set(cosmo_params)
-        cparam_grid = cparam_grid.at[:, -1].set(self.z)
+        from .spectral_equivalence import build_equiv_cparam_grid
+        cparam_grid = build_equiv_cparam_grid(params_values, self.z, state)
 
         Plin = self.emulator.predict(cparam_grid)
 

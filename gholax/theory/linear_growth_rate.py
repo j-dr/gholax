@@ -28,27 +28,14 @@ class LinearGrowthRate(LikelihoodModule):
         if self.use_emulator:
             self.emulator_file_name = config["emulator_file_name"]
             self.emulator = ScalarEmulator(self.emulator_file_name)
-            # these are the parameters that are checked in order to decide whether quantities need to be recomputed
-            self.output_requirements["f_z"] = [
-                "As",
-                "ns",
-                "H0",
-                "w",
-                "ombh2",
-                "omch2",
-                "mnu",
-            ]
+            ipo = getattr(self.emulator, 'input_param_order', None)
+            params = ["As", "ns", "H0", "w", "ombh2", "omch2", "mnu"]
+            if ipo is not None and "wa" in ipo:
+                params.append("wa")
+            self.output_requirements["f_z"] = params
 
         elif self.use_boltzmann:
-            self.output_requirements["f_z"] = [
-                "As",
-                "ns",
-                "H0",
-                "w",
-                "ombh2",
-                "omch2",
-                "mnu",
-            ]
+            self.output_requirements["f_z"] = ["boltzmann_results"]
 
         else:
             raise (
@@ -59,21 +46,14 @@ class LinearGrowthRate(LikelihoodModule):
 
     def compute_emulator(self, state, params_values):
         """Compute f(z) using the neural network emulator."""
-        cosmo_params = jnp.array(
-            [
-                params_values["As"],
-                params_values["ns"],
-                params_values["omch2"],
-                params_values["ombh2"],
-                params_values["H0"],
-                params_values["w"],
-                jnp.log10(params_values["mnu"]),
-            ]
+        from .spectral_equivalence import build_equiv_cparam_grid_custom_order
+        order = (
+            self.emulator.input_param_order
+            or ["As", "ns", "omch2", "ombh2", "H0", "w", "logmnu", "z"]
         )
-
-        cparam_grid = jnp.zeros((self.nz, len(cosmo_params) + 1))
-        cparam_grid = cparam_grid.at[:, :-1].set(cosmo_params)
-        cparam_grid = cparam_grid.at[:, -1].set(self.z)
+        cparam_grid = build_equiv_cparam_grid_custom_order(
+            params_values, self.z, state, order,
+        )
 
         f_z = self.emulator.predict(cparam_grid)[:, 0]
         state["f_z"] = f_z

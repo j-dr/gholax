@@ -1,0 +1,3 @@
+filebase: aemulus_nu_tier1_cosmo_only_f_z_emu
+scale_As: true
+param_order: ["As", "ns", "omch2", "ombh2", "H0", "w", "logmnu", "z"]

@@ -1,0 +1,20 @@
+pij_bases:
+  - aemulus_nu_tier1_cosmo_only_dst_irresum_p0_heft_emu
+  - aemulus_nu_tier1_cosmo_only_dst_irresum_p1_heft_emu
+  - aemulus_nu_tier1_cosmo_only_dst_irresum_p2_heft_emu
+  - aemulus_nu_tier1_cosmo_only_dst_irresum_p3_heft_emu
+  - aemulus_nu_tier1_cosmo_only_dst_irresum_p4_heft_emu
+  - aemulus_nu_tier1_cosmo_only_dst_irresum_p5_heft_emu
+  - aemulus_nu_tier1_cosmo_only_dst_irresum_p6_heft_emu
+  - aemulus_nu_tier1_cosmo_only_dst_irresum_p7_heft_emu
+  - aemulus_nu_tier1_cosmo_only_dst_irresum_p8_heft_emu
+  - aemulus_nu_tier1_cosmo_only_dst_irresum_p9_heft_emu
+  - aemulus_nu_tier1_cosmo_only_dst_irresum_p10_heft_emu
+  - aemulus_nu_tier1_cosmo_only_dst_irresum_p11_heft_emu
+  - aemulus_nu_tier1_cosmo_only_dst_irresum_p12_heft_emu
+  - aemulus_nu_tier1_cosmo_only_dst_irresum_p13_heft_emu
+  - aemulus_nu_tier1_cosmo_only_dst_irresum_p14_heft_emu
+
+s8z_base: aemulus_nu_tier1_cosmo_only_heft_sigma8z_emu
+kmin: 1e-3
+kmax: 3.9355007545577743

@@ -92,27 +92,13 @@ class RedshiftSpaceBiasedTracerSpectra(LikelihoodModule):
         if self.use_emulator:
             self.emulator_file_names = config["emulator_file_names"]
             self.emulators = {}
-            self.input_param_order = [
-                "As",
-                "ns",
-                "omch2",
-                "ombh2",
-                "H0",
-                "w",
-                "logmnu",
-                "z",
-            ]
-            self.output_requirements["p_ij_ell_redshift_space_bias_grid"] = [
-                "As",
-                "ns",
-                "omch2",
-                "ombh2",
-                "H0",
-                "w",
-                "logmnu",
-                "e_z",
-                "chi_z",
-            ]
+
+            # Read param order from first emulator config
+            first_emu = MultiSpectrumEmulator(self.emulator_file_names[0])
+            self.input_param_order = first_emu.input_param_order
+            if self.input_param_order[-1] != 'z':
+                self.input_param_order.remove('z')
+                self.input_param_order.append('z')
 
             for ell in range(self.n_ell_noap):
                 self.emulators[ell] = MultiSpectrumEmulator(
@@ -126,6 +112,13 @@ class RedshiftSpaceBiasedTracerSpectra(LikelihoodModule):
                 "e_z",
                 "chi_z",
             ]
+            
+            self.output_requirements["p_ij_ell_no_ap_redshift_space_bias_grid"] = [
+                "f_z",
+                "Pcb_lin_z",
+                "e_z",
+                "chi_z",
+            ]            
         self.kIR = config.get("kIR", 0.2)
         self.interpolation_order = config.get("interpolation_order", "cubic")
 
@@ -230,12 +223,10 @@ class RedshiftSpaceBiasedTracerSpectra(LikelihoodModule):
 
     def compute_emulator(self, state, params_values):
         """Compute redshift-space P_ij(k,ell) using emulators and apply AP corrections."""
-        cosmo_params = jnp.array(
-            [params_values[p] for p in self.input_param_order[:-1]]
+        from .spectral_equivalence import build_equiv_cparam_grid_custom_order
+        cparam_grid = build_equiv_cparam_grid_custom_order(
+            params_values, self.z, state, self.input_param_order,
         )
-        cparam_grid = jnp.zeros((self.nz, len(cosmo_params) + 1))
-        cparam_grid = cparam_grid.at[:, :-1].set(cosmo_params)
-        cparam_grid = cparam_grid.at[:, -1].set(self.z)
 
         logk_emu = jnp.log10(self.emulators[0].k)
         state["p_ij_ell_redshift_space_bias_grid"] = jnp.zeros(
@@ -481,6 +472,7 @@ class RedshiftSpaceBiasExpansion(LikelihoodModule):
         self.scale_by_s8z = config.get("scale_by_s8z", True)
         self.scale_by_aap = config.get("scale_by_aap", True)
         self.det_bias_aap = config.get("det_bias_aap", False)
+        self.lens_bin_mapping = config.get("lens_bin_mapping", {})
         self.hz_fid =  jnp.array(spectrum_info["p_gg_ell"]["hz_fid"])
         self.chiz_fid = jnp.array(spectrum_info["p_gg_ell"]["chiz_fid"])
 
@@ -530,10 +522,10 @@ class RedshiftSpaceBiasExpansion(LikelihoodModule):
             if self.spectrum_info["p_gg_ell"]["use_cross"]:
                 self.all_spectra["p_gg_ell"].append((i, j))
                 self.output_requirements["p_gg_ell"].extend(
-                    [p.format(i=i) for p in self.spectrum_params["p_gg_ell"]]
+                    [p.format(i=self.lens_bin_mapping.get(i, i)) for p in self.spectrum_params["p_gg_ell"]]
                 )
                 self.output_requirements["p_gg_ell"].extend(
-                    [p.format(i=j) for p in self.spectrum_params["p_gg_ell"]]
+                    [p.format(i=self.lens_bin_mapping.get(j, j)) for p in self.spectrum_params["p_gg_ell"]]
                 )
                 self.output_requirements["p_gg_ell"].append(
                     self.spectrum_basis["p_gg_ell"]
@@ -545,7 +537,7 @@ class RedshiftSpaceBiasExpansion(LikelihoodModule):
                 if (i,) not in self.all_spectra["p_gg_ell"]:
                     self.all_spectra["p_gg_ell"].append((i,))
                     self.output_requirements["p_gg_ell"].extend(
-                        [p.format(i=i) for p in self.spectrum_params["p_gg_ell"]]
+                        [p.format(i=self.lens_bin_mapping.get(i, i)) for p in self.spectrum_params["p_gg_ell"]]
                     )
                     self.output_requirements["p_gg_ell"].append(
                         self.spectrum_basis["p_gg_ell"]
@@ -563,14 +555,14 @@ class RedshiftSpaceBiasExpansion(LikelihoodModule):
             ):  # self.observed_data_vector.spectrum_info[spec_type]["bins0"]:
                 if self.spectrum_info["p_gg_ell"]["use_cross"]:
                     for j in self.dbins:
-                        pars = [p.format(i=i) for p in self.spectrum_params["p_gg_ell"]]
+                        pars = [p.format(i=self.lens_bin_mapping.get(i, i)) for p in self.spectrum_params["p_gg_ell"]]
                         pars.extend(
-                            [p.format(i=j) for p in self.spectrum_params["p_gg_ell"]]
+                            [p.format(i=self.lens_bin_mapping.get(int(j), int(j))) for p in self.spectrum_params["p_gg_ell"]]
                         )
                         self.indexed_params["p_gg_ell"].append(pars)
                 else:
                     self.indexed_params["p_gg_ell"].append(
-                        [p.format(i=i) for p in self.spectrum_params["p_gg_ell"]]
+                        [p.format(i=self.lens_bin_mapping.get(i, i)) for p in self.spectrum_params["p_gg_ell"]]
                     )
             else:
                 self.indexed_params["p_gg_ell"].append(

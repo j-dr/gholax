@@ -106,29 +106,20 @@ def get_gaussian_proposal_generator(proposal_cov):
 
 
 class MetropolisHastings(object):
-    """Metropolis-Hastings random-walk sampler using blackjax.
-
-    Supports Gaussian or CosmoMC-style proposals, adaptive covariance
-    updates, optional L-BFGS pre-minimization, Hessian/Jacobian-based
-    initial proposal estimation, convergence checking via R-hat, and
-    checkpoint restart.
-    """
-
     def __init__(self, config):
-        """Initialize the Metropolis-Hastings sampler from config.
-
-        Args:
-            config: Full config dict containing 'sampler' -> 'MetropolisHastings' section.
-        """
         c = config["sampler"]["MetropolisHastings"]
         self.target_r_minus_one = c.get("target_r_minus_one", 0.1)
         self.min_cov_r_minus_one = c.get("min_cov_r_minus_one", 10)
         self.n_steps_checkpoint = c.get("n_steps_checkpoint", 1000)
         self.n_steps_incr = c.get("n_steps_incr", 100)
-        self.n_steps = c.get("n_steps", 10000)
+        self.n_steps_min = c.get("n_steps", 100000)
         self.random_start = c.get("random_start", True)
         self.covariance_filename = c.get("covariance_filename", None)
         self.init_covariance = c.get("init_covariance", "jacobian")
+        if self.init_covariance == 'None':
+            self.init_covariance = None
+
+        
         self.update_covariance = c.get("update_covariance", True)
         self.proposal_distribution = c.get("proposal_distribution", "cosmomc")
         self.minimize_and_sample = c.get("minimize_and_sample", False)
@@ -147,19 +138,6 @@ class MetropolisHastings(object):
             self.proposal_covariance = None
 
     def run(self, model, output_file):
-        """Run the Metropolis-Hastings sampler until R-hat converges.
-
-        Initializes proposal covariance (from Jacobian, Hessian, file, or
-        diagonal prior), optionally pre-minimizes, then iteratively samples
-        with periodic covariance updates and checkpoint saving.
-
-        Args:
-            model: Model instance with log_posterior_scaled_params and prior.
-            output_file: Base path for output checkpoint and proposal files.
-
-        Returns:
-            Tuple of (samples array, parameter names list).
-        """
         rng_key = jax.random.key(int(datetime.now().strftime("%Y%m%d%s")))
         param_names = model.prior.params
         prior = model.prior
@@ -200,6 +178,7 @@ class MetropolisHastings(object):
                 ]
 
         else:
+            samples = None
             if self.minimize_and_sample:
                 # minimize negative log posterior
                 jnlp = jax.jit(lambda p: -log_posterior(p))
@@ -362,7 +341,7 @@ class MetropolisHastings(object):
             n_steps = samples.shape[1]
             is_accepted = jnp.ones(n_steps, dtype=bool)
 
-        while rhat - 1 > self.target_r_minus_one:
+        while (rhat - 1 > self.target_r_minus_one) | (n_steps < self.n_steps_min):
             if counter == 0:
                 states, info = pmap_inference_loop(
                     sample_keys, random_walk.step, states, self.n_steps_incr
@@ -405,7 +384,7 @@ class MetropolisHastings(object):
                         ]
                     )
 
-                rhat = jnp.mean(potential_scale_reduction(samples_temp))
+                rhat = jnp.max(potential_scale_reduction(samples_temp))
                 print(
                     f"Acceptance fraction per chain = {n_accepted_steps / is_accepted.shape[1]}",
                     flush=True,
@@ -438,6 +417,10 @@ class MetropolisHastings(object):
                 n_steps = n_steps + self.n_steps_checkpoint
 
             counter += 1
+
+            keys = jax.random.split(rng_key, 1 + n_devices)
+            rng_key = keys[0]
+            sample_keys = keys[1:]
 
         samples = samples_temp * sigmas[None, None, :] + reference[None, None, :]
         log_density = log_density_temp
