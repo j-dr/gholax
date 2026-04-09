@@ -62,8 +62,11 @@ class NUTS(object):
     def _hessian_mass_matrix(self, jlp, position):
         """Estimate diagonal inverse mass matrix from the Hessian of the log posterior.
 
-        Uses forward-over-reverse AD (JVP over grad) to compute only the
-        diagonal of the Hessian, avoiding materializing the full dim×dim matrix.
+        Uses forward finite differences of the gradient to estimate the diagonal
+        of the Hessian using only reverse-mode AD. Forward-mode (JVP) cannot be
+        used because odeint defines a custom_vjp without a matching custom_jvp.
+        Requires dim+1 gradient evaluations.
+
         Elements are clamped to [1e-6, 1e6] to guard against degenerate
         curvature far from the MAP.
 
@@ -77,9 +80,12 @@ class NUTS(object):
         """
         jnlp = lambda p: -jlp(p)
         grad_fn = jax.grad(jnlp)
-        diag_H = jax.vmap(
-            lambda ei: jax.jvp(grad_fn, (position,), (ei,))[1] @ ei
-        )(jnp.eye(len(position)))
+        eps = 1e-3
+        dim = len(position)
+        g0 = grad_fn(position)
+        perturbations = jnp.eye(dim) * eps
+        g_plus = jax.vmap(lambda delta: grad_fn(position + delta))(perturbations)
+        diag_H = (jnp.diag(g_plus) - g0) / eps
         return 1.0 / jnp.clip(diag_H, 1e-6, 1e6)
 
     def _adaptive_window_warmup(self, jlp, rng_key, initial_position, initial_inverse_mass_matrix=None):
