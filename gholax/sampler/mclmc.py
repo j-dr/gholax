@@ -379,21 +379,35 @@ class MCLMC(object):
         state = initial_state
         params = initial_params
 
+        # When the Hessian provides the initial mass matrix, disable diagonal
+        # preconditioning so blackjax doesn't throw it away and replace it with
+        # a sample-covariance estimate. Only L and step_size will be tuned.
+        diag_precond = self.diagonal_preconditioning and (self.mass_matrix_init != "hessian")
+        if self.mass_matrix_init == "hessian" and self.diagonal_preconditioning:
+            print(
+                "Disabling diagonal_preconditioning to preserve Hessian mass matrix estimate.",
+                flush=True,
+            )
+
         for round_num in range(1, self.max_warmup_rounds + 1):
             rng_key, tune_key = jax.random.split(rng_key)
             prev_params = params
 
             if self.adjusted:
-                state, params = self._adapt_adjusted(jlp, state, tune_key, params)
+                state, params = self._adapt_adjusted(
+                    jlp, state, tune_key, params, diagonal_preconditioning=diag_precond
+                )
             else:
-                state, params = self._adapt_unadjusted(jlp, state, tune_key, params)
+                state, params = self._adapt_unadjusted(
+                    jlp, state, tune_key, params, diagonal_preconditioning=diag_precond
+                )
 
-            rel_L = abs(float(params.L) - float(prev_params.L)) / abs(float(prev_params.L))
-            rel_ss = abs(float(params.step_size) - float(prev_params.step_size)) / abs(float(prev_params.step_size))
+            rel_L = abs(float(params.L) - float(prev_params.L)) / (abs(float(prev_params.L)) + 1e-10)
+            rel_ss = abs(float(params.step_size) - float(prev_params.step_size)) / (abs(float(prev_params.step_size)) + 1e-10)
             rel_imm = float(
                 jnp.max(
                     jnp.abs(params.inverse_mass_matrix - prev_params.inverse_mass_matrix)
-                    / jnp.abs(prev_params.inverse_mass_matrix)
+                    / (jnp.abs(prev_params.inverse_mass_matrix) + 1e-10)
                 )
             )
             max_rel_change = max(rel_L, rel_ss, rel_imm)
@@ -422,8 +436,12 @@ class MCLMC(object):
 
         return state, params
 
-    def _adapt_unadjusted(self, jlp, initial_state, rng_key, initial_params):
+    def _adapt_unadjusted(self, jlp, initial_state, rng_key, initial_params,
+                          diagonal_preconditioning=None):
         """Run unadjusted MCLMC adaptation."""
+        if diagonal_preconditioning is None:
+            diagonal_preconditioning = self.diagonal_preconditioning
+
         kernel = lambda inverse_mass_matrix: blackjax.mcmc.mclmc.build_kernel(
             logdensity_fn=jlp,
             integrator=blackjax.mcmc.integrators.isokinetic_mclachlan,
@@ -438,14 +456,17 @@ class MCLMC(object):
             frac_tune1=self.frac_tune1,
             frac_tune2=self.frac_tune2,
             frac_tune3=self.frac_tune3,
-            diagonal_preconditioning=self.diagonal_preconditioning,
+            diagonal_preconditioning=diagonal_preconditioning,
             params=initial_params,
         )
 
         return state, params
 
-    def _adapt_adjusted(self, jlp, initial_state, rng_key, initial_params):
+    def _adapt_adjusted(self, jlp, initial_state, rng_key, initial_params,
+                        diagonal_preconditioning=None):
         """Run adjusted MCLMC adaptation."""
+        if diagonal_preconditioning is None:
+            diagonal_preconditioning = self.diagonal_preconditioning
 
         def kernel(
             rng_key,
@@ -472,7 +493,7 @@ class MCLMC(object):
             frac_tune1=self.frac_tune1,
             frac_tune2=self.frac_tune2,
             frac_tune3=self.frac_tune3,
-            diagonal_preconditioning=self.diagonal_preconditioning,
+            diagonal_preconditioning=diagonal_preconditioning,
             params=initial_params,
         )
 
