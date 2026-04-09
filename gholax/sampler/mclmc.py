@@ -352,9 +352,12 @@ class MCLMC(object):
         eps = 1e-3
         dim = len(position)
         g0 = grad_fn(position)
-        perturbations = jnp.eye(dim) * eps
-        g_plus = jax.vmap(lambda delta: grad_fn(position + delta))(perturbations)
-        diag_H = (jnp.diag(g_plus) - g0) / eps
+        # Sequential loop: one gradient eval per parameter, keeping only the
+        # i-th element each time to avoid allocating dim gradient arrays at once.
+        diag_H = jnp.array([
+            (grad_fn(position.at[i].set(position[i] + eps))[i] - g0[i]) / eps
+            for i in range(dim)
+        ])
         return 1.0 / jnp.clip(diag_H, 1e-6, 1e6)
 
     def _adapt_with_convergence(self, jlp, initial_state, rng_key, initial_params):
