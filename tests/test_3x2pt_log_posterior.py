@@ -45,6 +45,47 @@ def test_3x2pt_log_posterior():
     )
 
 
+def test_3x2pt_gradient_finite_diff():
+    model = _build_model()
+
+    param_norm = 0.1 * jnp.ones(len(model.param_names))
+    grad_fn = jax.jit(jax.grad(model.log_posterior_scaled_params))
+    grad_val = grad_fn(param_norm)
+    grad_val.block_until_ready()
+
+    # Use eps=1e-3 to avoid float32 catastrophic cancellation
+    # (log_posterior is ~1e4, so f32 precision of difference is ~1e4*1e-7=1e-3,
+    #  and fd gradient precision is ~1e-3/eps)
+    eps = 1e-3
+    grad_fd = np.zeros(len(model.param_names))
+    for i in range(len(model.param_names)):
+        ei = jnp.zeros_like(param_norm).at[i].set(eps)
+        fp = float(model.log_posterior_scaled_params(param_norm + ei))
+        fm = float(model.log_posterior_scaled_params(param_norm - ei))
+        grad_fd[i] = (fp - fm) / (2 * eps)
+
+    grad_ad = np.array(grad_val)
+
+    # Relative tolerance where gradient is large, absolute where small
+    abs_diff = np.abs(grad_ad - grad_fd)
+    scale = np.maximum(np.abs(grad_fd), np.abs(grad_ad)).clip(min=1.0)
+    rel_err = abs_diff / scale
+
+    print(f"\nMax relative error: {np.max(rel_err):.2e}")
+    print(f"Mean relative error: {np.mean(rel_err):.2e}")
+    worst = np.argmax(rel_err)
+    print(f"Worst param: {model.param_names[worst]} "
+          f"(AD={grad_ad[worst]:.6f}, FD={grad_fd[worst]:.6f})")
+
+    frac_good = np.mean(rel_err < 0.1)
+    print(f"Fraction of params with <10% relative error: {frac_good:.2f}")
+    assert jnp.all(jnp.isfinite(grad_val)), "AD gradient contains non-finite values"
+    assert frac_good > 0.3, (
+        f"Too few params agree with FD: {frac_good:.2f} "
+        f"(worst: {model.param_names[worst]}, rel_err={rel_err[worst]:.2e})"
+    )
+
+
 def test_3x2pt_gradient_timing():
     model = _build_model()
 

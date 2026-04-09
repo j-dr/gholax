@@ -39,6 +39,7 @@ class NUTS(object):
         self.target_acceptance_rate = c.get("target_acceptance_rate", 0.65)
         self.step_size_init = c.get("step_size_init", 0.05)
         self.parallel_warmup = c.get("parallel_warmup", False)
+        self.mass_matrix_init = c.get("mass_matrix_init", "ones")  # "ones" or "hessian"
 
         self.warmup_algorithm = c.get("warmup_algorithm", "window")
         if self.warmup_algorithm not in self.WARMUP_ALGORITHMS:
@@ -58,27 +59,57 @@ class NUTS(object):
         self.meads_warmup_steps = c.get("meads_warmup_steps", 150)
         self.meads_step_size_tuning_steps = c.get("meads_step_size_tuning_steps", 100)
 
-    def _adaptive_window_warmup(self, jlp, rng_key, initial_position):
+    def _hessian_mass_matrix(self, jlp, position):
+        """Estimate diagonal inverse mass matrix from the Hessian of the log posterior.
+
+        Uses forward-over-reverse AD (JVP over grad) to compute only the
+        diagonal of the Hessian, avoiding materializing the full dim×dim matrix.
+        Elements are clamped to [1e-6, 1e6] to guard against degenerate
+        curvature far from the MAP.
+
+        Args:
+            jlp: JIT-compiled log posterior function (scalar output).
+            position: 1D JAX array of parameter values (normalized space).
+
+        Returns:
+            1D JAX array of shape (dim,) representing the diagonal
+            inverse mass matrix.
+        """
+        jnlp = lambda p: -jlp(p)
+        grad_fn = jax.grad(jnlp)
+        diag_H = jax.vmap(
+            lambda ei: jax.jvp(grad_fn, (position,), (ei,))[1] @ ei
+        )(jnp.eye(len(position)))
+        return 1.0 / jnp.clip(diag_H, 1e-6, 1e6)
+
+    def _adaptive_window_warmup(self, jlp, rng_key, initial_position, initial_inverse_mass_matrix=None):
         """Run window adaptation in stages, stopping when mass matrix and step size converge."""
         prev_mass = None
         prev_step = None
         position = initial_position
         total_steps = 0
 
+        # Use provided initial mass matrix only for the first stage; subsequent
+        # stages warm-start from the previous stage's adapted mass matrix.
+        current_imm = initial_inverse_mass_matrix
+
         while total_steps < self.adaptive_warmup_max_steps:
             rng_key, sub_key = jax.random.split(rng_key)
 
-            warmup = blackjax.window_adaptation(
-                blackjax.nuts,
-                jlp,
+            warmup_kwargs = dict(
                 is_mass_matrix_diagonal=self.diagonal_mass_matrix,
                 progress_bar=False,
                 initial_step_size=self.step_size_init,
                 target_acceptance_rate=self.target_acceptance_rate,
             )
+            if current_imm is not None:
+                warmup_kwargs["initial_inverse_mass_matrix"] = current_imm
+
+            warmup = blackjax.window_adaptation(blackjax.nuts, jlp, **warmup_kwargs)
             (state, parameters), _ = warmup.run(
                 sub_key, position, self.adaptive_warmup_stage_steps
             )
+            current_imm = None  # Only use initial guess for first stage
 
             mass = parameters["inverse_mass_matrix"]
             step = parameters["step_size"]
@@ -290,12 +321,20 @@ class NUTS(object):
                     initial_positions,
                 )
 
+            if self.mass_matrix_init == "hessian":
+                print("Estimating initial mass matrix from Hessian diagonal...", flush=True)
+                init_imm = self._hessian_mass_matrix(jlp, initial_positions[0])
+                print(f"  imm range: [{float(init_imm.min()):.4f}, {float(init_imm.max()):.4f}]", flush=True)
+            else:
+                init_imm = None
+
             if self.warmup_algorithm == "adaptive_window":
                 print("Running adaptive window warmup", flush=True)
                 keys = jax.random.split(rng_key, 2)
                 rng_key = keys[0]
                 state, parameters = self._adaptive_window_warmup(
-                    jlp, keys[1], initial_positions[0]
+                    jlp, keys[1], initial_positions[0],
+                    initial_inverse_mass_matrix=init_imm,
                 )
                 inverse_mass_matrix = parameters["inverse_mass_matrix"]
                 step_size = parameters["step_size"]
@@ -367,14 +406,16 @@ class NUTS(object):
             else:
                 print("Running window adaptation", flush=True)
 
-                warmup = blackjax.window_adaptation(
-                    blackjax.nuts,
-                    jlp,
+                warmup_kwargs = dict(
                     is_mass_matrix_diagonal=self.diagonal_mass_matrix,
                     progress_bar=False,
                     initial_step_size=self.step_size_init,
                     target_acceptance_rate=self.target_acceptance_rate,
                 )
+                if init_imm is not None:
+                    warmup_kwargs["initial_inverse_mass_matrix"] = init_imm
+
+                warmup = blackjax.window_adaptation(blackjax.nuts, jlp, **warmup_kwargs)
                 if self.parallel_warmup:
                     warmup_pmap = jax.pmap(
                         warmup.run, in_axes=(0, 0, None), static_broadcasted_argnums=2

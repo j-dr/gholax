@@ -60,7 +60,7 @@ def load_model_samples(config_file, compute_sigma8=False, burn_in_frac=0,
 
     # Load samples
     gds = None
-    if sampler in ('NUTS', 'MetropolisHastings'):
+    if sampler in ('NUTS', 'MetropolisHastings', 'MCLMC'):
         samples_path = f'{output_file}.samples_chk.npy'
         logpost_path = f'{output_file}.logposterior_chk.npy'
         if os.path.exists(samples_path):

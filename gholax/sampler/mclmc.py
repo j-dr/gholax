@@ -32,6 +32,8 @@ class MCLMC(object):
 
         self.adjusted = c.get("adjusted", False)
         self.n_steps_warmup = c.get("n_steps_warmup", 5000)
+        self.warmup_tolerance = c.get("warmup_tolerance", 0.2)
+        self.max_warmup_rounds = c.get("max_warmup_rounds", 10)
         self.target_r_minus_one = c.get("target_r_minus_one", 0.1)
         self.n_steps_incr = c.get("n_steps_incr", 50)
         self.n_steps_min = c.get("n_steps_min", 250)
@@ -40,6 +42,7 @@ class MCLMC(object):
         self.restart = c.get("restart", False)
         self.minimize_and_sample = c.get("minimize_and_sample", True)
         self.step_size_init = c.get("step_size_init", 0.01)
+        self.mass_matrix_init = c.get("mass_matrix_init", "ones")  # "ones" or "hessian"
 
         # Adaptation tuning fractions
         self.frac_tune1 = c.get("frac_tune1", 0.1)
@@ -153,39 +156,44 @@ class MCLMC(object):
             print(
                 f"Running MCLMC adaptation "
                 f"({'adjusted' if self.adjusted else 'unadjusted'}, "
-                f"{self.n_steps_warmup} steps)",
+                f"{self.n_steps_warmup} steps/round, "
+                f"tol={self.warmup_tolerance:.0%})",
                 flush=True,
             )
 
-            rng_key, init_key, tune_key = jax.random.split(rng_key, 3)
+            rng_key, init_key = jax.random.split(rng_key)
 
             if self.adjusted:
-                initial_state = blackjax.mcmc.adjusted_mclmc.init(
+                warmup_state = blackjax.mcmc.adjusted_mclmc.init(
                     position=initial_positions[0],
                     logdensity_fn=jlp,
                 )
             else:
-                initial_state = blackjax.mcmc.mclmc.init(
+                warmup_state = blackjax.mcmc.mclmc.init(
                     position=initial_positions[0],
                     logdensity_fn=jlp,
                     rng_key=init_key,
                 )
 
             dim = initial_positions.shape[1]
-            initial_params = MCLMCAdaptationState(
+
+            if self.mass_matrix_init == "hessian":
+                print("Estimating initial mass matrix from Hessian diagonal...", flush=True)
+                init_imm = self._hessian_mass_matrix(jlp, initial_positions[0])
+                print(f"  imm range: [{float(init_imm.min()):.4f}, {float(init_imm.max()):.4f}]", flush=True)
+            else:
+                init_imm = jnp.ones((dim,))
+
+            warmup_params = MCLMCAdaptationState(
                 L=jnp.sqrt(dim),
                 step_size=self.step_size_init,
-                inverse_mass_matrix=jnp.ones((dim,)),
+                inverse_mass_matrix=init_imm,
             )
 
-            if self.adjusted:
-                state, params = self._adapt_adjusted(
-                    jlp, initial_state, tune_key, initial_params
-                )
-            else:
-                state, params = self._adapt_unadjusted(
-                    jlp, initial_state, tune_key, initial_params
-                )
+            state, params = self._adapt_with_convergence(
+                jlp, warmup_state, rng_key, warmup_params
+            )
+            rng_key, _ = jax.random.split(rng_key)
 
             L = params.L
             step_size = params.step_size
@@ -319,6 +327,91 @@ class MCLMC(object):
                 step_size=step_size,
                 inverse_mass_matrix=inverse_mass_matrix,
             )
+
+    def _hessian_mass_matrix(self, jlp, position):
+        """Estimate diagonal inverse mass matrix from the Hessian of the log posterior.
+
+        Uses forward-over-reverse AD (JVP over grad) to compute only the
+        diagonal of the Hessian, avoiding materializing the full dim×dim matrix.
+        Elements are clamped to [1e-6, 1e6] to guard against degenerate
+        curvature far from the MAP.
+
+        Args:
+            jlp: JIT-compiled log posterior function (scalar output).
+            position: 1D JAX array of parameter values (normalized space).
+
+        Returns:
+            1D JAX array of shape (dim,) representing the diagonal
+            inverse mass matrix.
+        """
+        jnlp = lambda p: -jlp(p)
+        grad_fn = jax.grad(jnlp)
+        diag_H = jax.vmap(
+            lambda ei: jax.jvp(grad_fn, (position,), (ei,))[1] @ ei
+        )(jnp.eye(len(position)))
+        return 1.0 / jnp.clip(diag_H, 1e-6, 1e6)
+
+    def _adapt_with_convergence(self, jlp, initial_state, rng_key, initial_params):
+        """Run adaptation rounds until L, step_size, and inverse_mass_matrix converge.
+
+        Calls the underlying adaptation function repeatedly, checking relative
+        change between successive rounds. Stops when all three quantities change
+        by less than warmup_tolerance, or after max_warmup_rounds rounds.
+
+        Args:
+            jlp: JIT-compiled log posterior function.
+            initial_state: Initial MCLMC state.
+            rng_key: JAX random key.
+            initial_params: Initial MCLMCAdaptationState.
+
+        Returns:
+            Tuple of (final state, final MCLMCAdaptationState).
+        """
+        state = initial_state
+        params = initial_params
+
+        for round_num in range(1, self.max_warmup_rounds + 1):
+            rng_key, tune_key = jax.random.split(rng_key)
+            prev_params = params
+
+            if self.adjusted:
+                state, params = self._adapt_adjusted(jlp, state, tune_key, params)
+            else:
+                state, params = self._adapt_unadjusted(jlp, state, tune_key, params)
+
+            rel_L = abs(float(params.L) - float(prev_params.L)) / abs(float(prev_params.L))
+            rel_ss = abs(float(params.step_size) - float(prev_params.step_size)) / abs(float(prev_params.step_size))
+            rel_imm = float(
+                jnp.max(
+                    jnp.abs(params.inverse_mass_matrix - prev_params.inverse_mass_matrix)
+                    / jnp.abs(prev_params.inverse_mass_matrix)
+                )
+            )
+            max_rel_change = max(rel_L, rel_ss, rel_imm)
+
+            print(
+                f"Warmup round {round_num}: "
+                f"L={float(params.L):.4f}, "
+                f"step_size={float(params.step_size):.6f}, "
+                f"max_rel_change={max_rel_change:.4f}",
+                flush=True,
+            )
+
+            if round_num > 1 and max_rel_change < self.warmup_tolerance:
+                print(
+                    f"Warmup converged after {round_num} rounds "
+                    f"(max_rel_change={max_rel_change:.4f} < tol={self.warmup_tolerance:.0%})",
+                    flush=True,
+                )
+                break
+        else:
+            print(
+                f"Warning: Warmup did not converge within {self.max_warmup_rounds} rounds "
+                f"(max_rel_change={max_rel_change:.4f}, tol={self.warmup_tolerance:.0%})",
+                flush=True,
+            )
+
+        return state, params
 
     def _adapt_unadjusted(self, jlp, initial_state, rng_key, initial_params):
         """Run unadjusted MCLMC adaptation."""
