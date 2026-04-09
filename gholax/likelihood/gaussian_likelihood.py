@@ -1,6 +1,6 @@
 import jax.numpy as jnp
 import numpy as np
-from jax import jacobian, jit
+from jax import jacfwd, jit
 from copy import copy
 import yaml
 from .likelihood import Likelihood
@@ -35,7 +35,7 @@ class GaussianLikelihood(Likelihood):
                 [key for key in self.linear_params_dict.keys()]
             )
             self.linear_params_means = {
-                key: self.linear_params_dict[key]["mean"]
+                key: float(self.linear_params_dict[key]["mean"])
                 for key in self.linear_params_dict.keys()
             }
             self.linear_params_stds = jnp.array(
@@ -314,7 +314,7 @@ class GaussianLikelihood(Likelihood):
             return self.predict_model(params, params_am)
 
         model = self.predict_model(params, params_am)
-        templates = jacobian(predict_model_linear_pars)(params_am)
+        templates = jacfwd(predict_model_linear_pars)(params_am)
         templates = jnp.array(list(templates.values()))
 
         diff = (
