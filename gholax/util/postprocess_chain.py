@@ -11,7 +11,7 @@ from gholax.theory.linear_growth import LinearGrowth
 
 
 def load_model_samples(config_file, compute_sigma8=False, burn_in_frac=0,
-                       ignore_chains=[], smooth_scale=-1):
+                       ignore_chains=[], smooth_scale=-1, return_warmup_params=False):
     """Load model, checkpointed samples, and best-fit values from a config file.
 
     Args:
@@ -21,13 +21,20 @@ def load_model_samples(config_file, compute_sigma8=False, burn_in_frac=0,
         burn_in_frac: Fraction of samples to discard as burn-in.
         ignore_chains: List of chain indices to ignore (NUTS/MH only).
         smooth_scale: Smoothing scale for GetDist plots.
+        return_warmup_params: If True, also load and return the warmup
+            parameters for NUTS ({output_file}.nuts_warmup_parameters.json)
+            or MCLMC ({output_file}.mclmc_warmup_parameters.json). Returns
+            None if the file does not exist or the sampler is not NUTS/MCLMC.
 
     Returns:
-        Tuple of (model, gds, best_fit) where:
+        Tuple of (model, gds, best_fit) normally, or
+        (model, gds, best_fit, warmup_params) when return_warmup_params=True.
             model: Instantiated Model object.
             gds: GetDist MCSamples object, or None if no checkpoint exists.
             best_fit: Dict mapping parameter names to best-fit values, or None
                 if no minimization results exist.
+            warmup_params: Dict of warmup parameters, or None (only when
+                return_warmup_params=True).
     """
     with open(config_file, 'r') as fp:
         cfg = yaml.load(fp, Loader=yaml.SafeLoader)
@@ -140,7 +147,21 @@ def load_model_samples(config_file, compute_sigma8=False, burn_in_frac=0,
             best_fit['omegam'] = omegam_val
             best_fit['s8'] = sigma8_val * np.sqrt(omegam_val / 0.3)
 
-    return model, gds, best_fit
+    if not return_warmup_params:
+        return model, gds, best_fit
+
+    warmup_params = None
+    warmup_paths = {
+        'NUTS':  f'{output_file}.nuts_warmup_parameters.json',
+        'MCLMC': f'{output_file}.mclmc_warmup_parameters.json',
+    }
+    if sampler in warmup_paths:
+        warmup_path = warmup_paths[sampler]
+        if os.path.exists(warmup_path):
+            with open(warmup_path, 'r') as fp:
+                warmup_params = json.load(fp)
+
+    return model, gds, best_fit, warmup_params
 
 
 def _build_emu_input(samples_i, names, cosmo_params, like):
