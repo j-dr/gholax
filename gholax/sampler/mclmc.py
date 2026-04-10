@@ -43,6 +43,9 @@ class MCLMC(object):
         self.minimize_and_sample = c.get("minimize_and_sample", True)
         self.step_size_init = c.get("step_size_init", 0.01)
         self.mass_matrix_init = c.get("mass_matrix_init", "ones")  # "ones" or "hessian"
+        # Floor for L to prevent phase-3 collapse when mass matrix is well-tuned.
+        # L >= L_floor_factor * sqrt(dim) * step_size
+        self.L_floor_factor = c.get("L_floor_factor", 1.0)
 
         # Adaptation tuning fractions
         self.frac_tune1 = c.get("frac_tune1", 0.1)
@@ -378,29 +381,28 @@ class MCLMC(object):
         """
         state = initial_state
         params = initial_params
-
-        # When the Hessian provides the initial mass matrix, disable diagonal
-        # preconditioning so blackjax doesn't throw it away and replace it with
-        # a sample-covariance estimate. Only L and step_size will be tuned.
-        diag_precond = self.diagonal_preconditioning and (self.mass_matrix_init != "hessian")
-        if self.mass_matrix_init == "hessian" and self.diagonal_preconditioning:
-            print(
-                "Disabling diagonal_preconditioning to preserve Hessian mass matrix estimate.",
-                flush=True,
-            )
+        dim = initial_params.inverse_mass_matrix.shape[0]
 
         for round_num in range(1, self.max_warmup_rounds + 1):
             rng_key, tune_key = jax.random.split(rng_key)
             prev_params = params
 
             if self.adjusted:
-                state, params = self._adapt_adjusted(
-                    jlp, state, tune_key, params, diagonal_preconditioning=diag_precond
-                )
+                state, params = self._adapt_adjusted(jlp, state, tune_key, params)
             else:
-                state, params = self._adapt_unadjusted(
-                    jlp, state, tune_key, params, diagonal_preconditioning=diag_precond
+                state, params = self._adapt_unadjusted(jlp, state, tune_key, params)
+
+            # Clamp L to prevent phase-3 collapse when ESS is high (blackjax
+            # phase 3 computes L = 0.4 * step_size * mean(num_steps_3 / ess),
+            # which collapses when the mass matrix is already well-tuned).
+            L_min = float(self.L_floor_factor) * float(jnp.sqrt(dim)) * float(params.step_size)
+            if float(params.L) < L_min:
+                print(
+                    f"Warmup round {round_num}: L={float(params.L):.6f} below floor "
+                    f"{L_min:.6f}; clamping.",
+                    flush=True,
                 )
+                params = params._replace(L=jnp.asarray(L_min))
 
             rel_L = abs(float(params.L) - float(prev_params.L)) / (abs(float(prev_params.L)) + 1e-10)
             rel_ss = abs(float(params.step_size) - float(prev_params.step_size)) / (abs(float(prev_params.step_size)) + 1e-10)
