@@ -46,6 +46,7 @@ class Nx2PTAngularPowerSpectrum(GaussianLikelihood):
         self.redshift_uncertainty = c.get('redshift_uncertainty', 'delta_z')
         lens_bin_mapping = c.get("lens_bin_mapping", {})
         source_bin_mapping = c.get("source_bin_mapping", {})
+        ia_tag = c.get("ia_tag", "")
 
         self.observed_data_vector = TwoPointSpectrum(
             zmin=self.zmin_proj,
@@ -200,6 +201,7 @@ class Nx2PTAngularPowerSpectrum(GaussianLikelihood):
                     nk=self.nk,
                     lens_bin_mapping=lens_bin_mapping,
                     source_bin_mapping=source_bin_mapping,
+                    ia_tag=ia_tag,
                     **config_theory.get("RealSpaceIAExpansion", {}),
                 ),
                 Limber(

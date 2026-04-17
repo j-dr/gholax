@@ -360,6 +360,7 @@ class RealSpaceIAExpansion(LikelihoodModule):
         self.lens_bin_mapping = config.get("lens_bin_mapping", {})
         self.source_bin_mapping = config.get("source_bin_mapping", {})
         self.independent_p_mi_ct = config.get('independent_p_mi_ct', False)
+        self.ia_tag = config.get("ia_tag", "")
 #        self.include_ia_shapenoise = config.get('include_ia_shapenoise')
         
         if self.independent_p_mi_ct:
@@ -425,7 +426,19 @@ class RealSpaceIAExpansion(LikelihoodModule):
                 ["c_s", "c_ds", "c_s2", "c_L2", "c_3", "c_dt", "alpha_s", "sigma_s"],
             ],
         }
-        
+
+        if self.ia_tag:
+            # Insert the tag right after each IA base name so that downstream
+            # suffix conventions (bin and spline indices) stay rightmost.
+            # Density-bias entries (b_*) describe lens galaxies and are shared
+            # with RealSpaceBiasExpansion, so they are left untouched.
+            def _tag(name):
+                return name if name.startswith("b_") else f"{name}_{self.ia_tag}"
+            self.spectrum_params = {
+                stype: [[_tag(p) for p in lst] for lst in lists]
+                for stype, lists in self.spectrum_params.items()
+            }
+
         self.spectrum_basis = {
             "p_ii_ee": "p_mij_real_space_shape_shape_grid",
             "p_ii_22_0": "p_mij_real_space_shape_shape_grid",
