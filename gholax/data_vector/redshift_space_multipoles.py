@@ -49,7 +49,8 @@ class RedshiftSpaceMultipoles(DataVector):
             spectrum_info: Dict of spectrum type configs (bins, cross-correlations).
             ells: Tuple of multipole orders to include (default: (0, 2, 4)).
             scale_cuts: Optional dict of (k_min, k_max) per bin pair and ell.
-            covariance_info: Optional dict with f_sky and noise for Gaussian covariance.
+            covariance_info: Optional dict with v_survey (survey volume) and
+                noise for the Gaussian P_ell(k) covariance.
             dummy_cov: If True, skip loading the covariance matrix.
             generate_data_vector: If True, generate a synthetic data vector.
             zmin: Minimum redshift for n(z) interpolation grid.
@@ -512,13 +513,16 @@ class RedshiftSpaceMultipoles(DataVector):
         )
 
     def _ensure_covariance_info(self):
-        """Prompt interactively for any f_sky or noise terms missing from covariance_info."""
+        """Prompt interactively for any v_survey or noise terms missing from covariance_info."""
         if self.covariance_info is None:
             self.covariance_info = {}
 
-        if "f_sky" not in self.covariance_info:
-            val = input("f_sky not found in config. Enter f_sky: ")
-            self.covariance_info["f_sky"] = float(val)
+        # P_ell(k) mode counting uses the survey volume, not a sky fraction.
+        if "v_survey" not in self.covariance_info:
+            val = input(
+                "v_survey (survey volume, [Mpc/h]^3) not found in config. Enter v_survey: "
+            )
+            self.covariance_info["v_survey"] = float(val)
 
         for t in self.spectrum_info:
             if t not in self.covariance_info:
@@ -547,21 +551,26 @@ class RedshiftSpaceMultipoles(DataVector):
         Returns:
             Array of variance values per k bin.
         """
-        c0 = f"c_{covariance_field_types[si][0]}{covariance_field_types[sj][0]}"
-        if c0 not in field_types:
-            c0 = f"c_{covariance_field_types[sj][0]}{covariance_field_types[si][0]}"
+        # Resolve the four constituent spectra of the disconnected (Gaussian)
+        # covariance term (P_ac P_bd + P_ad P_bc). Each entry pairs one field
+        # of spectrum ``si`` with one field of spectrum ``sj``; the spectrum
+        # that connects those two fields is found by inverting
+        # ``covariance_field_types`` (which maps a spectrum type to its two
+        # field labels). This replaces the "c_" + field-concatenation string
+        # trick from the 2pt (C_ell) class, whose key format assumes the
+        # spectrum type IS "c_<f0><f1>" and does not hold for P_ell(k) keys
+        # such as "p_gg_ell".
+        field_to_spectrum = {}
+        for stype, fields in covariance_field_types.items():
+            field_to_spectrum[(fields[0], fields[1])] = stype
+            field_to_spectrum[(fields[1], fields[0])] = stype
 
-        c1 = f"c_{covariance_field_types[si][1]}{covariance_field_types[sj][1]}"
-        if c1 not in field_types:
-            c1 = f"c_{covariance_field_types[sj][1]}{covariance_field_types[si][1]}"
-
-        c2 = f"c_{covariance_field_types[si][0]}{covariance_field_types[sj][1]}"
-        if c2 not in field_types:
-            c2 = f"c_{covariance_field_types[sj][1]}{covariance_field_types[si][0]}"
-
-        c3 = f"c_{covariance_field_types[si][1]}{covariance_field_types[sj][0]}"
-        if c3 not in field_types:
-            c3 = f"c_{covariance_field_types[sj][0]}{covariance_field_types[si][1]}"
+        fi0, fi1 = covariance_field_types[si]
+        fj0, fj1 = covariance_field_types[sj]
+        c0 = field_to_spectrum[(fi0, fj0)]
+        c1 = field_to_spectrum[(fi1, fj1)]
+        c2 = field_to_spectrum[(fi0, fj1)]
+        c3 = field_to_spectrum[(fi1, fj0)]
 
         spec_w_n = []
         for spec, za, zb, f0, f1 in zip(
@@ -581,21 +590,23 @@ class RedshiftSpaceMultipoles(DataVector):
                 covariance_field_types[sj][0],
             ],
         ):
+            # ``spectrum_type`` is stored as bytes (S10); encode the str key.
+            spec_key = spec.encode("utf-8") if isinstance(spec, str) else spec
             if (za, zb) in self.spectrum_info[spec]["bin_pairs"]:
                 c_w_n = self.spectra["value"][
-                    (self.spectra["spectrum_type"] == spec)
+                    (self.spectra["spectrum_type"] == spec_key)
                     & (self.spectra["zbin0"] == za)
                     & (self.spectra["zbin1"] == zb)
                 ] + float(self.covariance_info[spec][f"{za}_{zb}"]["noise"])
             elif covariance_field_types[spec][0] == covariance_field_types[spec][1]:
                 c_w_n = self.spectra["value"][
-                    (self.spectra["spectrum_type"] == spec)
+                    (self.spectra["spectrum_type"] == spec_key)
                     & (self.spectra["zbin0"] == zb)
                     & (self.spectra["zbin1"] == za)
                 ] + float(self.covariance_info[spec][f"{zb}_{za}"]["noise"])
             elif f1 == "d":
                 c_w_n = self.spectra["value"][
-                    (self.spectra["spectrum_type"] == spec)
+                    (self.spectra["spectrum_type"] == spec_key)
                     & (self.spectra["zbin0"] == zb)
                     & (self.spectra["zbin1"] == za)
                 ] + float(self.covariance_info[spec][f"{zb}_{za}"]["noise"])
@@ -606,16 +617,39 @@ class RedshiftSpaceMultipoles(DataVector):
 
             spec_w_n.append(c_w_n)
 
-        var = (
-            4
-            * np.pi
-            * (spec_w_n[0] * spec_w_n[1] + spec_w_n[2] * spec_w_n[3])
-            / (
-                float(self.covariance_info["f_sky"])
-                * self.delta_ell
-                * (2 * self.ell_eff)
-            )
+        # k value for every entry of the block being filled. Taken from
+        # spectrum ``si``'s own (z00, z01) rows so it aligns with the numerator
+        # arrays (same k-grid across all constituent spectra).
+        si_key = si.encode("utf-8") if isinstance(si, str) else si
+        k_block = self.spectra["separation"][
+            (self.spectra["spectrum_type"] == si_key)
+            & (self.spectra["zbin0"] == z00)
+            & (self.spectra["zbin1"] == z01)
+        ]
+
+        # Width of the k shells. Defined once in ``generate_data``; fall back to
+        # the ``ko_eff`` spacing if a data vector was loaded without it.
+        delta_k = getattr(self, "delta_k", None)
+        if delta_k is None:
+            delta_k = float(np.diff(np.asarray(self.ko_eff)).mean())
+
+        # Gaussian (disconnected) covariance of P_ell(k) bandpowers from mode
+        # counting in spherical k-shells:
+        #   N_modes(k) = V_survey * k^2 * delta_k / (2 * pi^2)
+        #   Var[P(k)]  = (P_ac P_bd + P_ad P_bc) / N_modes(k)
+        # For a single-tracer auto-spectrum the numerator reduces to
+        # 2 (P + 1/nbar)^2, i.e. the textbook 2 P^2 / N_modes result. This
+        # mirrors the 2pt (C_ell) class, where the denominator is likewise the
+        # number of independent modes in the bandpower
+        # (N_modes = f_sky * (2 ell + 1) * delta_ell).
+        n_modes = (
+            float(self.covariance_info["v_survey"])
+            * k_block**2
+            * delta_k
+            / (2.0 * np.pi**2)
         )
+
+        var = (spec_w_n[0] * spec_w_n[1] + spec_w_n[2] * spec_w_n[3]) / n_modes
 
         return var
 
