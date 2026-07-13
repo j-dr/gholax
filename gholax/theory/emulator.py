@@ -7,56 +7,6 @@ import numpy as np
 import yaml
 
 
-class NNPowerSpectrumInterpolator(object):
-    """Wrapper providing a P(z, k) interface around a spectrum emulator and sigma8(z) emulator."""
-
-    def __init__(self, emu, sigma8z_emu, cosmo_params, nz_max=200, nonu=False):
-        """Initialize the interpolator.
-
-        Args:
-            emu: Emulator instance for the power spectrum.
-            sigma8z_emu: ScalarEmulator instance for sigma8(z).
-            cosmo_params: Array of cosmological parameters [As, ns, H0, w, ombh2, omch2, mnu].
-            nz_max: Maximum number of redshift bins to pre-allocate.
-            nonu: If True, skip log10 transform of neutrino mass parameter.
-        """
-        self.emu = emu
-        self.sigma8z_emu = sigma8z_emu
-        self.cosmo_params = jnp.copy(cosmo_params)
-        # set zero neutrino mass to 1e-2 eV (this is the boundary of our training data)
-        if not nonu:
-            if self.cosmo_params[-1] != 0:
-                self.cosmo_params = self.cosmo_params.at[-1].set(
-                    jnp.log10(self.cosmo_params[-1])
-                )
-            else:
-                self.cosmo_params = self.cosmo_params.at[-1].set(-2)
-
-        self.cparam_grid = jnp.zeros((nz_max, len(self.cosmo_params) + 1))
-        self.cparam_grid = self.cparam_grid.at[:, :-1].set(self.cosmo_params)
-
-    def P(self, z, k):
-        """Evaluate the power spectrum at given redshifts and wavenumbers.
-
-        Args:
-            z: Array of redshift values.
-            k: Array of wavenumber values in h/Mpc.
-
-        Returns:
-            2D array of shape (len(k), len(z)) with P(k, z) values.
-        """
-        self.cparam_grid = self.cparam_grid.at[: len(z), -1].set(z)
-        sigma8z = self.sigma8z_emu.predict(self.cparam_grid[: len(z)])[:, 0]
-        self.cparam_grid = self.cparam_grid.at[: len(z), -1].set(sigma8z)
-
-        k_emu, p = self.emu.predict(self.cparam_grid[: len(z)])
-        p_result = jnp.zeros((len(k), len(z)))
-        for i in range(len(z)):
-            p_result = p_result.at[:, i].set(jnp.interp(k, k_emu, p[:, i]))
-
-        return p_result
-
-
 def activation(x, alpha, beta):
     """
     Swish-like activation function with learnable parameters.
