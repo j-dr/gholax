@@ -1,4 +1,3 @@
-import jax.numpy as jnp
 import numpy as np
 from copy import copy
 from jax import lax
@@ -59,24 +58,6 @@ class LikelihoodModule(object):
 
         self.required_params = np.unique(self.required_params)
 
-    def check_cache(self, state, params_values):
-        """
-        Check to see whether parameters required for this module
-        have changed from the last time this module was called.
-        If they have then need to recompute.
-
-        Args:
-            params_values dict: Dictionary of parameter values
-
-        Returns:
-            bool : Whether the required parameters for this module
-                   are the same as the last call.
-        """
-
-        params = jnp.array([params_values[p] for p in self.required_params])
-        last_params = jnp.array([state["last_params"][p] for p in self.required_params])
-        return jnp.any(params != last_params)
-
     def get_required_inputs(self, state):
         """Extract the required input values from the state dict.
 
@@ -99,13 +80,3 @@ class LikelihoodModule(object):
             params_values dict: Dictionary of parameter values.
         """
         pass
-
-    def check_cache_and_compute(self, state, params_values):
-        """Calculates stuff, assuming that there are things in the cache.
-        Default method just calls compute. Overload method to do more.
-
-        Args:
-            state dict: Inputs are contained here and outputs are written.
-            params_values dict: Dictionary of parameter values.
-        """
-        return self.compute(state, params_values)
