@@ -1,3 +1,5 @@
+import copy
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -104,28 +106,32 @@ class Limber(LikelihoodModule):
 
         self.all_spectra = {}
 
+        # Instance copy: the module-level dict must never be mutated, or two
+        # likelihoods with different settings cross-contaminate each other.
+        self.required_components = copy.deepcopy(required_components)
+
         if (not self.magnification_x_ia) & (not self.no_ia):
-            required_components["c_dk"] = [
+            self.required_components["c_dk"] = [
                 (("w_d_dk", "w_k"), ("p_gm",0), "zeff_w_d_dk"),
                 (("w_mag_dk", "w_k"), ("p_mm",0), "z_limber"),
                 (("w_d_dk", "w_ia"), ("p_gi",0), "zeff_w_d_dk"),
             ]
 
         if self.no_ia:
-            required_components["c_dk"] = [
+            self.required_components["c_dk"] = [
                 (("w_d_dk", "w_k"), ("p_gm",0), "zeff_w_d_dk"),
                 (("w_mag_dk", "w_k"), ("p_mm",0), "z_limber"),
             ]
 
-            required_components["c_kk"] = [
+            self.required_components["c_kk"] = [
                 (("w_k", "w_k"), ("p_mm",0), "z_limber"),
             ]
 
-            required_components["c_bb"] = []
+            self.required_components["c_bb"] = []
 
         if "c_dd" in self.spectrum_info:
             if self.spectrum_info["c_dd"]["use_cross"]:
-                required_components["c_dd"] = [
+                self.required_components["c_dd"] = [
                     (("w_d", "w_d"), ("p_gg",0), "zeff_w_d"),
                     (("w_mag", "w_d"), ("p_gm",1), "zeff_w_d"),
                     (("w_d", "w_mag"), ("p_gm",0), "zeff_w_d"),
@@ -139,7 +145,7 @@ class Limber(LikelihoodModule):
             self.all_spectra[t] = []
             self.output_requirements[t] = []
 
-            for (w_i, w_j), (p, td_), zfield_ in required_components[t]:
+            for (w_i, w_j), (p, td_), zfield_ in self.required_components[t]:
                 self.output_requirements[f"{w_i}_{w_j}"] = [w_i, w_j, p]
                 self.output_requirements[t].extend([w_i, w_j, p])
                 
@@ -174,24 +180,29 @@ class Limber(LikelihoodModule):
 
         nz_proj = self.nz_proj
 
-        def compute_component_c_l_chi(carry, x):
-            w_i, w_j, s, zfield = x
-
+        def _interp_to_proj(s_one, zfield_one):
             # Factor 2D interpolation into two 1D steps:
             # Step 1: interpolate s(k, z_pk) along z at the projection redshifts.
-            # zfield is either (n_ell, nz_proj) or scalar (zeff per bin pair).
-            if zfield.ndim >= 2:
-                z_query = zfield[0, :]  # (nz_proj,) — constant across ells
+            # zfield_one is (n_ell, nz_proj), (nz_proj,), or scalar (zeff).
+            if zfield_one.ndim >= 2:
+                z_query = zfield_one[0, :]  # (nz_proj,) — constant across ells
+            elif zfield_one.ndim == 1:
+                z_query = zfield_one
             else:
-                z_query = jnp.broadcast_to(zfield.reshape(1), (nz_proj,))
+                z_query = jnp.broadcast_to(zfield_one.reshape(1), (nz_proj,))
 
             s_at_zproj = interp1d(
-                z_query, self.z_pk, s.T, extrap=0.0, method=interp_method,
+                z_query, self.z_pk, s_one.T, extrap=0.0, method=interp_method,
             ).T  # (nk, nz_proj)
 
             # Step 2: for each z_proj column, interpolate in k at k=(ell+0.5)/chi.
             # log_kval[:, j] differs per column; vmap over the nz_proj axis.
-            p_ij = _interp_k_all_columns(log_kval, s_at_zproj)  # (n_ell, nz_proj)
+            return _interp_k_all_columns(log_kval, s_at_zproj)  # (n_ell, nz_proj)
+
+        def compute_component_c_l_chi(carry, x):
+            w_i, w_j, s, zfield = x
+
+            p_ij = _interp_to_proj(s, zfield)
 
             if self.k_cutoff is not None:
                 mask = k < self.k_cutoff
@@ -205,11 +216,22 @@ class Limber(LikelihoodModule):
 
             return carry, c_l_chi
 
-        for (w_i_, w_j_), (spectrum_, td_), zfield_ in required_components[spec_type]:
+        for (w_i_, w_j_), (spectrum_, td_), zfield_ in self.required_components[spec_type]:
             w_i = state[w_i_]
             w_j = state[w_j_]
             s = state[spectrum_]
             zfield = state[zfield_]
+
+            # A spectrum with a single row on the shared z grid is identical
+            # for every bin pair — interpolate it once instead of per pair.
+            interp_shared = (
+                (s.ndim == 3)
+                and (s.shape[0] == 1)
+                and (zfield_ == "z_limber")
+                and (zfield.ndim == 1)
+            )
+            s_orig = s
+            zfield_orig = zfield
 
             n_i = w_i.shape[0]
 
@@ -280,8 +302,29 @@ class Limber(LikelihoodModule):
                     if s.shape[0] == 1:
                         s = jnp.tile(s, (n_i, 1, 1))
 
-            xs = [w_i, w_j, s, zfield]
-            _, c_l_chi_w_i_w_j = scan(compute_component_c_l_chi, None, xs)
+            if interp_shared:
+                # One interpolation for all bin pairs; identical elementwise
+                # ops as the scan body, broadcast over the pair axis. The
+                # tiled s/zfield above are unused here and DCE'd under jit.
+                p_ij = _interp_to_proj(s_orig[0], zfield_orig)
+                if self.k_cutoff is not None:
+                    mask = k < self.k_cutoff
+                else:
+                    mask = jnp.ones_like(k)
+                c_l_chi_w_i_w_j = (
+                    w_i[:, None, :]
+                    * w_j[:, None, :]
+                    * p_ij[None, :, :]
+                    / state["chi_z_limber"][None, None, :] ** 2
+                    * mask[None, :, :]
+                )
+                if self.non_parametric_growth:
+                    c_l_chi_w_i_w_j = c_l_chi_w_i_w_j * (
+                        state["A_growth_chi"][None, None, :] ** 2
+                    )
+            else:
+                xs = [w_i, w_j, s, zfield]
+                _, c_l_chi_w_i_w_j = scan(compute_component_c_l_chi, None, xs)
             state[f"{w_i_}_{w_j_}"] = c_l_chi_w_i_w_j
             if spec_type in state:
                 state[spec_type] += c_l_chi_w_i_w_j

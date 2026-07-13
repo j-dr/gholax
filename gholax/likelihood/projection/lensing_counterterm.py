@@ -1,3 +1,4 @@
+import copy
 import warnings
 
 import jax.numpy as jnp
@@ -77,8 +78,10 @@ class LensingCounterterm(LikelihoodModule):
                 )
 
         self.all_spectra = {}
+        # Instance copy: never mutate the module-level dict shared with Limber.
+        self.required_components = copy.deepcopy(required_components)
         if not self.magnification_x_ia:
-            required_components["c_dk"] = [
+            self.required_components["c_dk"] = [
                 (("w_d_dk", "w_k"), ("p_gm",0), "zeff_w_d_dk"),
                 (("w_mag_dk", "w_k"), ("p_mm",0), "z_limber"),
                 (("w_d_dk", "w_ia"), ("p_gi",0), "zeff_w_d_dk"),
@@ -101,7 +104,7 @@ class LensingCounterterm(LikelihoodModule):
 
         for t in self.spectrum_types:
             self.output_requirements[f"{t}_w_lensing_ct"] = []
-            for (w_i, w_j), (p, td_), zfield_ in required_components[t]:
+            for (w_i, w_j), (p, td_), zfield_ in self.required_components[t]:
                 if (w_i in self.lensing_kernels) & (w_j in self.lensing_kernels):
                     self.output_requirements[f"{t}_w_lensing_ct"].extend(
                         self.lensing_counterterms
@@ -348,7 +351,7 @@ class LensingCounterterm(LikelihoodModule):
         for t in self.spectrum_types:
             add_ct = False
             if self.lensing_counterterm_order > 0:
-                for (w_i, w_j), _, _ in required_components[t]:
+                for (w_i, w_j), _, _ in self.required_components[t]:
                     if (w_i in self.lensing_kernels) & (w_j in self.lensing_kernels):
                         w_i_n = self.w_n(w_i, state)
                         w_j_n = self.w_n(w_j, state)
