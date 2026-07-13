@@ -124,7 +124,7 @@ class ProjectionKernels(LikelihoodModule):
                             self.indexed_params[k].append("NA")  # returns zero
             self.indexed_params[k] = np.array(self.indexed_params[k])[:, None]
 
-    def compute_w_d(self, e_z, chi_z, omega_m, nz, smags, z, chi_star):
+    def compute_w_d(self, e_z, chi_z, omega_m, nz, smags, z, chi_star, lensing_geom=None):
         """Compute the galaxy/density projection kernel W_d(chi)."""
         w_d = jnp.zeros_like(nz)
 
@@ -137,15 +137,15 @@ class ProjectionKernels(LikelihoodModule):
 
         return w_d, zeff_d, jnp.zeros_like(zeff_d)
 
-    def compute_w_d_dk(self, e_z, chi_z, omega_m, nz, smags, z, chi_star):
+    def compute_w_d_dk(self, e_z, chi_z, omega_m, nz, smags, z, chi_star, lensing_geom=None):
         """Compute the galaxy kernel for density-shear cross correlations."""
         return self.compute_w_d(e_z, chi_z, omega_m, nz, smags, z, chi_star)
 
-    def compute_w_d_dcmbk(self, e_z, chi_z, omega_m, nz, smags, z, chi_star):
+    def compute_w_d_dcmbk(self, e_z, chi_z, omega_m, nz, smags, z, chi_star, lensing_geom=None):
         """Compute the galaxy kernel for density-CMB lensing cross correlations."""
         return self.compute_w_d(e_z, chi_z, omega_m, nz, smags, z, chi_star)
 
-    def compute_w_ia(self, e_z, chi_z, omega_m, nz, smags, z, chi_star):
+    def compute_w_ia(self, e_z, chi_z, omega_m, nz, smags, z, chi_star, lensing_geom=None):
         """Compute the intrinsic alignment projection kernel."""
         rho_c = 2.7754e11
         c1_bar = 5e-14
@@ -156,8 +156,15 @@ class ProjectionKernels(LikelihoodModule):
 
         return -om_fid * rho_c * c1_bar * w_ia, zeff_ia, ichi_inv
 
-    def compute_w_k(self, e_z, chi_z, omega_m, nz, smags, z, chi_star):
-        """Compute the lensing convergence kernel W_kappa(chi)."""
+    def compute_lensing_geometry(self, e_z, chi_z, z):
+        """Compute the n(z)-independent lensing-efficiency geometry.
+
+        Returns the integration grid ``chivalp`` (nchi, nchi), the source-plane
+        geometric factor ``g_geom``, and ``Ez`` evaluated on the grid. These
+        depend only on (e_z, chi_z, z) — not on the source/lens n(z) — so they
+        can be computed once per evaluation and reused by ``compute_w_k`` for
+        every lensing/magnification kernel (w_k, w_mag, w_mag_dk, w_mag_dcmbk).
+        """
         nchi = chi_z.shape[0]
         cmax = jnp.max(chi_z) * 1.1
 
@@ -176,6 +183,19 @@ class ProjectionKernels(LikelihoodModule):
 
         g_geom = (chivalp - chi_z[None, :]) / chivalp
 
+        return chivalp, zvalp, Ez, g_geom
+
+    def compute_w_k(self, e_z, chi_z, omega_m, nz, smags, z, chi_star, lensing_geom=None):
+        """Compute the lensing convergence kernel W_kappa(chi).
+
+        The expensive (nchi, nchi) geometry is n(z)-independent; pass a
+        precomputed ``lensing_geom`` (from ``compute_lensing_geometry``) to reuse
+        it across kernels instead of recomputing it per source n(z).
+        """
+        if lensing_geom is None:
+            lensing_geom = self.compute_lensing_geometry(e_z, chi_z, z)
+        chivalp, zvalp, Ez, g_geom = lensing_geom
+
         def f(carry, nz_i):
             dndz_n = jnp.interp(zvalp, z, nz_i, left=0, right=0)
             g = g_geom * dndz_n * Ez / 2997.925
@@ -189,7 +209,7 @@ class ProjectionKernels(LikelihoodModule):
 
         return w_k, jnp.ones_like(ichi_eff), ichi_eff
 
-    def compute_c_cmbk(self, e_z, chi_z, omega_m, nz, smags, z, chi_star):
+    def compute_c_cmbk(self, e_z, chi_z, omega_m, nz, smags, z, chi_star, lensing_geom=None):
         """Compute the CMB lensing convergence kernel."""
         w_cmbk = 1.5 * omega_m * (1.0 / 2997.925) ** 2 * (1 + z)
         w_cmbk *= chi_z * (chi_star - chi_z) / chi_star
@@ -197,10 +217,15 @@ class ProjectionKernels(LikelihoodModule):
 
         return w_cmbk, jnp.ones_like(ichi_eff), ichi_eff
 
-    def compute_w_mag(self, e_z, chi_z, omega_m, nz, smags, z, chi_star):
-        """Compute the magnification bias kernel, scaled by (5s-2)."""
+    def compute_w_mag(self, e_z, chi_z, omega_m, nz, smags, z, chi_star, lensing_geom=None):
+        """Compute the magnification bias kernel, scaled by (5s-2).
+
+        Reuses the cached, n(z)-independent lensing geometry (``lensing_geom``)
+        for the underlying W_kappa integral; only the (5s-2) scaling is
+        magnification-specific.
+        """
         w_mag, zeff, ichi_eff = self.compute_w_k(
-            e_z, chi_z, omega_m, nz, smags, z, chi_star
+            e_z, chi_z, omega_m, nz, smags, z, chi_star, lensing_geom=lensing_geom
         )
 
         def f(ii, x):
@@ -212,13 +237,17 @@ class ProjectionKernels(LikelihoodModule):
         _, w_mag = jax.lax.scan(f, 0, [w_mag, smags])
         return w_mag, zeff, ichi_eff
 
-    def compute_w_mag_dk(self, e_z, chi_z, omega_m, nz, smags, z, chi_star):
+    def compute_w_mag_dk(self, e_z, chi_z, omega_m, nz, smags, z, chi_star, lensing_geom=None):
         """Compute the magnification kernel for density-shear cross correlations."""
-        return self.compute_w_mag(e_z, chi_z, omega_m, nz, smags, z, chi_star)
+        return self.compute_w_mag(
+            e_z, chi_z, omega_m, nz, smags, z, chi_star, lensing_geom=lensing_geom
+        )
 
-    def compute_w_mag_dcmbk(self, e_z, chi_z, omega_m, nz, smags, z, chi_star):
+    def compute_w_mag_dcmbk(self, e_z, chi_z, omega_m, nz, smags, z, chi_star, lensing_geom=None):
         """Compute the magnification kernel for density-CMB lensing cross correlations."""
-        return self.compute_w_mag(e_z, chi_z, omega_m, nz, smags, z, chi_star)
+        return self.compute_w_mag(
+            e_z, chi_z, omega_m, nz, smags, z, chi_star, lensing_geom=lensing_geom
+        )
 
     def compute(self, state, params_values):
         """Compute all required projection kernels and write to state."""
@@ -248,6 +277,11 @@ class ProjectionKernels(LikelihoodModule):
             _, nz = jax.lax.scan(f, None, nz)
             interpolated_nzs[nz_name] = nz
 
+        # The (nchi, nchi) lensing-efficiency geometry depends only on
+        # (e_z, chi_z, z), not on the source/lens n(z), so compute it once and
+        # reuse across every lensing/magnification kernel (w_k, w_mag*).
+        lensing_geom = self.compute_lensing_geometry(e_z, chi_z_proj, z_limber)
+
         for k in self.all_kernels:
             nz_name = self.kernel_nz[k]
             nz = interpolated_nzs[nz_name]
@@ -267,7 +301,8 @@ class ProjectionKernels(LikelihoodModule):
                 smag = jnp.zeros(0)
 
             w, z_eff, ichi_eff = kernel(
-                e_z, chi_z_proj, state["omegam"], nz, smag, z_limber, chi_star
+                e_z, chi_z_proj, state["omegam"], nz, smag, z_limber, chi_star,
+                lensing_geom=lensing_geom,
             )
             if k in ["w_d_dk", "w_mag_dk"]:
                 w = w.reshape((self.n_dbins, self.n_sbins, -1))
