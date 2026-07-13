@@ -543,6 +543,18 @@ class RedshiftSpaceBiasExpansion(LikelihoodModule):
                         self.spectrum_basis["p_gg_ell"]
                     )
 
+        if self.compute_p_gg_cross:
+            raise NotImplementedError(
+                "RSD galaxy-galaxy cross-spectra are not implemented "
+                "(compute_p_gg_cross=True, triggered by "
+                "spectrum_info['p_gg_ell']['use_cross']=True). The cross compute "
+                "path in RedshiftSpaceBiasExpansion.compute references unbound "
+                "variables (bias_params, s8z, fz, aap are assigned only in the "
+                "auto-spectrum branch), and combine_lpt_redshift_space_gg_cross_spectra "
+                "unconditionally raises NotImplementedError. Set "
+                "spectrum_info['p_gg_ell']['use_cross']=False to use RSD p_gg_ell."
+            )
+
         self.dbins = jnp.unique(jnp.array(self.dbins))
         self.n_dbins = self.dbins.shape[0]
 

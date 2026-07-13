@@ -330,20 +330,6 @@ class RealSpaceBiasedTracerSpectra(LikelihoodModule):
 
         return state
 
-    def compute_p11_boltz_analytic(self, state, params_values):
-        boltz = state["boltzmann_results"]
-        h = params_values["H0"] / 100
-
-        pk_m = np.zeros((self.nz, self.nk))
-
-        for i, z in enumerate(self.z):
-            for j, k in enumerate(self.k):
-                pk_m[i, j] = boltz.pk(k * h, z) * h**3
-
-        state["p_11_real_space_bias_grid"] = pk_m
-
-        return state
-
     def compute(self, state, params_values):
         """Compute real-space biased tracer basis spectra and write to state."""
         if self.use_emulator:
