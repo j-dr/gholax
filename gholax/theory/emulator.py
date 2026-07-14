@@ -28,6 +28,150 @@ def activation(x, alpha, beta):
     )
 
 
+def _resolve_emu_config(config, abspath=False, data_dir=None,
+                        empty_data_dir_on_abspath=False):
+    """Resolve an emulator YAML config name/dict to (cfg dict, data_dir).
+
+    Relative config names are resolved against data_dir (default:
+    emu_weights/ next to this file). With abspath=True the config is opened
+    as given (or used directly if already a dict);
+    empty_data_dir_on_abspath reproduces MultiSpectrumEmulator's convention
+    of blanking data_dir so weight paths come verbatim from the config.
+    """
+    if not abspath:
+        if data_dir is None:
+            data_dir = "/".join(
+                [
+                    os.path.dirname(os.path.realpath(__file__)),
+                    "emu_weights",
+                ]
+            )
+
+            if type(config) is not dict:
+                config_abspath = "/".join(
+                    [
+                        data_dir,
+                        config,
+                    ]
+                )
+        else:
+            if type(config) is not dict:
+                config_abspath = "/".join(
+                    [
+                        data_dir,
+                        config,
+                    ]
+                )
+
+        with open(config_abspath, "r") as fp:
+            cfg = yaml.load(fp, Loader=yaml.SafeLoader)
+    else:
+        if type(config) is not dict:
+            config_abspath = config
+            with open(config_abspath, "r") as fp:
+                cfg = yaml.load(fp, Loader=yaml.SafeLoader)
+        else:
+            cfg = config
+
+        if empty_data_dir_on_abspath:
+            data_dir = ""
+
+    return cfg, data_dir
+
+
+def _load_h5_weights(filebase, scale_As=False, As_param_order=None,
+                     first_layer_param_order=None, param_idx=None):
+    """Load MLP weights from filebase.h5 into a dict of jnp arrays.
+
+    Args:
+        filebase: Path to the weight file (without .h5 extension).
+        scale_As: Multiply the As entry of param_mean/param_sigmas by 1e9.
+        As_param_order: Parameter order used to locate As (index 0 if None).
+        first_layer_param_order: When given, the first W layer's input width
+            is asserted against its length and the layer is reordered by
+            param_idx; param_mean/param_sigmas are reordered as well.
+        param_idx: Index list mapping the weights' parameter order to the
+            caller's input parameter order.
+    """
+    out = {}
+    with h5.File("{}.h5".format(filebase), "r") as weights:
+        for k in weights:
+            if k in ["W", "b", "alphas", "betas"]:
+                w = []
+                for i, wi in enumerate(weights[k]):
+                    w.append(weights[k][wi][:].astype(np.float32))
+                    if (first_layer_param_order is not None) & (i == 0) & (k == "W"):
+                        assert w[i].shape[0] == len(first_layer_param_order)
+                        w[i] = w[i][param_idx, :]
+                    w[i] = jnp.array(w[i]).astype(jnp.float32)
+
+            elif k in ["param_mean", "param_sigmas"]:
+                w = np.array(weights[k][f'{k}_0']).astype(np.float32)
+                if scale_As:
+                    if As_param_order is not None:
+                        w[As_param_order.index("As")] *= 1e9
+                    else:
+                        w[0] *= 1e9
+                if first_layer_param_order is not None:
+                    w = w[param_idx]
+
+                w = jnp.array(w).astype(jnp.float32)
+
+            else:
+                w = jnp.array(weights[k][f'{k}_0']).astype(jnp.float32)
+
+            out[k] = w
+    return out
+
+
+def _build_scan_stacks(W, b, alphas, betas):
+    """Pre-stack hidden layer weights for the scan-based forward pass.
+
+    Returns (use_scan, W_hidden, b_hidden, alphas_hidden, betas_hidden);
+    the stacks are None unless all middle hidden layers share one shape.
+    """
+    mid_W = W[1:-1]
+    use_scan = (
+        len(W) > 2
+        and len(mid_W) > 0
+        and all(w.shape == mid_W[0].shape for w in mid_W)
+    )
+    if not use_scan:
+        return False, None, None, None, None
+    return (
+        True,
+        jnp.stack(mid_W),
+        jnp.stack(b[1:-1]),
+        jnp.stack(alphas[1:]),
+        jnp.stack(betas[1:]),
+    )
+
+
+def _mlp_step(x, wandb):
+    """Single hidden layer step for use with jax.lax.scan."""
+    W_i, b_i, alpha_i, beta_i = wandb
+    x = x @ W_i + b_i
+    x = activation(x, alpha_i, beta_i)
+    return x, None
+
+
+def _hidden_forward(x, W, b, alphas, betas, use_scan, hidden_stacks):
+    """Run the input + hidden layers of the MLP (everything before the
+    linear output layer), via scan when the hidden stacks are available."""
+    if use_scan:
+        # First hidden layer
+        x = x @ W[0] + b[0]
+        x = activation(x, alphas[0], betas[0])
+
+        # Middle hidden layers via scan
+        x, _ = jax.lax.scan(_mlp_step, x, hidden_stacks)
+    else:
+        for i in range(len(W) - 1):
+            x = x @ W[i] + b[i]
+            x = activation(x, alphas[i], betas[i])
+    return x
+
+
 class Emulator(object):
     """MLP emulator for single-spectrum power spectrum predictions.
 
@@ -138,43 +282,10 @@ class MultiSpectrumEmulator(object):
         """
         super(MultiSpectrumEmulator, self).__init__()
 
-        if not abspath:
-            if data_dir is None:
-                data_dir = "/".join(
-                    [
-                        os.path.dirname(os.path.realpath(__file__)),
-                        "emu_weights",
-                    ]
-                )
-
-                if type(config) is not dict:
-                    config_abspath = "/".join(
-                        [
-                            os.path.dirname(os.path.realpath(__file__)),
-                            "emu_weights",
-                            config,
-                        ]
-                    )
-            else:
-                if type(config) is not dict:
-                    config_abspath = "/".join(
-                        [
-                            data_dir,
-                            config,
-                        ]
-                    )
-
-            with open(config_abspath, "r") as fp:
-                cfg = yaml.load(fp, Loader=yaml.SafeLoader)
-        else:
-            if type(config) is not dict:
-                config_abspath = config
-                with open(config_abspath, "r") as fp:
-                    cfg = yaml.load(fp, Loader=yaml.SafeLoader)
-            else:
-                cfg = config
-
-            data_dir = ""
+        cfg, data_dir = _resolve_emu_config(
+            config, abspath=abspath, data_dir=data_dir,
+            empty_data_dir_on_abspath=True,
+        )
 
         spec_base = cfg["spec_base"]
         s8z_base = cfg["s8z_base"]
@@ -237,19 +348,13 @@ class MultiSpectrumEmulator(object):
         self.nk = self.sigmas.shape[0] // self.n_spec
         self.k = jnp.logspace(jnp.log10(kmin), jnp.log10(kmax), self.nk)
 
-        # Pre-stack hidden layer weights for scan-based forward pass
-        # (only if all middle hidden layers have the same shape)
-        mid_W = self.W[1:-1]
-        self._use_scan = (
-            self.n_layers > 2
-            and len(mid_W) > 0
-            and all(w.shape == mid_W[0].shape for w in mid_W)
-        )
-        if self._use_scan:
-            self._W_hidden = jnp.stack(mid_W)
-            self._b_hidden = jnp.stack(self.b[1:-1])
-            self._alphas_hidden = jnp.stack(self.alphas[1:])
-            self._betas_hidden = jnp.stack(self.betas[1:])
+        (
+            self._use_scan,
+            self._W_hidden,
+            self._b_hidden,
+            self._alphas_hidden,
+            self._betas_hidden,
+        ) = _build_scan_stacks(self.W, self.b, self.alphas, self.betas)
 
     def load_spec(self, filebase):
         """Load spectrum emulator weights from an HDF5 file.
@@ -257,33 +362,15 @@ class MultiSpectrumEmulator(object):
         Args:
             filebase: Path to the weight file (without .h5 extension).
         """
-        with h5.File("{}.h5".format(filebase), "r") as weights:
-            for k in weights:
-                if k in ["W", "b", "alphas", "betas"]:
-                    w = []
-                    for i, wi in enumerate(weights[k]):
-                        w.append(weights[k][wi][:].astype(np.float32))
-                        if (self.param_order_spec is not None) & (i == 0) & (k == "W"):
-                            assert w[i].shape[0] == len(self.param_order_spec)
-                            w[i] = w[i][self.param_idx_spec, :]
-                        w[i] = jnp.array(w[i]).astype(jnp.float32)
-
-                elif k in ["param_mean", "param_sigmas"]:
-                    w = np.array(weights[k][f'{k}_0']).astype(np.float32)
-                    if self.scale_As_spec:
-                        if self.param_order_spec is not None:
-                            w[self.param_order_spec.index("As")] *= 1e9
-                        else:
-                            w[0] *= 1e9
-                    if self.input_param_order is not None:
-                        w = w[self.param_idx_spec]
-
-                    w = jnp.array(w).astype(jnp.float32)
-
-                else:
-                    w = jnp.array(weights[k][f'{k}_0']).astype(jnp.float32)
-
-                setattr(self, k, w)
+        loaded = _load_h5_weights(
+            filebase,
+            scale_As=self.scale_As_spec,
+            As_param_order=self.param_order_spec,
+            first_layer_param_order=self.param_order_spec,
+            param_idx=self.param_idx_spec,
+        )
+        for k, w in loaded.items():
+            setattr(self, k, w)
 
     def predict(self, parameters):
         """Run the MLP forward pass to predict multiple spectra.
@@ -299,27 +386,10 @@ class MultiSpectrumEmulator(object):
             parameters = parameters.at[:, -1].set(s8z)
 
         x = (parameters - self.param_mean) / self.param_sigmas
-
-        if self._use_scan:
-            # First hidden layer
-            x = x @ self.W[0] + self.b[0]
-            x = activation(x, self.alphas[0], self.betas[0])
-
-            # Middle hidden layers via scan
-            def _mlp_step(x, wandb):
-                W_i, b_i, alpha_i, beta_i = wandb
-                x = x @ W_i + b_i
-                x = activation(x, alpha_i, beta_i)
-                return x, None
-
-            x, _ = jax.lax.scan(
-                _mlp_step, x,
-                (self._W_hidden, self._b_hidden, self._alphas_hidden, self._betas_hidden),
-            )
-        else:
-            for i in range(self.n_layers - 1):
-                x = x @ self.W[i] + self.b[i]
-                x = activation(x, self.alphas[i], self.betas[i])
+        x = _hidden_forward(
+            x, self.W, self.b, self.alphas, self.betas, self._use_scan,
+            (self._W_hidden, self._b_hidden, self._alphas_hidden, self._betas_hidden),
+        )
 
         # Linear output layer
         x = ((x @ self.W[-1]) + self.b[-1]) * self.pc_sigmas[
@@ -409,19 +479,13 @@ class ScalarEmulator(object):
         self.n_components = self.W[-1].shape[-1]
         self.n_layers = len(self.W)
 
-        # Pre-stack hidden layer weights for scan-based forward pass
-        # (only if all middle hidden layers have the same shape)
-        mid_W = self.W[1:-1]
-        self._use_scan = (
-            self.n_layers > 2
-            and len(mid_W) > 0
-            and all(w.shape == mid_W[0].shape for w in mid_W)
-        )
-        if self._use_scan:
-            self._W_hidden = jnp.stack(mid_W)
-            self._b_hidden = jnp.stack(self.b[1:-1])
-            self._alphas_hidden = jnp.stack(self.alphas[1:])
-            self._betas_hidden = jnp.stack(self.betas[1:])
+        (
+            self._use_scan,
+            self._W_hidden,
+            self._b_hidden,
+            self._alphas_hidden,
+            self._betas_hidden,
+        ) = _build_scan_stacks(self.W, self.b, self.alphas, self.betas)
 
     def load(self, filebase, data_dir=None):
         """Load neural network weights from an HDF5 file.
@@ -446,33 +510,15 @@ class ScalarEmulator(object):
                 ]
             )
 
-        with h5.File("{}.h5".format(emu_abspath), "r") as weights:
-            for k in weights:
-                if k in ["W", "b", "alphas", "betas"]:
-                    w = []
-                    for i, wi in enumerate(weights[k]):
-                        w.append(weights[k][wi][:].astype(np.float32))
-                        if (self.input_param_order is not None) & (i == 0) & (k == "W"):
-                            assert w[i].shape[0] == len(self.input_param_order)
-                            w[i] = w[i][self.param_idx, :]
-                        w[i] = jnp.array(w[i]).astype(jnp.float32)
-
-                elif k in ["param_mean", "param_sigmas"]:
-                    w = np.array(weights[k][f'{k}_0']).astype(np.float32)
-                    if self.scale_As:
-                        if self.weight_param_order is not None:
-                            w[self.weight_param_order.index("As")] *= 1e9
-                        else:
-                            w[0] *= 1e9
-                    if self.input_param_order is not None:
-                        w = w[self.param_idx]
-
-                    w = jnp.array(w).astype(jnp.float32)
-
-                else:
-                    w = jnp.array(weights[k][f'{k}_0']).astype(jnp.float32)
-
-                setattr(self, k, w)
+        loaded = _load_h5_weights(
+            emu_abspath,
+            scale_As=self.scale_As,
+            As_param_order=self.weight_param_order,
+            first_layer_param_order=self.input_param_order,
+            param_idx=getattr(self, "param_idx", None),
+        )
+        for k, w in loaded.items():
+            setattr(self, k, w)
 
     def predict(self, parameters):
         """Run the MLP forward pass to predict a scalar quantity.
@@ -484,27 +530,10 @@ class ScalarEmulator(object):
             Array of predicted scalar values.
         """
         x = (parameters - self.param_mean) / self.param_sigmas
-
-        if self._use_scan:
-            # First hidden layer
-            x = x @ self.W[0] + self.b[0]
-            x = activation(x, self.alphas[0], self.betas[0])
-
-            # Middle hidden layers via scan
-            def _mlp_step(x, wandb):
-                W_i, b_i, alpha_i, beta_i = wandb
-                x = x @ W_i + b_i
-                x = activation(x, alpha_i, beta_i)
-                return x, None
-
-            x, _ = jax.lax.scan(
-                _mlp_step, x,
-                (self._W_hidden, self._b_hidden, self._alphas_hidden, self._betas_hidden),
-            )
-        else:
-            for i in range(self.n_layers - 1):
-                x = x @ self.W[i] + self.b[i]
-                x = activation(x, self.alphas[i], self.betas[i])
+        x = _hidden_forward(
+            x, self.W, self.b, self.alphas, self.betas, self._use_scan,
+            (self._W_hidden, self._b_hidden, self._alphas_hidden, self._betas_hidden),
+        )
 
         # linear output layer
         x = ((x @ self.W[-1]) + self.b[-1]) * self.pc_sigmas + self.pc_mean
@@ -531,41 +560,9 @@ class PijEmulator(object):
             scale_As: If True, scale As by 1e9 for normalization.
             s8_tvar: If True, use sigma8(z) as a transformed variable.
         """
-        if not abspath:
-            if data_dir is None:
-                data_dir = "/".join(
-                    [
-                        os.path.dirname(os.path.realpath(__file__)),
-                        "emu_weights",
-                    ]
-                )
-
-                if type(config) is not dict:
-                    config_abspath = "/".join(
-                        [
-                            os.path.dirname(os.path.realpath(__file__)),
-                            "emu_weights",
-                            config,
-                        ]
-                    )
-            else:
-                if type(config) is not dict:
-                    config_abspath = "/".join(
-                        [
-                            data_dir,
-                            config,
-                        ]
-                    )
-
-            with open(config_abspath, "r") as fp:
-                cfg = yaml.load(fp, Loader=yaml.SafeLoader)
-        else:
-            if type(config) is not dict:
-                config_abspath = config
-                with open(config_abspath, "r") as fp:
-                    cfg = yaml.load(fp, Loader=yaml.SafeLoader)
-            else:
-                cfg = config
+        cfg, data_dir = _resolve_emu_config(
+            config, abspath=abspath, data_dir=data_dir
+        )
 
         pij_emu_bases = cfg["pij_bases"]
         s8z_base = cfg["s8z_base"]
@@ -681,14 +678,7 @@ def predict_scan(parameters, xs):
     x = x @ W_0 + b[0]
     x = activation(x, alphas[0], betas[0])
 
-    def MLP(x, wandb):
-        """Single hidden layer step for use with jax.lax.scan."""
-        W_i, b_i, alpha_i, beta_i = wandb
-        x = x @ W_i + b_i
-        x = activation(x, alpha_i, beta_i)
-        return x, None
-
-    x, _ = jax.lax.scan(MLP, x, (W, b[1:], alphas[1:], betas[1:]))
+    x, _ = jax.lax.scan(_mlp_step, x, (W, b[1:], alphas[1:], betas[1:]))
 
     # linear output layer
     x = ((x @ W_m1) + b_m1) * pc_sigmas + pc_mean
