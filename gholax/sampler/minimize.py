@@ -1,12 +1,13 @@
 import json
-from datetime import datetime
 
 import jax
 import jax.numpy as jnp
 import jaxopt
 
+from .base import BaseSampler
 
-class Minimize(object):
+
+class Minimize(BaseSampler):
     """L-BFGS minimizer for finding the maximum a posteriori (MAP) point.
 
     Uses jaxopt L-BFGS with parallel starts across available JAX devices
@@ -34,28 +35,17 @@ class Minimize(object):
             Tuple of (samples array with shape (n_devices, 1, n_params+1),
             parameter names list).
         """
-        rng_key = jax.random.key(int(datetime.now().strftime("%Y%m%d%s")))
-        param_names = model.prior.params
-        prior = model.prior
-
-        sigmas = prior.get_prior_sigmas()
-        reference = prior.get_reference_values()
-        log_posterior = model.log_posterior_scaled_params
-
-        n_devices = jax.local_device_count()
-        keys = jax.random.split(rng_key, n_devices + 1)
-        rng_key = keys[0]
-        initial_keys = keys[1:]
-        initial_positions = jnp.array(
-            [
-                list(
-                    prior.initial_position(
-                        random_start=self.random_start, key=k, normalize=True
-                    ).values()
-                )
-                for k in initial_keys
-            ]
-        )
+        (
+            rng_key,
+            param_names,
+            prior,
+            sigmas,
+            reference,
+            log_posterior,
+            jlp,
+            n_devices,
+            initial_positions,
+        ) = self._init_chains(model, jit_logpost=False)
 
         jnlp = jax.jit(lambda p: -log_posterior(p))
         vgrad = jax.value_and_grad(jnlp)

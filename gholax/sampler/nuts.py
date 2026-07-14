@@ -1,16 +1,15 @@
 import json
 import os
-from datetime import datetime
 
 import blackjax
 import jax
 import jax.numpy as jnp
-import jaxopt
 import numpy as np
-from blackjax.diagnostics import potential_scale_reduction
+
+from .base import BaseSampler
 
 
-class NUTS(object):
+class NUTS(BaseSampler):
     """No-U-Turn Sampler using blackjax.
 
     Wraps blackjax's NUTS sampler with window adaptation warmup, convergence
@@ -58,38 +57,6 @@ class NUTS(object):
         # MEADS parameters
         self.meads_warmup_steps = c.get("meads_warmup_steps", 150)
         self.meads_step_size_tuning_steps = c.get("meads_step_size_tuning_steps", 100)
-
-    def _hessian_mass_matrix(self, jlp, position):
-        """Estimate diagonal inverse mass matrix from the Hessian of the log posterior.
-
-        Uses forward finite differences of the gradient to estimate the diagonal
-        of the Hessian using only reverse-mode AD. Forward-mode (JVP) cannot be
-        used because odeint defines a custom_vjp without a matching custom_jvp.
-        Requires dim+1 gradient evaluations.
-
-        Elements are clamped to [1e-6, 1e6] to guard against degenerate
-        curvature far from the MAP.
-
-        Args:
-            jlp: JIT-compiled log posterior function (scalar output).
-            position: 1D JAX array of parameter values (normalized space).
-
-        Returns:
-            1D JAX array of shape (dim,) representing the diagonal
-            inverse mass matrix.
-        """
-        jnlp = lambda p: -jlp(p)
-        grad_fn = jax.grad(jnlp)
-        eps = 1e-3
-        dim = len(position)
-        g0 = grad_fn(position)
-        # Sequential loop: one gradient eval per parameter, keeping only the
-        # i-th element each time to avoid allocating dim gradient arrays at once.
-        diag_H = jnp.array([
-            (grad_fn(position.at[i].set(position[i] + eps))[i] - g0[i]) / eps
-            for i in range(dim)
-        ])
-        return 1.0 / jnp.clip(diag_H, 1e-6, 1e6)
 
     def _adaptive_window_warmup(self, jlp, rng_key, initial_position, initial_inverse_mass_matrix=None):
         """Run window adaptation in stages, stopping when mass matrix and step size converge."""
@@ -249,30 +216,17 @@ class NUTS(object):
         Returns:
             Tuple of (samples array, parameter names list).
         """
-        rng_key = jax.random.key(int(datetime.now().strftime("%Y%m%d%s")))
-        param_names = model.prior.params
-        prior = model.prior
-
-        sigmas = prior.get_prior_sigmas()
-        reference = prior.get_reference_values()
-        log_posterior = model.log_posterior_scaled_params
-
-        n_devices = jax.local_device_count()
-        keys = jax.random.split(rng_key, n_devices + 1)
-        rng_key = keys[0]
-        initial_keys = keys[1:]
-        initial_positions = jnp.array(
-            [
-                list(
-                    prior.initial_position(
-                        random_start=self.random_start, key=k, normalize=True
-                    ).values()
-                )
-                for k in initial_keys
-            ]
-        )
-
-        jlp = jax.jit(log_posterior)
+        (
+            rng_key,
+            param_names,
+            prior,
+            sigmas,
+            reference,
+            log_posterior,
+            jlp,
+            n_devices,
+            initial_positions,
+        ) = self._init_chains(model)
 
         if (os.path.exists(f"{output_file}.nuts_warmup_parameters.json")) & (
             self.restart
@@ -302,32 +256,8 @@ class NUTS(object):
 
         else:
             if self.minimize_and_sample:
-                # minimize negative log posterior
-                jnlp = jax.jit(lambda p: -log_posterior(p))
-                vgrad = jax.value_and_grad(jnlp)
-                solver = jaxopt.LBFGS(fun=vgrad, value_and_grad=True)
-
-                minimize_pmap = jax.pmap(solver.run, in_axes=(0))
-                print("Running minimization before sampling", flush=True)
-                res = minimize_pmap(initial_positions)
-                initial_positions = res.params
-                with open(f"{output_file}.minimization_results.json", "w") as fp:
-                    json.dump(
-                        {
-                            "x_opt": initial_positions.tolist(),
-                            "value": res.state.value.tolist(),
-                        },
-                        fp,
-                    )
-
-                chi2_ratio = res.state.value / np.min(res.state.value)
-                initial_positions_min = jnp.tile(
-                    initial_positions[jnp.argmin(res.state.value)], n_devices
-                ).reshape(n_devices, -1)
-                initial_positions = jnp.where(
-                    (chi2_ratio[:, None] - 1) > 0,
-                    initial_positions_min,
-                    initial_positions,
+                initial_positions = self._minimize_and_sample(
+                    log_posterior, initial_positions, n_devices, output_file
                 )
 
             if self.mass_matrix_init == "hessian":
@@ -475,77 +405,33 @@ class NUTS(object):
             )
             kernel = nuts.step
             samples = None
+            log_density = None
 
         keys = jax.random.split(rng_key, 1 + n_devices)
         rng_key = keys[0]
         sample_keys = keys[1:]
 
-        def inference_loop(rng_key, kernel, initial_state, num_samples):
-            @jax.jit
-            def one_step(state, rng_key):
-                state, _ = kernel(rng_key, state)
-                return state, state
+        pmap_inference_loop = self._make_pmap_inference_loop()
 
-            keys = jax.random.split(rng_key, num_samples)
-            _, states = jax.lax.scan(one_step, initial_state, keys)
+        def reinit_fn(states, rng_key):
+            init_pmap = jax.pmap(nuts.init, in_axes=(0))
+            return init_pmap(states.position[:, -1, :]), rng_key
 
-            return states
-
-        pmap_inference_loop = jax.pmap(
-            inference_loop,
-            in_axes=(0, None, 0, None),
-            static_broadcasted_argnums=(1, 3),
+        samples, log_density = self._run_convergence_loop(
+            pmap_inference_loop,
+            kernel,
+            states,
+            rng_key,
+            sample_keys,
+            samples,
+            log_density,
+            sigmas,
+            reference,
+            n_devices,
+            output_file,
+            reinit_fn,
         )
 
-        print("Running inference loop", flush=True)
-        rhat = 10000
-
-        if samples is None:
-            counter = 0
-            n_steps = 0
-        else:
-            counter = 0
-            n_steps = samples.shape[1]
-
-        while (rhat - 1 > self.target_r_minus_one) | (n_steps < self.n_steps_min):
-            if counter == 0:
-                states = pmap_inference_loop(
-                    sample_keys, kernel, states, self.n_steps_incr
-                )
-            else:
-               init_pmap = jax.pmap(nuts.init, in_axes=(0))
-               states = init_pmap(states.position[:, -1, :])
-               states = pmap_inference_loop(
-                    sample_keys, kernel, states, self.n_steps_incr
-                )
-                
-            if (counter == 0) & (n_steps == 0):
-                samples = states.position
-                log_density = states.logdensity
-            else:
-                samples = np.hstack([samples, states.position])
-                log_density = np.hstack([log_density, states.logdensity])
-
-            rhat = jnp.mean(potential_scale_reduction(samples))
-
-            print(f"n_samples = {samples.shape[1]}", flush=True)
-            print(f"rhat - 1 = {rhat - 1}", flush=True)
-
-            counter += 1
-            np.save(
-                f"{output_file}.samples_chk.npy",
-                samples * sigmas[None, None, :] + reference[None, None, :],
-            )
-            np.save(f"{output_file}.logposterior_chk.npy", log_density)
-            n_steps = samples.shape[1]
-
-            keys = jax.random.split(rng_key, 1 + n_devices)
-            rng_key = keys[0]
-            sample_keys = keys[1:]
-            
-
-        samples = samples * sigmas[None, None, :] + reference[None, None, :]
-        samples = jnp.vstack([samples.T, log_density[..., None].T]).T
-        param_names.append("log_posterior")
-
-        return samples, param_names
+        return self._finalize_samples(
+            samples, log_density, sigmas, reference, param_names
+        )
