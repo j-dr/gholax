@@ -10,12 +10,28 @@ import sys
 import types
 
 # Stub gholax.likelihood as a package (with __path__) so sub-imports work,
-# but skip its real __init__ which pulls in flowjax.
+# but skip its real __init__ which pulls in flowjax. A lazy __getattr__
+# forwards the class names the real __init__ exports, so Model construction
+# in other test modules still works when this stub is installed first.
 if "gholax.likelihood" not in sys.modules:
     _pkg = types.ModuleType("gholax.likelihood")
     import gholax
     _pkg.__path__ = [os.path.join(os.path.dirname(gholax.__file__), "likelihood")]
     _pkg.__package__ = "gholax.likelihood"
+
+    _EXPORTS = {
+        "Nx2PTAngularPowerSpectrum": "gholax.likelihood.nx2pt_aps",
+        "RSDPK": "gholax.likelihood.rsd_pk",
+        "FlowLikelihood": "gholax.likelihood.flow_likelihood",
+    }
+
+    def _lazy_getattr(name, _exports=_EXPORTS):
+        if name in _exports:
+            import importlib
+            return getattr(importlib.import_module(_exports[name]), name)
+        raise AttributeError(name)
+
+    _pkg.__getattr__ = _lazy_getattr
     sys.modules["gholax.likelihood"] = _pkg
 
 import jax.numpy as jnp
