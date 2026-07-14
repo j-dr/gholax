@@ -163,6 +163,24 @@ class LensingCounterterm(LikelihoodModule):
             self._ct_eps = 0.001
             self._ct_z_all = self._ct_eps + jnp.arange(max_points) * self._ct_dz
 
+            # Sparse index set of the counterterm contraction: only terms
+            # with N == n + m + o contribute (order^3-ish entries instead of
+            # the order^4 dense tensor previously masked by where=).
+            ct_idx = np.array(
+                [
+                    (N, n, m, o)
+                    for N in range(ct_order)
+                    for n in range(ct_order)
+                    for m in range(ct_order)
+                    for o in range(ct_order)
+                    if N == n + m + o
+                ]
+            )
+            self._ct_N_idx = jnp.array(ct_idx[:, 0])
+            self._ct_n_idx = jnp.array(ct_idx[:, 1])
+            self._ct_m_idx = jnp.array(ct_idx[:, 2])
+            self._ct_o_idx = jnp.array(ct_idx[:, 3])
+
     def sigma_N_o(self, state, lk):
         """Compute sigma_N_o integrals from the matter power spectrum above k_cutoff."""
         k = 10**lk
@@ -340,13 +358,19 @@ class LensingCounterterm(LikelihoodModule):
                     self.lensing_counterterm_order, -1
                 ),
             )
-            N, n, m, o = jnp.meshgrid(
-                jnp.arange(self.lensing_counterterm_order),
-                jnp.arange(self.lensing_counterterm_order),
-                jnp.arange(self.lensing_counterterm_order),
-                jnp.arange(self.lensing_counterterm_order),
-                indexing="ij",
-            )
+
+            if self.mean_model == "ct":
+                print(
+                    "CT mean model should only be used for illustrative purposes.",
+                    flush=True,
+                )
+
+            if self.mean_model in ("dmo", "ct"):
+                sigma_factor = sigma_N_o_emu * sigma_N_o
+            elif self.mean_model == "zero":
+                sigma_factor = sigma_N_o_emu * (1 + sigma_N_o)
+            else:
+                raise ValueError(f"Unknown mean_model '{self.mean_model}'")
 
         for t in self.spectrum_types:
             add_ct = False
@@ -368,37 +392,16 @@ class LensingCounterterm(LikelihoodModule):
                             else:
                                 w_j_n = jnp.tile(w_j_n, (n_i, 1))
 
-                        if self.mean_model == "dmo":
-                            c_l_uv = jnp.einsum(
-                                "in,im,No,Nl->ilNnmo",
-                                w_i_n,
-                                w_j_n,
-                                sigma_N_o_emu * sigma_N_o,
-                                ell_N,
-                            )
-                        elif self.mean_model == "ct":
-                            print(
-                                "CT mean model should only be used for illustrative purposes.",
-                                flush=True,
-                            )
-                            c_l_uv = jnp.einsum(
-                                "in,im,No,Nl->ilNnmo",
-                                w_i_n,
-                                w_j_n,
-                                sigma_N_o_emu * sigma_N_o,
-                                ell_N,
-                            )
-                        elif self.mean_model == "zero":
-                            c_l_uv = jnp.einsum(
-                                "in,im,No,Nl->ilNnmo",
-                                w_i_n,
-                                w_j_n,
-                                sigma_N_o_emu * (1 + sigma_N_o),
-                                ell_N,
-                            )
-
+                        # Contract only the sparse (N, n, m, o) terms with
+                        # N == n + m + o over the shared index axis s.
                         c_l_uv = (
-                            jnp.sum(c_l_uv, axis=(2, 3, 4, 5), where=(N == (n + m + o)))
+                            jnp.einsum(
+                                "is,is,s,sl->il",
+                                w_i_n[:, self._ct_n_idx],
+                                w_j_n[:, self._ct_m_idx],
+                                sigma_factor[self._ct_N_idx, self._ct_o_idx],
+                                ell_N[self._ct_N_idx, :],
+                            )
                             * (3 / 2 * state["omegam"] / self.hubble_radius**2) ** 2
                         )
 

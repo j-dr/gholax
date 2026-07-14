@@ -357,3 +357,108 @@ class TestCompute:
         assert not np.any(np.isnan(arr_zero))
         # They should differ because mean_model="zero" uses (1+sigma) instead of sigma
         assert not np.allclose(arr_dmo, arr_zero)
+
+
+# ===========================================================================
+# 5. Sparse-contraction equivalence tests
+# ===========================================================================
+
+def dense_counterterm_reference(ct, state, params_values):
+    """The pre-optimization dense einsum + masked sum, kept as a reference
+    implementation for the sparse contraction in compute()."""
+    param_vec = jnp.array(list(params_values.values()))
+    order = ct.lensing_counterterm_order
+
+    if ct.integration_method == "gl_quad":
+        log_kval = jnp.log10(ct.k_nodes)
+    else:
+        log_kval = jnp.log10(ct.k)
+    sigma_N_o_emu = ct.sigma_N_o(state, log_kval)
+    sigma_N_o = param_vec[ct.param_indices["all"]]
+
+    ell_N = jnp.array([(ct.ell + 0.5) ** (N + 1) for N in range(order)])
+    N, n, m, o = jnp.meshgrid(
+        *[jnp.arange(order)] * 4, indexing="ij"
+    )
+
+    if ct.mean_model in ("dmo", "ct"):
+        factor = sigma_N_o_emu * sigma_N_o
+    else:
+        factor = sigma_N_o_emu * (1 + sigma_N_o)
+
+    w_i_n = ct.w_n("w_k", state)
+    w_j_n = ct.w_n("w_k", state)
+    c_l = state["c_kk"]
+
+    n_i = w_i_n.shape[0]
+    n_j = w_j_n.shape[0]
+    n_c_l = c_l.shape[0]
+    if n_i != n_c_l:
+        w_i_n = jnp.repeat(w_i_n, n_j, 0)
+    if n_j != n_c_l:
+        if n_i == n_c_l:
+            w_j_n = jnp.tile(w_j_n, (n_i // n_j, 1))
+        else:
+            w_j_n = jnp.tile(w_j_n, (n_i, 1))
+
+    c_l_uv = jnp.einsum("in,im,No,Nl->ilNnmo", w_i_n, w_j_n, factor, ell_N)
+    c_l_uv = (
+        jnp.sum(c_l_uv, axis=(2, 3, 4, 5), where=(N == (n + m + o)))
+        * (3 / 2 * state["omegam"] / ct.hubble_radius**2) ** 2
+    )
+    return c_l_uv
+
+
+class TestSparseContractionEquivalence:
+    @pytest.mark.parametrize("order", [1, 3])
+    @pytest.mark.parametrize("mean_model", ["dmo", "ct", "zero"])
+    def test_sparse_matches_dense(self, order, mean_model):
+        ct = make_lensing_ct(order=order, mean_model=mean_model)
+        state = make_state(n_ell=ct.n_ell)
+        if mean_model != "dmo":
+            state["p_mm"] = state["p_11_real_space_bias_grid"][jnp.newaxis, ...]
+        params = setup_param_indices(ct, order=order)
+        for k in params:
+            if k.startswith("sigma_"):
+                params[k] = 2.0
+
+        expected_ct = np.array(dense_counterterm_reference(ct, state, params))
+
+        result = ct.compute(state, params)
+        actual_ct = np.array(result["c_kk_w_lensing_ct"]) - np.array(state["c_kk"])
+
+        # float32 pipeline: reordering the masked sum into a sparse gather
+        # can shift results at the few-ulp level only
+        np.testing.assert_allclose(actual_ct, expected_ct, rtol=2e-5, atol=0)
+
+    def test_sparse_index_set(self):
+        ct = make_lensing_ct(order=3)
+        idx = np.stack(
+            [
+                np.array(ct._ct_N_idx),
+                np.array(ct._ct_n_idx),
+                np.array(ct._ct_m_idx),
+                np.array(ct._ct_o_idx),
+            ],
+            axis=1,
+        )
+        # every kept term satisfies N == n + m + o, and all such terms are kept
+        assert np.all(idx[:, 0] == idx[:, 1:].sum(axis=1))
+        n_expected = sum(
+            1
+            for N in range(3)
+            for n in range(3)
+            for m in range(3)
+            for o in range(3)
+            if N == n + m + o
+        )
+        assert idx.shape[0] == n_expected
+
+    def test_invalid_mean_model_raises(self):
+        ct = make_lensing_ct(order=1, mean_model="dmo")
+        ct.mean_model = "bogus"
+        state = make_state(n_ell=ct.n_ell)
+        state["p_mm"] = state["p_11_real_space_bias_grid"][jnp.newaxis, ...]
+        params = setup_param_indices(ct, order=1)
+        with pytest.raises(ValueError, match="mean_model"):
+            ct.compute(state, params)
