@@ -1,6 +1,7 @@
 import jax.numpy as jnp
 import numpy as np
 from jax import jacfwd, jit
+from jax.lax import scan
 import yaml
 from .likelihood import Likelihood
 
@@ -151,11 +152,47 @@ class GaussianLikelihood(Likelihood):
 
         return state
 
-    def get_model_from_state(
-        self,
-        state,
-    ):
-        return
+    def _build_all_spectra(self, field_types):
+        """Build the per-spectrum-type index arrays used to gather the model
+        vector out of the pipeline state.
+
+        Args:
+            field_types: The field_types dict of the data-vector module the
+                subclass observes (they differ per data-vector type).
+        """
+        spectrum_info = self.observed_data_vector.spectrum_info
+        self.all_spectra = {}
+
+        for t in self.observed_data_vector.spectrum_types:
+            self.all_spectra[t] = []
+            for ii, i in enumerate(spectrum_info[t]["bins0"]):
+                if spectrum_info[t]["use_cross"]:
+                    if field_types[t][0] == field_types[t][1]:
+                        bins1 = spectrum_info[t]["bins1"][ii:]
+                    else:
+                        bins1 = spectrum_info[t]["bins1"][:]
+
+                    for j in bins1:
+                        self.all_spectra[t].append(
+                            i * spectrum_info[t]["n_bins1_tot"] + j
+                        )
+                else:
+                    self.all_spectra[t].append(i)
+            self.all_spectra[t] = jnp.array(self.all_spectra[t])
+
+    def get_model_from_state(self, state):
+        """Extract the windowed model vector from the pipeline state."""
+        dv = self.observed_data_vector
+        model = []
+        for t in dv.spectrum_types:
+            def f(carry, i):
+                return (carry, state[f"{t}_obs"][i])
+            _, m_t = scan(f, 0, self.all_spectra[t])
+            model.append(m_t.flatten())
+
+        model = jnp.hstack(model)
+
+        return model
 
     def get_model_from_state_no_window(self, state):
         """Extract the model prediction before window convolution (subclass override)."""

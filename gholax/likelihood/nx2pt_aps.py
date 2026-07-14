@@ -261,38 +261,7 @@ class Nx2PTAngularPowerSpectrum(GaussianLikelihood):
 
         # calling this builds the dependency information
         super(Nx2PTAngularPowerSpectrum, self).__init__(c, config["likelihood"].get('params', {}))
-        self.all_spectra = {}
-
-        for t in self.observed_data_vector.spectrum_types:
-            self.all_spectra[t] = []
-            for ii, i in enumerate(spectrum_info[t]["bins0"]):
-                if spectrum_info[t]["use_cross"]:
-                    if field_types[t][0] == field_types[t][1]:
-                        bins1 = spectrum_info[t]["bins1"][ii:]
-                    else:
-                        bins1 = spectrum_info[t]["bins1"][:]
-
-                    for j in bins1:
-                        self.all_spectra[t].append(
-                            i * spectrum_info[t]["n_bins1_tot"] + j
-                        )
-                else:
-                    self.all_spectra[t].append(i)
-            self.all_spectra[t] = jnp.array(self.all_spectra[t])
-
-    def get_model_from_state(self, state):
-        """Extract the windowed model vector from the pipeline state."""
-        dv = self.observed_data_vector
-        model = []
-        for t in dv.spectrum_types:
-            def f(carry, i):
-                return (carry, state[f"{t}_obs"][i])
-            _, m_t = scan(f, 0, self.all_spectra[t])
-            model.append(m_t.flatten())
-
-        model = jnp.hstack(model)
-
-        return model
+        self._build_all_spectra(field_types)
 
     def get_model_from_state_no_window(self, state):
         """Extract the pre-window theory C_ell predictions from the state."""
