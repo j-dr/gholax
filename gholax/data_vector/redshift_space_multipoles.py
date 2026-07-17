@@ -9,14 +9,24 @@ covariance_field_types = {
     "p_gg_ell": ["drsd", "drsd"],
 }
 
+# BAO dilation parameters appended to the data vector as scalar "spectra"
+# (one row per bin, ell=0). Their joint covariance with p_gg_ell must come
+# from the data file; they are exempt from scale cuts.
+ALPHA_TYPES = ("alpha_iso", "alpha_par", "alpha_perp")
 
 
 datavector_requires = {
     "p_gg_ell": ["z_fid", "chiz_fid", "hz_fid"],
+    "alpha_iso": ["rd_fid", "zeff_bao", "DV_fid_bao"],
+    "alpha_par": ["rd_fid", "zeff_bao", "Hz_fid_bao"],
+    "alpha_perp": ["rd_fid", "zeff_bao", "DM_fid_bao"],
 }
 
 field_types = {
     "p_gg_ell": ["d_zs", "d_zs"],
+    "alpha_iso": ["bao", "bao"],
+    "alpha_par": ["bao", "bao"],
+    "alpha_perp": ["bao", "bao"],
 }
 
 
@@ -29,6 +39,7 @@ class RedshiftSpaceMultipoles(DataVector):
     """
 
     _field_types = field_types
+    scale_cut_exempt_types = ALPHA_TYPES
 
     def __init__(
         self,
@@ -60,6 +71,10 @@ class RedshiftSpaceMultipoles(DataVector):
         """
         self.data_vector_info_filename = data_vector_info_filename
         self.spectrum_info = spectrum_info
+        # alphas are per-bin scalars; only auto "pairs" (bin, bin) make sense
+        for t in ALPHA_TYPES:
+            if t in self.spectrum_info:
+                self.spectrum_info[t].setdefault("use_cross", False)
         self.scale_cuts = scale_cuts
         self.spectrum_types = list(self.spectrum_info.keys())
         self.covariance_info = covariance_info
@@ -79,6 +94,9 @@ class RedshiftSpaceMultipoles(DataVector):
     def _first_block_meta(self, spectra, idx):
         """Restrict per-bin metadata to the highest multipole block and
         record ell_max."""
+        stype = spectra["spectrum_type"][idx][0].decode()
+        if stype in ALPHA_TYPES:
+            return idx, {}
         ell_max = np.max(spectra["ell"][idx])
         idx = idx & (spectra["ell"] == ell_max)
         return idx, {"ell_max": ell_max}
@@ -128,7 +146,8 @@ class RedshiftSpaceMultipoles(DataVector):
                     for k_j in self.data_vector_info[k_i].keys():
                         grp.create_dataset(k_j, data=self.data_vector_info[k_i][k_j][:])
                 else:
-                    f.create_dataset(k_i, data=self.data_vector_info[k_i][:])
+                    ds = self.data_vector_info[k_i]
+                    f.create_dataset(k_i, data=ds[()] if ds.shape == () else ds[:])
 
     def generate_data(self):
         """Generate a synthetic data vector with k-binning and window matrices.
@@ -212,6 +231,17 @@ class RedshiftSpaceMultipoles(DataVector):
             for r in requirements:
                 if r in ["z_fid", "chiz_fid", "hz_fid"]:
                     self.spectrum_info[t][r] = jnp.array(self.data_vector_info[r][:])
+                elif t in ALPHA_TYPES:
+                    if r not in self.data_vector_info:
+                        raise ValueError(
+                            f"Data file is missing dataset '{r}' required by "
+                            f"BAO alpha spectrum type '{t}'"
+                        )
+                    ds = self.data_vector_info[r]
+                    if ds.shape == ():
+                        self.spectrum_info[t][r] = float(ds[()])
+                    else:
+                        self.spectrum_info[t][r] = jnp.array(ds[:])
 #                elif "nz" in r:
 #                    nz_ = self.data_vector_info[r][:]
 #
@@ -250,6 +280,14 @@ class RedshiftSpaceMultipoles(DataVector):
 
     def _ensure_covariance_info(self):
         """Prompt interactively for any v_survey or noise terms missing from covariance_info."""
+        alpha_present = [t for t in self.spectrum_info if t in ALPHA_TYPES]
+        if alpha_present:
+            raise ValueError(
+                "The internal Gaussian covariance cannot be generated for BAO "
+                f"alpha types {alpha_present}; provide a joint covariance in "
+                "the data file instead."
+            )
+
         if self.covariance_info is None:
             self.covariance_info = {}
 

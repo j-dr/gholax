@@ -20,6 +20,10 @@ class DataVector(metaclass=abc.ABCMeta):
     # methods can consult it without importing a specific module's copy.
     _field_types = None
 
+    # Spectrum types that never receive scale cuts (e.g. scalar BAO alphas);
+    # all of their elements are always kept in the data vector.
+    scale_cut_exempt_types = ()
+
     def __init__(self, config):
         pass
 
@@ -208,7 +212,9 @@ class DataVector(metaclass=abc.ABCMeta):
         # make scale cut mask
         if self.scale_cuts is not None:
             for t in self.spectrum_info:
-                if t in self.scale_cuts:
+                if t in self.scale_cut_exempt_types:
+                    self.spectrum_info[t]["scale_cut_masks"] = None
+                elif t in self.scale_cuts:
                     scale_cut_dict = self.scale_cuts[t]
                     scale_cut_mask = {}
                     sep_unmasked = self.spectrum_info[t]["separation"]

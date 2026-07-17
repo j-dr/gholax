@@ -12,7 +12,12 @@ from .window.redshift_space_multipole_power_spectrum_window import (
     RedshiftSpaceMultipolePowerSpectrumWindow,
 )
 from .gaussian_likelihood import GaussianLikelihood
-from ..data_vector.redshift_space_multipoles import RedshiftSpaceMultipoles, field_types
+from ..data_vector.redshift_space_multipoles import (
+    RedshiftSpaceMultipoles,
+    field_types,
+    ALPHA_TYPES,
+)
+from ..theory.bao_alphas import BAOAlphas
 import jax.numpy as jnp
 from jax.lax import scan
 
@@ -51,6 +56,10 @@ class RSDPK(GaussianLikelihood):
         config_theory = config.get("theory", {})
         spectrum_types = self.observed_data_vector.spectrum_types
         spectrum_info = self.observed_data_vector.spectrum_info
+        # BAO alphas are predicted directly from the expansion history; only
+        # the full-shape types go through the bias expansion and window.
+        alpha_types = [t for t in spectrum_types if t in ALPHA_TYPES]
+        fs_types = [t for t in spectrum_types if t not in ALPHA_TYPES]
         if self.use_boltzmann:
             self.likelihood_pipeline = [
                 Boltzmann(),
@@ -74,6 +83,17 @@ class RSDPK(GaussianLikelihood):
                 )
             )
 
+        bao_modules = []
+        if alpha_types:
+            bao_modules.append(
+                BAOAlphas(
+                    spectrum_info,
+                    alpha_types,
+                    use_boltzmann=self.use_boltzmann,
+                    **config_theory.get("BAOAlphas", {}),
+                )
+            )
+
         self.likelihood_pipeline.extend(
             [
                 ExpansionHistory(
@@ -82,6 +102,7 @@ class RSDPK(GaussianLikelihood):
                     nz=self.nz_proj,
                     **config_theory.get("ExpansionHistory", {}),
                 ),
+                *bao_modules,
                 *spectral_equiv_modules,
                 LinearGrowthRate(
                     zmin=self.zmin_pk,
@@ -109,7 +130,7 @@ class RSDPK(GaussianLikelihood):
                 ),
                 RedshiftSpaceBiasExpansion(
                     self.observed_data_vector,
-                    spectrum_types,
+                    fs_types,
                     spectrum_info,
                     spectrum_info["p_gg_ell"]["z_fid"],
                     kmin=self.kmin,
@@ -120,7 +141,7 @@ class RSDPK(GaussianLikelihood):
                 ),
                 RedshiftSpaceMultipolePowerSpectrumWindow(
                     self.observed_data_vector,
-                    spectrum_types,
+                    fs_types,
                     spectrum_info,
                     kmin=self.kmin,
                     kmax=self.kmax,
@@ -137,12 +158,18 @@ class RSDPK(GaussianLikelihood):
         self._build_all_spectra(field_types)
 
     def get_model_from_state_no_window(self, state):
-        """Extract the pre-window theory P_ell(k) predictions from the state."""
+        """Extract the pre-window theory P_ell(k) predictions from the state.
+
+        BAO alpha types are skipped: they are scalar observables with no
+        pre-window analog.
+        """
         self.k_no_window = jnp.linspace(0, 0.6, 600)
         window_module = self.likelihood_pipeline[-1]
         k_theory = window_module.k
         model = []
         for t in self.observed_data_vector.spectrum_types:
+            if t in ALPHA_TYPES:
+                continue
             pl_pre = state[f"{t}{window_module.pl_tag}"]
 
             def f(carry, pl):
