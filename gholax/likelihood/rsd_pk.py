@@ -94,16 +94,13 @@ class RSDPK(GaussianLikelihood):
                 )
             )
 
-        self.likelihood_pipeline.extend(
-            [
-                ExpansionHistory(
-                    zmin=self.zmin_proj,
-                    zmax=self.zmax_proj,
-                    nz=self.nz_proj,
-                    **config_theory.get("ExpansionHistory", {}),
-                ),
-                *bao_modules,
-                *spectral_equiv_modules,
+        # The full-shape half of the pipeline is only needed when the data
+        # vector actually carries P_ell(k) blocks. A BAO-only data vector has
+        # no p_gg_ell entry in spectrum_info, so these modules are skipped
+        # entirely (their fiducial-geometry arguments live under p_gg_ell).
+        fs_modules = []
+        if fs_types:
+            fs_modules = [
                 LinearGrowthRate(
                     zmin=self.zmin_pk,
                     zmax=self.zmax_pk,
@@ -149,6 +146,20 @@ class RSDPK(GaussianLikelihood):
                     **config.get("RedshiftSpaceMultipolePowerSpectrumWindow", {}),
                 ),
             ]
+
+        self.fs_types = fs_types
+        self.likelihood_pipeline.extend(
+            [
+                ExpansionHistory(
+                    zmin=self.zmin_proj,
+                    zmax=self.zmax_proj,
+                    nz=self.nz_proj,
+                    **config_theory.get("ExpansionHistory", {}),
+                ),
+                *bao_modules,
+                *spectral_equiv_modules,
+                *fs_modules,
+            ]
         )
 
         self.n_modules = len(self.likelihood_pipeline)
@@ -163,6 +174,11 @@ class RSDPK(GaussianLikelihood):
         BAO alpha types are skipped: they are scalar observables with no
         pre-window analog.
         """
+        if not self.fs_types:
+            raise ValueError(
+                "No-window predictions are undefined for a BAO-only data "
+                "vector: the alphas are scalars and there is no window module."
+            )
         self.k_no_window = jnp.linspace(0, 0.6, 600)
         window_module = self.likelihood_pipeline[-1]
         k_theory = window_module.k
