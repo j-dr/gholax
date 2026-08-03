@@ -1,6 +1,6 @@
 import jax.numpy as jnp
 import numpy as np
-from jax import jacfwd, jit
+from jax import checkpoint, jacfwd, jit
 from jax.lax import scan
 import yaml
 from .likelihood import Likelihood
@@ -23,6 +23,11 @@ class GaussianLikelihood(Likelihood):
         self.analytic_marginalization = config.get("analytic_marginalization", True)
         self.include_am_priors = config.get("include_am_priors", True)
         self.include_am_determinant = config.get("include_am_determinant", True)
+        # Rematerialize each pipeline module's intermediates in the backward
+        # pass instead of storing them: ~2x forward compute for peak gradient
+        # memory of roughly the largest single module. Requires the
+        # differentiable (emulator-mode) pipeline.
+        self.gradient_checkpointing = config.get("gradient_checkpointing", False)
 
         if self.analytic_marginalization:
             self.linear_params_filename = config["linear_params_filename"]
@@ -127,7 +132,10 @@ class GaussianLikelihood(Likelihood):
 
         pipeline = self.likelihood_pipeline if apply_window else self.likelihood_pipeline[:-1]
         for module in pipeline:
-            state = module.compute(state, params_dict)
+            if self.gradient_checkpointing:
+                state = checkpoint(module.compute)(state, params_dict)
+            else:
+                state = module.compute(state, params_dict)
 
         if apply_window:
             model = self.get_model_from_state(state)
