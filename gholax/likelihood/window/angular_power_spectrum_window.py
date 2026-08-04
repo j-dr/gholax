@@ -12,6 +12,8 @@ class AngularPowerSpectrumWindow(LikelihoodModule):
     coupling/window matrix to produce observed bandpowers.
     """
 
+    shards_pair_axis = True
+
     def __init__(
         self,
         observed_data_vector,
@@ -97,7 +99,12 @@ class AngularPowerSpectrumWindow(LikelihoodModule):
         for t in self.spectrum_types:
             f = lambda carry, c_l: (carry, jnp.interp(ell_p, self.ell, c_l))
             _, c_l_p = scan(f, 0, state[f"{t}{self.cl_tag}"])
-            c_l_p = jnp.einsum("ilm,im->il", self.cW[t][:, :, : self.l_max], c_l_p)
+            cW_t = self.cW[t]
+            if self.model_sharding is not None:
+                # C_ell arrives as a local block of the pair axis; use the
+                # matching block of the window matrices.
+                cW_t = self.model_sharding.slice_local(cW_t)
+            c_l_p = jnp.einsum("ilm,im->il", cW_t[:, :, : self.l_max], c_l_p)
             state[f"{t}_obs"] = c_l_p
 
         return state

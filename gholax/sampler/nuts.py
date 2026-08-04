@@ -25,6 +25,7 @@ class NUTS(BaseSampler):
             config: Full config dict containing 'sampler' -> 'NUTS' section.
         """
         c = config["sampler"]["NUTS"]
+        self._sampler_cfg = c
 
         self.n_steps_warmup = c.get("n_steps_warmup", 500)
         self.target_r_minus_one = c.get("target_r_minus_one", 0.1)
@@ -216,6 +217,22 @@ class NUTS(BaseSampler):
         Returns:
             Tuple of (samples array, parameter names list).
         """
+        from ..util.distributed import build_mesh, gather_to_host, is_io_process
+
+        self.mesh = build_mesh(self._sampler_cfg)
+        if self.mesh is not None:
+            if self.warmup_algorithm == "meads":
+                raise ValueError(
+                    "warmup_algorithm 'meads' is not supported in mesh mode "
+                    "(n_chains/model_shards or multi-process runs); use "
+                    "'adaptive_window' or 'window'."
+                )
+            if self.parallel_warmup:
+                raise ValueError(
+                    "parallel_warmup is not supported in mesh mode; warmup "
+                    "runs on a single chain with the model-sharded posterior."
+                )
+
         (
             rng_key,
             param_names,
@@ -227,6 +244,11 @@ class NUTS(BaseSampler):
             n_devices,
             initial_positions,
         ) = self._init_chains(model)
+
+        # Kernels driven inside the chain shard_map must close over the raw
+        # (ctx-active) posterior — jlp is already shard_map-wrapped in mesh
+        # mode and cannot nest. Host-driven warmup keeps using jlp.
+        kernel_lp = log_posterior if self.mesh is not None else jlp
 
         if (os.path.exists(f"{output_file}.nuts_warmup_parameters.json")) & (
             self.restart
@@ -248,10 +270,9 @@ class NUTS(BaseSampler):
                 initial_state = jnp.array(warmup_parameters["initial_state"])
 
             nuts = blackjax.nuts(
-                jlp, inverse_mass_matrix=inverse_mass_matrix, step_size=step_size
+                kernel_lp, inverse_mass_matrix=inverse_mass_matrix, step_size=step_size
             )
-            init_pmap = jax.pmap(nuts.init, in_axes=(0))
-            states = init_pmap(initial_state)
+            states = self._map_chains(nuts.init)(jnp.asarray(initial_state))
             kernel = nuts.step
 
         else:
@@ -279,10 +300,9 @@ class NUTS(BaseSampler):
                 step_size = parameters["step_size"]
                 states = jnp.tile(state.position, (n_devices, 1))
                 nuts = blackjax.nuts(
-                    jlp, inverse_mass_matrix=inverse_mass_matrix, step_size=step_size
+                    kernel_lp, inverse_mass_matrix=inverse_mass_matrix, step_size=step_size
                 )
-                init_pmap = jax.pmap(nuts.init, in_axes=(0))
-                states = init_pmap(states)
+                states = self._map_chains(nuts.init)(states)
 
             elif self.warmup_algorithm == "meads":
                 keys = jax.random.split(rng_key, 2)
@@ -294,10 +314,9 @@ class NUTS(BaseSampler):
                 step_size = parameters["step_size"]
                 states = jnp.tile(state.position, (n_devices, 1))
                 nuts = blackjax.nuts(
-                    jlp, inverse_mass_matrix=inverse_mass_matrix, step_size=step_size
+                    kernel_lp, inverse_mass_matrix=inverse_mass_matrix, step_size=step_size
                 )
-                init_pmap = jax.pmap(nuts.init, in_axes=(0))
-                states = init_pmap(states)
+                states = self._map_chains(nuts.init)(states)
 
             elif self.pathfinder_adaptation:
                 print("Running pathfinder adaptation", flush=True)
@@ -337,10 +356,9 @@ class NUTS(BaseSampler):
                     step_size = parameters["step_size"]
                     states = jnp.tile(state.position, (n_devices, 1))
                     nuts = blackjax.nuts(
-                        jlp, inverse_mass_matrix=inverse_mass_matrix, step_size=step_size
+                        kernel_lp, inverse_mass_matrix=inverse_mass_matrix, step_size=step_size
                     )
-                    init_pmap = jax.pmap(nuts.init, in_axes=(0))
-                    states = init_pmap(states)
+                    states = self._map_chains(nuts.init)(states)
 
             else:
                 print("Running window adaptation", flush=True)
@@ -386,22 +404,24 @@ class NUTS(BaseSampler):
                     step_size = parameters["step_size"]
                     states = jnp.tile(state.position, (n_devices, 1))
                     nuts = blackjax.nuts(
-                        jlp, inverse_mass_matrix=inverse_mass_matrix, step_size=step_size
+                        kernel_lp, inverse_mass_matrix=inverse_mass_matrix, step_size=step_size
                     )
-                    init_pmap = jax.pmap(nuts.init, in_axes=(0))
-                    states = init_pmap(states)
+                    states = self._map_chains(nuts.init)(states)
 
             warmup_parameters = {
                 "inverse_mass_matrix": inverse_mass_matrix.tolist(),
                 "step_size": step_size.tolist(),
-                "initial_state": states.position.tolist(),
+                "initial_state": np.asarray(
+                    gather_to_host(states.position)
+                ).tolist(),
             }
 
-            with open(f"{output_file}.nuts_warmup_parameters.json", "w") as fp:
-                json.dump(warmup_parameters, fp)
+            if is_io_process():
+                with open(f"{output_file}.nuts_warmup_parameters.json", "w") as fp:
+                    json.dump(warmup_parameters, fp)
 
             nuts = blackjax.nuts(
-                jlp, inverse_mass_matrix=inverse_mass_matrix, step_size=step_size
+                kernel_lp, inverse_mass_matrix=inverse_mass_matrix, step_size=step_size
             )
             kernel = nuts.step
             samples = None
@@ -411,11 +431,16 @@ class NUTS(BaseSampler):
         rng_key = keys[0]
         sample_keys = keys[1:]
 
-        pmap_inference_loop = self._make_pmap_inference_loop()
+        if self.mesh is None:
+            pmap_inference_loop = self._make_pmap_inference_loop()
+        else:
+            pmap_inference_loop = self._make_mesh_inference_loop(
+                kernel, self.n_steps_incr
+            )
 
         def reinit_fn(states, rng_key):
-            init_pmap = jax.pmap(nuts.init, in_axes=(0))
-            return init_pmap(states.position[:, -1, :]), rng_key
+            init_map = self._map_chains(nuts.init)
+            return init_map(states.position[:, -1, :]), rng_key
 
         samples, log_density = self._run_convergence_loop(
             pmap_inference_loop,

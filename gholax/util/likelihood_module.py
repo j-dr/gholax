@@ -11,6 +11,12 @@ class LikelihoodModule(object):
     output_requirements so the dependency graph can be resolved at init time.
     """
 
+    # Modules that can shard their bin-pair axis across the 'model' mesh axis
+    # override shards_pair_axis = True; GaussianLikelihood.set_model_sharding
+    # assigns them a ModelShardingContext (None = unsharded evaluation).
+    shards_pair_axis = False
+    model_sharding = None
+
     def __init__(self):
         """
         Initialize module. Set what inputs are required for each output,

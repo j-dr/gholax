@@ -59,6 +59,8 @@ class Limber(LikelihoodModule):
     comoving distance to produce C_ell for each spectrum type.
     """
 
+    shards_pair_axis = True
+
     def __init__(
         self,
         observed_data_vector,
@@ -301,6 +303,16 @@ class Limber(LikelihoodModule):
                         )
                     if s.shape[0] == 1:
                         s = jnp.tile(s, (n_i, 1, 1))
+
+            if self.model_sharding is not None:
+                # This module is the first to touch the canonical pair axis:
+                # record its full length, then keep only this shard's block.
+                self.model_sharding.pair_counts[spec_type] = int(w_i.shape[0])
+                w_i = self.model_sharding.slice_local(w_i)
+                w_j = self.model_sharding.slice_local(w_j)
+                if not interp_shared:
+                    s = self.model_sharding.slice_local(s)
+                    zfield = self.model_sharding.slice_local(zfield)
 
             if interp_shared:
                 # One interpolation for all bin pairs; identical elementwise

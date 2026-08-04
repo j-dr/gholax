@@ -146,6 +146,57 @@ class Model:
 
         return jnp.nan_to_num(logp, nan=-jnp.inf)
 
+    def set_model_sharding(self, ctx):
+        """Propagate a ModelShardingContext (or None) to all likelihoods."""
+        for like in self.likelihoods.values():
+            if hasattr(like, "set_model_sharding"):
+                like.set_model_sharding(ctx)
+
+    def sharded_log_posterior_scaled_params(self, mesh):
+        """Build a jitted scaled log-posterior sharded over the mesh 'model' axis.
+
+        The returned function takes the same (dim,) normalized parameter
+        vector as log_posterior_scaled_params and returns the same scalar,
+        but evaluates the Nx2PT projection stage with its bin-pair axis
+        partitioned across the mesh's 'model' axis (replicated across any
+        other mesh axes). With model_shards == 1 this is a plain jit.
+
+        Side effect: the model's likelihoods are switched to sharded mode, so
+        after calling this with model_shards > 1, only evaluate the posterior
+        through the returned function (or inside an equivalent shard_map).
+
+        Args:
+            mesh: jax.sharding.Mesh containing a 'model' axis (from
+                gholax.util.distributed.build_mesh).
+
+        Returns:
+            Jitted callable (dim,) -> scalar.
+        """
+        from jax.sharding import PartitionSpec as P
+
+        from .distributed import MODEL_AXIS, ModelShardingContext
+
+        n_shards = mesh.shape[MODEL_AXIS]
+        ctx = ModelShardingContext(MODEL_AXIS, n_shards) if n_shards > 1 else None
+        self.set_model_sharding(ctx)
+        if ctx is None:
+            return jax.jit(self.log_posterior_scaled_params)
+
+        # check_vma=False: jax 0.6.2's varying-axes checker cannot type two
+        # legal patterns used here (jacfwd inside the shard body for analytic
+        # marginalization, and searchsorted's while_loop mixing model-varying
+        # queries with unvaried grids in the interpolators) and its own error
+        # message prescribes disabling it. Numerical equivalence of value and
+        # gradient vs the unsharded path is covered by tests/test_model_sharding.py.
+        f = jax.shard_map(
+            self.log_posterior_scaled_params,
+            mesh=mesh,
+            in_specs=P(),
+            out_specs=P(),
+            check_vma=False,
+        )
+        return jax.jit(f)
+
     def log_likelihood(self, param_values):
         """Compute the log-likelihood (without the prior contribution).
 

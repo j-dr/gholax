@@ -8,6 +8,8 @@ import jaxopt
 import numpy as np
 from blackjax.diagnostics import potential_scale_reduction
 
+from ..util.distributed import CHAIN_AXIS, gather_to_host, is_io_process
+
 ChainSetup = namedtuple(
     "ChainSetup",
     [
@@ -35,12 +37,36 @@ class BaseSampler(object):
     Checkpoint file names and formats written here are a public API — they
     are read by gholax.util.postprocess_chain from external notebooks and
     by the samplers' own restart paths. Do not change paths or keys.
+
+    Mesh mode: samplers that support it (NUTS, Minimize) set self.mesh from
+    the sampler config (n_chains / model_shards keys, see
+    gholax.util.distributed.build_mesh). Chains then map over the mesh
+    'chains' axis via shard_map instead of pmap, and each chain's posterior
+    is sharded over the 'model' axis. self.mesh is None by default, keeping
+    the legacy one-chain-per-local-device pmap behavior.
     """
 
+    mesh = None
+
     def _init_chains(self, model, jit_logpost=True):
-        """Seed the rng, extract prior scaling, and draw per-device initial
-        positions in normalized parameter space."""
-        rng_key = jax.random.key(int(datetime.now().strftime("%Y%m%d%s")))
+        """Seed the rng, extract prior scaling, and draw per-chain initial
+        positions in normalized parameter space.
+
+        In mesh mode the chain count comes from the mesh's 'chains' axis, the
+        rng seed is broadcast from process 0 (all processes must draw
+        identical warmup trajectories and initial positions), and jlp is the
+        model-sharded jitted posterior. ChainSetup.log_posterior is always
+        the raw (unwrapped) function: in mesh mode it is what kernels running
+        *inside* the chain shard_map must close over.
+        """
+        seed = int(datetime.now().strftime("%Y%m%d%s"))
+        if self.mesh is not None and jax.process_count() > 1:
+            from jax.experimental import multihost_utils
+
+            seed = int(
+                multihost_utils.broadcast_one_to_all(jnp.uint32(seed % (2**31)))
+            )
+        rng_key = jax.random.key(seed)
         param_names = model.prior.params
         prior = model.prior
 
@@ -48,7 +74,10 @@ class BaseSampler(object):
         reference = prior.get_reference_values()
         log_posterior = model.log_posterior_scaled_params
 
-        n_devices = jax.local_device_count()
+        if self.mesh is not None:
+            n_devices = self.mesh.shape[CHAIN_AXIS]
+        else:
+            n_devices = jax.local_device_count()
         keys = jax.random.split(rng_key, n_devices + 1)
         rng_key = keys[0]
         initial_keys = keys[1:]
@@ -63,7 +92,13 @@ class BaseSampler(object):
             ]
         )
 
-        jlp = jax.jit(log_posterior) if jit_logpost else None
+        if self.mesh is not None:
+            # Activates pair-axis sharding on the model's likelihoods as a
+            # side effect; log_posterior above then contains model-axis
+            # collectives and may only run inside a shard_map.
+            jlp = model.sharded_log_posterior_scaled_params(self.mesh)
+        else:
+            jlp = jax.jit(log_posterior) if jit_logpost else None
 
         return ChainSetup(
             rng_key,
@@ -76,6 +111,49 @@ class BaseSampler(object):
             n_devices,
             initial_positions,
         )
+
+    def _chain_map(self, fn, chain_axes):
+        """shard_map analog of jax.pmap over the mesh 'chains' axis.
+
+        Args:
+            fn: Function of positional args, one chain's worth each.
+            chain_axes: Tuple with one entry per positional arg: 0 to split
+                the leading (chain) axis, None to replicate.
+
+        Returns:
+            Callable mapping over chains; outputs gain a leading chain axis.
+            fn executes once per chain group, replicated across the 'model'
+            axis devices of that group (whose lockstep is maintained by the
+            model-axis collectives inside the sharded posterior).
+        """
+        from jax.sharding import PartitionSpec as P
+
+        in_specs = tuple(P(CHAIN_AXIS) if a == 0 else P() for a in chain_axes)
+
+        def body(*bargs):
+            unbatched = [
+                jax.tree.map(lambda x: x[0], b) if a == 0 else b
+                for b, a in zip(bargs, chain_axes)
+            ]
+            out = fn(*unbatched)
+            return jax.tree.map(lambda x: jnp.asarray(x)[None], out)
+
+        mapped = jax.shard_map(
+            body,
+            mesh=self.mesh,
+            in_specs=in_specs,
+            out_specs=P(CHAIN_AXIS),
+            check_vma=False,
+        )
+        return jax.jit(mapped)
+
+    def _map_chains(self, fn, chain_axes=(0,)):
+        """Map fn over chains: pmap in legacy mode, _chain_map in mesh mode."""
+        if self.mesh is None:
+            return jax.pmap(
+                fn, in_axes=tuple(0 if a == 0 else None for a in chain_axes)
+            )
+        return self._chain_map(fn, chain_axes)
 
     def _hessian_mass_matrix(self, jlp, position):
         """Estimate diagonal inverse mass matrix from the Hessian of the log posterior.
@@ -121,22 +199,24 @@ class BaseSampler(object):
         vgrad = jax.value_and_grad(jnlp)
         solver = jaxopt.LBFGS(fun=vgrad, value_and_grad=True)
 
-        minimize_pmap = jax.pmap(solver.run, in_axes=(0))
+        minimize_map = self._map_chains(solver.run)
         print("Running minimization before sampling", flush=True)
-        res = minimize_pmap(initial_positions)
-        initial_positions = res.params
-        with open(f"{output_file}.minimization_results.json", "w") as fp:
-            json.dump(
-                {
-                    "x_opt": initial_positions.tolist(),
-                    "value": res.state.value.tolist(),
-                },
-                fp,
-            )
+        res = minimize_map(initial_positions)
+        initial_positions = gather_to_host(res.params)
+        values = gather_to_host(res.state.value)
+        if is_io_process():
+            with open(f"{output_file}.minimization_results.json", "w") as fp:
+                json.dump(
+                    {
+                        "x_opt": initial_positions.tolist(),
+                        "value": values.tolist(),
+                    },
+                    fp,
+                )
 
-        chi2_ratio = res.state.value / np.min(res.state.value)
+        chi2_ratio = values / np.min(values)
         initial_positions_min = jnp.tile(
-            initial_positions[jnp.argmin(res.state.value)], n_devices
+            initial_positions[np.argmin(values)], n_devices
         ).reshape(n_devices, -1)
         initial_positions = jnp.where(
             chi2_ratio[:, None] > chi2_threshold,
@@ -168,6 +248,31 @@ class BaseSampler(object):
             in_axes=(0, None, 0, None),
             static_broadcasted_argnums=(1, 3),
         )
+
+    def _make_mesh_inference_loop(self, kernel, num_samples, collect_info=False):
+        """Mesh analog of _make_pmap_inference_loop.
+
+        kernel and num_samples are closed over (they were static pmap args);
+        the returned callable matches the pmap loop's call signature so
+        _run_convergence_loop can drive either interchangeably.
+        """
+
+        def inference_loop(rng_key, initial_state):
+            def one_step(state, k):
+                state, info = kernel(k, state)
+                return state, ([state, info] if collect_info else state)
+
+            keys = jax.random.split(rng_key, num_samples)
+            _, states = jax.lax.scan(one_step, initial_state, keys)
+
+            return states
+
+        mapped = self._chain_map(inference_loop, (0, 0))
+
+        def loop(sample_keys, _kernel, states, _num_samples):
+            return mapped(sample_keys, states)
+
+        return loop
 
     def _save_checkpoint(self, output_file, samples, log_density, sigmas, reference):
         """Write physical-space samples and log posterior checkpoints."""
@@ -221,12 +326,17 @@ class BaseSampler(object):
                     sample_keys, kernel, states, self.n_steps_incr
                 )
 
+            # In multi-process runs each host holds only its shard of the
+            # chain axis; gather so R-hat sees all chains and checkpoints are
+            # complete (no-op device-to-host transfer otherwise).
+            batch_positions = gather_to_host(states.position)
+            batch_logdensity = gather_to_host(states.logdensity)
             if (counter == 0) & (n_steps == 0):
-                samples = states.position
-                log_density = states.logdensity
+                samples = batch_positions
+                log_density = batch_logdensity
             else:
-                samples = np.hstack([samples, states.position])
-                log_density = np.hstack([log_density, states.logdensity])
+                samples = np.hstack([samples, batch_positions])
+                log_density = np.hstack([log_density, batch_logdensity])
 
             rhat = jnp.mean(potential_scale_reduction(samples))
 
@@ -234,7 +344,10 @@ class BaseSampler(object):
             print(f"rhat - 1 = {rhat - 1}", flush=True)
 
             counter += 1
-            self._save_checkpoint(output_file, samples, log_density, sigmas, reference)
+            if is_io_process():
+                self._save_checkpoint(
+                    output_file, samples, log_density, sigmas, reference
+                )
             n_steps = samples.shape[1]
 
             keys = jax.random.split(rng_key, 1 + n_devices)

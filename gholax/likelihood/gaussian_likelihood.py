@@ -28,6 +28,9 @@ class GaussianLikelihood(Likelihood):
         # memory of roughly the largest single module. Requires the
         # differentiable (emulator-mode) pipeline.
         self.gradient_checkpointing = config.get("gradient_checkpointing", False)
+        # Set via set_model_sharding when the posterior runs inside a
+        # shard_map with a 'model' mesh axis; None = unsharded evaluation.
+        self.model_sharding = None
 
         if self.analytic_marginalization:
             self.linear_params_filename = config["linear_params_filename"]
@@ -63,6 +66,24 @@ class GaussianLikelihood(Likelihood):
     def _augment_free_params(self):
         """Add analytically marginalized linear nuisance params to free_params."""
         self.free_params.update(self.linear_params_dict)
+
+    def set_model_sharding(self, ctx):
+        """Enable (or disable, ctx=None) pair-axis sharding of the pipeline.
+
+        Propagates a ModelShardingContext to every pipeline module that
+        declares `shards_pair_axis`. The likelihood itself only records the
+        context if at least one module shards (e.g. RSDPK pipelines have no
+        sharding modules and keep replicated evaluation).
+
+        After enabling, the posterior may only be evaluated inside a
+        jax.shard_map over a mesh containing the context's axis.
+        """
+        any_sharded = False
+        for module in self.likelihood_pipeline:
+            if getattr(module, "shards_pair_axis", False):
+                module.model_sharding = ctx
+                any_sharded = ctx is not None
+        self.model_sharding = ctx if any_sharded else None
 
     def setup_training_requirements(self, required_data):
         """Determine pipeline modules and parameters needed for training data generation.
@@ -193,8 +214,15 @@ class GaussianLikelihood(Likelihood):
         dv = self.observed_data_vector
         model = []
         for t in dv.spectrum_types:
+            obs = state[f"{t}_obs"]
+            if self.model_sharding is not None:
+                # obs is this shard's block of the pair axis; reassemble the
+                # full axis (replicated) before gathering observed pairs.
+                obs = self.model_sharding.gather_full(
+                    obs, self.model_sharding.pair_counts[t]
+                )
             def f(carry, i):
-                return (carry, state[f"{t}_obs"][i])
+                return (carry, obs[i])
             _, m_t = scan(f, 0, self.all_spectra[t])
             model.append(m_t.flatten())
 

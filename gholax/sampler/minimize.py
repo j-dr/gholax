@@ -21,6 +21,7 @@ class Minimize(BaseSampler):
             config: Full config dict containing 'sampler' -> 'Minimize' section.
         """
         c = config["sampler"]["Minimize"]
+        self._sampler_cfg = c
 
         self.random_start = c.get("random_start", True)
 
@@ -35,6 +36,10 @@ class Minimize(BaseSampler):
             Tuple of (samples array with shape (n_devices, 1, n_params+1),
             parameter names list).
         """
+        from ..util.distributed import build_mesh, gather_to_host, is_io_process
+
+        self.mesh = build_mesh(self._sampler_cfg)
+
         (
             rng_key,
             param_names,
@@ -51,21 +56,22 @@ class Minimize(BaseSampler):
         vgrad = jax.value_and_grad(jnlp)
         solver = jaxopt.LBFGS(fun=vgrad, value_and_grad=True)
 
-        minimize_pmap = jax.pmap(solver.run, in_axes=(0))
+        minimize_map = self._map_chains(solver.run)
         print("Running minimization", flush=True)
-        res = minimize_pmap(initial_positions)
+        res = minimize_map(initial_positions)
 
-        optimal_positions = res.params
-        optimal_values = res.state.value
+        optimal_positions = gather_to_host(res.params)
+        optimal_values = gather_to_host(res.state.value)
 
-        with open(f"{output_file}.minimization_results.json", "w") as fp:
-            json.dump(
-                {
-                    "x_opt": optimal_positions.tolist(),
-                    "value": optimal_values.tolist(),
-                },
-                fp,
-            )
+        if is_io_process():
+            with open(f"{output_file}.minimization_results.json", "w") as fp:
+                json.dump(
+                    {
+                        "x_opt": optimal_positions.tolist(),
+                        "value": optimal_values.tolist(),
+                    },
+                    fp,
+                )
 
         samples = optimal_positions * sigmas[None, :] + reference[None, :]
         log_density = -optimal_values

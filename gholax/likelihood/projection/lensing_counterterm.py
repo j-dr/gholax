@@ -20,6 +20,8 @@ class LensingCounterterm(LikelihoodModule):
     a cutoff scale and adds counterterm corrections to C_ell.
     """
 
+    shards_pair_axis = True
+
     def __init__(
         self,
         observed_data_vector,
@@ -383,7 +385,13 @@ class LensingCounterterm(LikelihoodModule):
 
                         n_i = w_i_n.shape[0]
                         n_j = w_j_n.shape[0]
-                        n_c_l = c_l.shape[0]
+                        # Under sharding c_l is a local block; the per-pair
+                        # arrays are built at the full pair length recorded by
+                        # Limber, then sliced to the same block.
+                        if self.model_sharding is not None:
+                            n_c_l = self.model_sharding.pair_counts[t]
+                        else:
+                            n_c_l = c_l.shape[0]
                         if n_i != n_c_l:
                             w_i_n = jnp.repeat(w_i_n, n_j, 0)
                         if n_j != n_c_l:
@@ -391,6 +399,9 @@ class LensingCounterterm(LikelihoodModule):
                                 w_j_n = jnp.tile(w_j_n, (n_i // n_j, 1))
                             else:
                                 w_j_n = jnp.tile(w_j_n, (n_i, 1))
+                        if self.model_sharding is not None:
+                            w_i_n = self.model_sharding.slice_local(w_i_n)
+                            w_j_n = self.model_sharding.slice_local(w_j_n)
 
                         # Contract only the sparse (N, n, m, o) terms with
                         # N == n + m + o over the shared index axis s.
@@ -405,25 +416,19 @@ class LensingCounterterm(LikelihoodModule):
                             * (3 / 2 * state["omegam"] / self.hubble_radius**2) ** 2
                         )
 
-                        if "mag" in w_i:
-                            smag = param_vec[self.param_indices[w_i]][:, 0]
-                            if smag.shape[0] != c_l_uv.shape[0]:
-                                c_l_uv = (
-                                    c_l_uv.reshape(smag.shape[0], -1, self.n_ell)
-                                    * (5 * smag[:, None, None] - 2)
-                                ).reshape(-1, self.n_ell)
-                            else:
-                                c_l_uv = c_l_uv * (5 * smag[:, None] - 2)
-
-                        if "mag" in w_j:
-                            smag = param_vec[self.param_indices[w_j]][:, 0]
-                            if smag.shape[0] != c_l_uv.shape[0]:
-                                c_l_uv = (
-                                    c_l_uv.reshape(smag.shape[0], -1, self.n_ell)
-                                    * (5 * smag[:, None, None] - 2)
-                                ).reshape(-1, self.n_ell)
-                            else:
-                                c_l_uv = c_l_uv * (5 * smag[:, None] - 2)
+                        for w_mag in (w_i, w_j):
+                            if "mag" not in w_mag:
+                                continue
+                            smag = param_vec[self.param_indices[w_mag]][:, 0]
+                            # Build the full per-pair magnification vector
+                            # (repeat = the row-major grouping the previous
+                            # reshape-based scaling applied), then slice to
+                            # the local block under sharding.
+                            if smag.shape[0] != n_c_l:
+                                smag = jnp.repeat(smag, n_c_l // smag.shape[0])
+                            if self.model_sharding is not None:
+                                smag = self.model_sharding.slice_local(smag)
+                            c_l_uv = c_l_uv * (5 * smag[:, None] - 2)
 
                         state[f"{t}_w_lensing_ct"] = c_l + c_l_uv
                         add_ct = True
