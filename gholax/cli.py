@@ -1,13 +1,9 @@
 #!/usr/bin/python3
 import yaml
 import sys
-from . import sampler
-from .util import Model
 import jax
 import numpy as np
-import os
 jax.config.update("jax_default_matmul_precision", "float32")
-os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"]=".25"
 #jax.config.update("jax_log_compiles", True)
 
 def main():
@@ -32,6 +28,15 @@ def main():
             f"{jax.device_count()} global devices",
             flush=True,
         )
+
+    # Imported only after maybe_init_distributed: this import chain reaches
+    # interpax, which materializes a jnp array at module scope and so brings
+    # up the XLA backend. Importing it earlier makes
+    # jax.distributed.initialize() fail ("must be called before any JAX calls
+    # that might initialise the XLA backend") and leaves every task on a node
+    # holding all of that node's GPUs, which then OOMs.
+    from . import sampler
+    from .util import Model
 
     if len(sys.argv) > 2:
         restart = bool(int(sys.argv[2]))

@@ -21,11 +21,11 @@ import yaml
 
 
 RSD_CONFIG = os.path.join(
-    os.path.dirname(__file__), '..', 'example_configs', 'abcacus_dr1_rsd.yaml'
+    os.path.dirname(__file__), '..', 'example_configs', 'abacus_rsd_example.yaml'
 )
 
 
-def _rsd_cfg(tmp_path, restart=False, n_chains=2, model_shards=2):
+def _rsd_cfg(tmp_path, restart=False, n_chains=2, model_shards=2, n_steps_min=4):
     with open(RSD_CONFIG) as f:
         cfg = yaml.load(f, Loader=yaml.SafeLoader)
 
@@ -37,7 +37,7 @@ def _rsd_cfg(tmp_path, restart=False, n_chains=2, model_shards=2):
             "adaptive_warmup_stage_steps": 5,
             "adaptive_warmup_min_steps": 5,
             "adaptive_warmup_max_steps": 10,
-            "n_steps_min": 4,
+            "n_steps_min": n_steps_min,
             "n_steps_incr": 2,
             "target_r_minus_one": 1e6,  # stop at n_steps_min
             "random_start": False,
@@ -71,13 +71,25 @@ def test_nuts_mesh_smoke_and_restart(tmp_path):
     chk = np.load(f"{cfg['output_file']}.samples_chk.npy")
     assert chk.shape[0] == 2 and chk.shape[2] == n_params
 
-    # restart: resumes from the checkpoint and appends
-    cfg_r = _rsd_cfg(tmp_path, restart=True)
+    # restart: resumes from the checkpoint and appends. n_steps_min is raised
+    # past the checkpointed length so the convergence loop actually runs a
+    # batch instead of returning the loaded samples untouched.
+    cfg_r = _rsd_cfg(tmp_path, restart=True, n_steps_min=chk.shape[1] + 2)
     model_r = Model(cfg_r)
     sampler_r = NUTS(cfg_r)
     samples_r, _ = sampler_r.run(model_r, cfg_r["output_file"])
-    assert samples_r.shape[1] >= samples.shape[1]
+    assert samples_r.shape[1] > samples.shape[1]
     assert np.all(np.isfinite(np.asarray(samples_r)))
+
+    # The resumed prefix must come back byte-identical. Checkpoints hold
+    # physical-space samples while the loop accumulates normalized ones, so a
+    # missing conversion on load silently re-applies sigma/reference to every
+    # previously collected sample on each restart.
+    chk_r = np.load(f"{cfg_r['output_file']}.samples_chk.npy")
+    assert chk_r.shape[1] > chk.shape[1]
+    assert np.allclose(chk_r[:, : chk.shape[1], :], chk), (
+        "restart rescaled the resumed samples"
+    )
 
 
 def test_mesh_loop_chain_independence():

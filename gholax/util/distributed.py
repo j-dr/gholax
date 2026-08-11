@@ -5,9 +5,17 @@ chains are data-parallel across the 'chains' axis, and each chain's posterior
 evaluation/gradient may additionally be sharded across the 'model' axis
 (bin-pair sharding of the projection stage in Nx2PT likelihoods).
 
-Multi-node runs use jax.distributed: one process per GPU launched by slurm
-(e.g. `srun --ntasks-per-node=4 --gpus-per-task=1 run-gholax cfg.yaml`), all
-processes forming a single global mesh and a single logical run.
+Multi-node runs use jax.distributed: one process per GPU launched by slurm,
+all processes forming a single global mesh and a single logical run, e.g.
+
+    srun -N2 --ntasks-per-node=4 --gpus-per-node=4 --gpu-bind=none \
+        run-gholax cfg.yaml
+
+Every task must see *all* of its node's GPUs. jax.distributed picks each
+process's device by indexing SLURM_LOCALID into the visible device list, so
+restricting visibility per task (`--gpus-per-task=1`, `--gpu-bind=closest`,
+or exporting CUDA_VISIBLE_DEVICES) leaves each task with a single device and
+that index out of range: "no supported devices found for platform CUDA".
 """
 
 import os

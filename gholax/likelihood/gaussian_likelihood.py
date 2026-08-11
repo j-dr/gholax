@@ -132,7 +132,7 @@ class GaussianLikelihood(Likelihood):
         return required_modules_all, required_params_all
 
     def predict_model(
-        self, params, params_am, return_state=False, apply_scale_mask=True,
+        self, params, params_am=None, return_state=False, apply_scale_mask=True,
         apply_window=True,
     ):
         """Run the full pipeline and return the model prediction vector.
@@ -148,7 +148,8 @@ class GaussianLikelihood(Likelihood):
             Model prediction vector, or (prediction, state) if return_state.
         """
         params_all = params.copy()
-        params_all.update(params_am)
+        if params_am is not None:
+            params_all.update(params_am)
         state, params_dict = self.setup_state_params(params_all)
 
         pipeline = self.likelihood_pipeline if apply_window else self.likelihood_pipeline[:-1]

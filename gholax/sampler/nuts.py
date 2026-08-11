@@ -259,11 +259,16 @@ class NUTS(BaseSampler):
             inverse_mass_matrix = jnp.array(warmup_parameters["inverse_mass_matrix"])
             step_size = jnp.array(warmup_parameters["step_size"])
             if os.path.exists(f"{output_file}.samples_chk.npy"):
-                samples = np.load(f"{output_file}.samples_chk.npy")
+                # The checkpoint stores physical-space samples, but the
+                # convergence loop accumulates normalized ones and rescales on
+                # every write. Convert back on load, otherwise each restart
+                # re-applies sigma/reference to the whole resumed prefix.
+                samples = (
+                    np.load(f"{output_file}.samples_chk.npy")
+                    - np.asarray(reference)[None, None, :]
+                ) / np.asarray(sigmas)[None, None, :]
                 log_density = np.load(f"{output_file}.logposterior_chk.npy")
-                initial_state = (samples[:, -1, :] - reference[None, :]) / sigmas[
-                    None, :
-                ]
+                initial_state = samples[:, -1, :]
             else:
                 samples = None
                 log_density = None

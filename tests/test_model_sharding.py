@@ -112,7 +112,7 @@ def test_rsd_replicated_on_mesh():
     from gholax.util.model import Model
 
     cfg_path = os.path.join(
-        os.path.dirname(__file__), '..', 'example_configs', 'abcacus_dr1_rsd.yaml'
+        os.path.dirname(__file__), '..', 'example_configs', 'abacus_rsd_example.yaml'
     )
     with open(cfg_path) as f:
         cfg = yaml.load(f, Loader=yaml.SafeLoader)
