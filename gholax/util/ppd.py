@@ -29,7 +29,7 @@ import argparse
 import os
 import warnings
 from collections import namedtuple
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import h5py as h5
 import jax
@@ -84,6 +84,10 @@ class PPDResult:
         sample_index: (n_samples,) indices back into the post-burn-in, post-thin
             chain samples. Not simply arange(n_samples) when non-finite
             predictions were dropped.
+        excluded: ExcludedElements the scale cuts removed from the predicted
+            data vector, carried purely so the panel plots can show what was cut
+            rather than leaving blank space. None for a result built by hand or
+            read from an older cache.
     """
 
     p_value: float
@@ -104,6 +108,7 @@ class PPDResult:
     params: dict = field(default_factory=dict, repr=False)
     drawn_params: list = field(default_factory=list, repr=False)
     sample_index: np.ndarray = field(default=None, repr=False)
+    excluded: object = field(default=None, repr=False)
 
     def worst_samples(self, k=10):
         """The k samples with the largest chi2_obs, with the parameters behind them.
@@ -177,7 +182,7 @@ def element_key_fields(dv):
     ]
 
 
-def element_keys(dv, likelihood_name):
+def element_keys(dv, likelihood_name, indices=None):
     """Tuple keys identifying each *masked* element of a data vector.
 
     The key fields are taken from ``dv._covariance_match_fields()`` -- the same
@@ -189,13 +194,16 @@ def element_keys(dv, likelihood_name):
         dv: A DataVector instance with load_data() already called.
         likelihood_name: Name of the owning likelihood, used to keep elements of
             different likelihoods distinct.
+        indices: Rows of ``dv.spectra`` to key, defaulting to the elements
+            surviving the scale cuts.
 
     Returns:
-        List of hashable tuples, one per element surviving the scale cuts, in
-        data vector order.
+        List of hashable tuples, one per element, in data vector order.
     """
     fields = element_key_fields(dv)[1:]
-    rows = np.asarray(dv.spectra)[np.asarray(dv.scale_mask)]
+    if indices is None:
+        indices = dv.scale_mask
+    rows = np.asarray(dv.spectra)[np.asarray(indices, dtype=int)]
 
     keys = []
     for row in rows:
@@ -228,6 +236,81 @@ class ModelElements:
     cov: np.ndarray
     slices: dict
     key_fields: dict = field(default_factory=dict)
+    excluded: object = None
+
+
+@dataclass
+class ExcludedElements:
+    """The elements the scale cuts removed, and what the model says about them.
+
+    These take no part in any p-value -- nothing conditions or is tested on
+    them -- but the model does predict them, and a panel plot that shows the
+    measurement and the prediction at the cut scales says what the cuts cost.
+
+    Attributes:
+        keys: Element keys, in the same form as ``ModelElements.keys``.
+        d_obs: (n,) observed values.
+        sigma: (n,) square roots of the covariance diagonal.
+        key_fields: Field names of each likelihood's keys, as in ModelElements.
+        rows: Per likelihood, the rows of its data vector these came from.
+        slices: Per likelihood, its slice of the concatenated arrays.
+        mu_med, mu_lo, mu_hi: (n,) median and 16/84th percentiles of the model
+            prediction over the posterior samples, or None when the elements
+            were collected without running the model.
+    """
+
+    keys: list
+    d_obs: np.ndarray
+    sigma: np.ndarray
+    key_fields: dict = field(default_factory=dict)
+    rows: dict = field(default_factory=dict, repr=False)
+    slices: dict = field(default_factory=dict, repr=False)
+    mu_med: np.ndarray = None
+    mu_lo: np.ndarray = None
+    mu_hi: np.ndarray = None
+
+    def __len__(self):
+        return len(self.keys)
+
+
+def excluded_elements(model):
+    """Collect every data vector element the scale cuts removed from a Model.
+
+    Args:
+        model: A Model instance.
+
+    Returns:
+        ExcludedElements, empty when nothing was cut or no covariance is loaded.
+        The model predictions are left unset; :func:`posterior_predictive_test`
+        fills them in from the posterior samples.
+    """
+    keys, d_obs, sigma, key_fields, rows, slices = [], [], [], {}, {}, {}
+    start = 0
+
+    for lname, like in model.likelihoods.items():
+        dv = like.observed_data_vector
+        cut = np.setdiff1d(np.arange(len(np.asarray(dv.spectra))),
+                           np.asarray(dv.scale_mask, dtype=int))
+        cov = getattr(dv, "cov", None)
+        if cut.size == 0 or cov is None:
+            continue
+
+        keys.extend(element_keys(dv, lname, cut))
+        d_obs.append(np.asarray(dv.measured_spectra, dtype=float)[cut])
+        sigma.append(np.sqrt(np.diag(np.asarray(cov["value"], dtype=float))[cut]))
+        key_fields[lname] = element_key_fields(dv)
+        rows[lname] = cut
+        slices[lname] = slice(start, start + cut.size)
+        start += cut.size
+
+    return ExcludedElements(
+        keys=keys,
+        d_obs=np.concatenate(d_obs) if d_obs else np.zeros(0),
+        sigma=np.concatenate(sigma) if sigma else np.zeros(0),
+        key_fields=key_fields,
+        rows=rows,
+        slices=slices,
+    )
 
 
 def collect_elements(model):
@@ -280,6 +363,7 @@ def collect_elements(model):
         cov=block_diag(*blocks) if blocks else np.zeros((0, 0)),
         slices=slices,
         key_fields=key_fields,
+        excluded=excluded_elements(model),
     )
 
 
@@ -641,7 +725,7 @@ def _am_params(pred_like, chain_like, params_chain, n, rng, sample_am_params,
 
 
 def _predict(elements, params_all, chain_model, n, rng, sample_am_params,
-             batch_size, use_vmap):
+             batch_size, use_vmap, cut_out=None):
     """Model predictions for every element of a ModelElements view.
 
     Args:
@@ -655,34 +739,56 @@ def _predict(elements, params_all, chain_model, n, rng, sample_am_params,
         sample_am_params: Whether to sample AM parameters or use prior means.
         batch_size: Chunk size for batched evaluation.
         use_vmap: Whether to attempt vmap.
+        cut_out: (n, n_excluded) array to fill with the predictions at the
+            elements the scale cuts removed, or None to skip them. The scale
+            mask is applied at the very end of the pipeline, so these cost
+            nothing beyond the indexing -- the same evaluation supplies both.
 
     Returns:
         (n, n_elements) array of predictions in element order.
     """
     out = np.empty((n, len(elements.keys)), dtype=float)
+    excluded = getattr(elements, "excluded", None)
 
     for lname, like in elements.model.likelihoods.items():
         chain_like = chain_model.likelihoods.get(lname) if chain_model else None
         params_like = {k: params_all[k] for k in like.sampled_params}
+
+        cut_rows = None if cut_out is None or excluded is None else (
+            excluded.rows.get(lname))
+        masked = cut_rows is None
 
         params_am = _am_params(
             like, chain_like, params_all, n, rng, sample_am_params,
             batch_size, use_vmap, lname,
         )
 
-        def predict(args, _like=like):
+        def predict(args, _like=like, _masked=masked):
             params, params_am_i = args
-            return _like.predict_model(params, params_am_i if params_am_i else {})
+            return _like.predict_model(params, params_am_i if params_am_i else {},
+                                       apply_scale_mask=_masked)
 
-        preds = _batched_map(
-            predict,
-            (params_like, params_am),
-            n,
-            batch_size,
-            use_vmap=use_vmap,
-            label=f"predictions for {lname!r}",
+        preds = np.asarray(
+            _batched_map(
+                predict,
+                (params_like, params_am),
+                n,
+                batch_size,
+                use_vmap=use_vmap,
+                label=f"predictions for {lname!r}",
+            ),
+            dtype=float,
         )
-        out[:, elements.slices[lname]] = np.asarray(preds, dtype=float)
+
+        width = elements.slices[lname].stop - elements.slices[lname].start
+        if masked or preds.shape[1] == width:
+            # A likelihood that ignores apply_scale_mask leaves nothing to
+            # index; its cut elements simply keep no prediction.
+            out[:, elements.slices[lname]] = preds
+        else:
+            mask = np.asarray(like.observed_data_vector.scale_mask, dtype=int)
+            out[:, elements.slices[lname]] = preds[:, mask]
+            cut_out[:, excluded.slices[lname]] = preds[:, cut_rows]
 
     return out
 
@@ -710,7 +816,7 @@ def _build_params(model, samples, names, n, rng):
 
 
 def _predict_finite(elements, params, drawn, chain_model, n, rng, sample_am_params,
-                    batch_size, use_vmap, retries):
+                    batch_size, use_vmap, retries, cut_out=None):
     """Predict, redrawing prior-drawn parameters until the prediction is finite.
 
     Parameters the chain did not sample are drawn from their prior, which is
@@ -737,12 +843,14 @@ def _predict_finite(elements, params, drawn, chain_model, n, rng, sample_am_para
         batch_size: Chunk size for batched evaluation.
         use_vmap: Whether to attempt vmap.
         retries: Maximum number of redraw rounds.
+        cut_out: (n, n_excluded) array to fill with the predictions at the
+            scale-cut elements, kept in step with the redraws.
 
     Returns:
         (n, n_elements) array of predictions.
     """
     mu = _predict(elements, params, chain_model, n, rng, sample_am_params,
-                  batch_size, use_vmap)
+                  batch_size, use_vmap, cut_out)
 
     if not drawn:
         return mu
@@ -758,18 +866,129 @@ def _predict_finite(elements, params, drawn, chain_model, n, rng, sample_am_para
         trial = {k: np.asarray(v)[idx] for k, v in params.items()}
         trial.update(sample_prior(elements.model.prior, drawn, idx.size, rng))
 
+        cut_trial = None if cut_out is None else np.full(
+            (idx.size, cut_out.shape[1]), np.nan)
         mu_trial = _predict(elements, trial, chain_model, idx.size, rng,
-                            sample_am_params, batch_size, use_vmap)
+                            sample_am_params, batch_size, use_vmap, cut_trial)
 
         ok = np.isfinite(mu_trial).all(axis=1)
         if not ok.any():
             continue
 
         mu[idx[ok]] = mu_trial[ok]
+        if cut_out is not None:
+            cut_out[idx[ok]] = cut_trial[ok]
         for name in drawn:
             params[name][idx[ok]] = trial[name][ok]
 
     return mu
+
+
+def _cut_predictions_array(elements, n):
+    """(n, n_excluded) buffer for the predictions at the scale-cut elements."""
+    excluded = getattr(elements, "excluded", None)
+    if excluded is None or not len(excluded):
+        return None
+
+    return np.full((n, len(excluded)), np.nan)
+
+
+def _with_cut_predictions(excluded, mu_cut, keep):
+    """Summarize the scale-cut predictions of the kept samples onto `excluded`.
+
+    Only the median and the 68% interval are kept: the panel plots draw nothing
+    else from them, and the full (n_samples, n_excluded) block would swell a
+    saved result with a set of elements no p-value ever touches.
+    """
+    if excluded is None or mu_cut is None:
+        return excluded
+
+    mu_cut = mu_cut[keep]
+    if not len(mu_cut) or not np.isfinite(mu_cut).any():
+        return excluded
+
+    # A likelihood that ignores apply_scale_mask leaves its cut columns NaN,
+    # which is a gap in the drawn curve rather than something to warn about.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        lo, med, hi = np.nanpercentile(mu_cut, [16.0, 50.0, 84.0], axis=0)
+
+    return replace(excluded, mu_med=med, mu_lo=lo, mu_hi=hi)
+
+
+def fill_excluded_predictions(result, prediction_config, chain_config=None,
+                              max_samples=100, seed=0, sample_am_params=True,
+                              batch_size=64, use_vmap=True):
+    """Evaluate the model at the scale-cut elements of a finished PPD.
+
+    :func:`posterior_predictive_test` does this as it goes, for free, since the
+    scale mask is applied at the end of the forward model.  A result that
+    predates that -- a cache written by an older version, or one built by hand
+    -- can still get the predictions here, because ``result.params`` holds
+    exactly the parameters the test fed the model.  This costs one forward-model
+    pass, so it is the fallback, not the route to take when the test is being
+    run anyway.
+
+    Args:
+        result: A PPDResult carrying `params`.
+        prediction_config: Config path or Model of whichever model the test
+            predicted with -- the prediction config where there was one, else
+            the chain's.
+        chain_config: Config path or Model of the chain, so analytically
+            marginalized parameters come from their conditional posterior rather
+            than their prior. Defaults to `prediction_config`.
+        max_samples: Evaluate at most this many of the result's samples, evenly
+            spaced. The percentiles of a band do not need all of them. None uses
+            every sample.
+        seed: Seed for the AM parameter draws.
+        sample_am_params, batch_size, use_vmap: As in
+            :func:`posterior_predictive_test`.
+
+    Returns:
+        A copy of `result` whose `excluded` carries mu_med/mu_lo/mu_hi, or
+        `result` itself when nothing was cut or the model cannot be evaluated at
+        the stored parameters.
+    """
+    pred_model = _resolve_model(prediction_config, None)
+    chain_model = _resolve_model(chain_config, pred_model)
+
+    elements = collect_elements(pred_model)
+    excluded = elements.excluded
+    if excluded is None or not len(excluded):
+        return result
+
+    params = {p: np.asarray(v, dtype=float) for p, v in result.params.items()}
+    if not params:
+        raise ValueError(
+            "The result carries no parameters, so the model cannot be "
+            "re-evaluated at the scale-cut elements."
+        )
+
+    missing = sorted(
+        {p for like in pred_model.likelihoods.values() for p in like.sampled_params}
+        - set(params)
+    )
+    if missing:
+        raise ValueError(
+            f"The result does not carry every parameter the prediction model "
+            f"samples; {len(missing)} missing, e.g. {missing[:5]}. Is "
+            f"prediction_config the config the test predicted with?"
+        )
+
+    n = len(next(iter(params.values())))
+    if max_samples is not None and n > max_samples:
+        take = np.linspace(0, n - 1, max_samples).astype(int)
+        params = {p: v[take] for p, v in params.items()}
+        n = len(take)
+
+    mu_cut = _cut_predictions_array(elements, n)
+    _predict(elements, params, chain_model, n, np.random.default_rng(seed),
+             sample_am_params, batch_size, use_vmap, mu_cut)
+
+    return replace(
+        result,
+        excluded=_with_cut_predictions(excluded, mu_cut, np.ones(n, dtype=bool)),
+    )
 
 
 def _usable_sample_mask(d2_obs, mu_cond, cov_cond, max_dropped_frac,
@@ -995,14 +1214,20 @@ def posterior_predictive_test(
             UserWarning,
         )
 
+    # The scale cuts are applied at the end of the forward model, so the model
+    # at the cut scales comes out of the same evaluation as the fitted one.
+    mu_cut = _cut_predictions_array(
+        elements_a if mode == GOODNESS_OF_FIT else elements_b, n)
+
     if mode == GOODNESS_OF_FIT:
         params, drawn = _build_params(chain_model, samples, names, n, rng)
         mu_cond = _predict_finite(elements_a, params, drawn, chain_model, n, rng,
                                   sample_am_params, batch_size, use_vmap,
-                                  nonfinite_retries)
+                                  nonfinite_retries, mu_cut)
         cov_cond = 0.5 * (elements_a.cov + elements_a.cov.T)
         d2_obs, pred_keys = elements_a.d_obs, elements_a.keys
         pred_key_fields = elements_a.key_fields
+        pred_excluded = elements_a.excluded
         params_used, drawn_used = params, drawn
 
     elif mode == NESTED_CONDITIONAL:
@@ -1022,7 +1247,7 @@ def posterior_predictive_test(
         params, drawn = _build_params(pred_model, samples, names, n, rng)
         mu = _predict_finite(elements_b, params, drawn, chain_model, n, rng,
                              sample_am_params, batch_size, use_vmap,
-                             nonfinite_retries)
+                             nonfinite_retries, mu_cut)
 
         cov = elements_b.cov
         mu_cond, cov_cond = conditional_moments(
@@ -1032,13 +1257,14 @@ def posterior_predictive_test(
         d2_obs = elements_b.d_obs[idx2]
         pred_keys = [elements_b.keys[i] for i in idx2]
         pred_key_fields = elements_b.key_fields
+        pred_excluded = elements_b.excluded
         params_used, drawn_used = params, drawn
 
     else:  # disjoint, with or without a cross-covariance
         params_b, drawn_b = _build_params(pred_model, samples, names, n, rng)
         mu2 = _predict_finite(elements_b, params_b, drawn_b, chain_model, n, rng,
                               sample_am_params, batch_size, use_vmap,
-                              nonfinite_retries)
+                              nonfinite_retries, mu_cut)
 
         if mode == DISJOINT_INDEPENDENT:
             mu_cond = mu2
@@ -1060,6 +1286,7 @@ def posterior_predictive_test(
 
         d2_obs, pred_keys = elements_b.d_obs, elements_b.keys
         pred_key_fields = elements_b.key_fields
+        pred_excluded = elements_b.excluded
 
     # A single filtering step, after the conditional so that an unusable
     # prediction in either block has already propagated into mu_cond.
@@ -1067,6 +1294,8 @@ def posterior_predictive_test(
         d2_obs, mu_cond, cov_cond, max_dropped_frac, max_residual_sigma
     )
     mu_cond = mu_cond[keep]
+
+    pred_excluded = _with_cut_predictions(pred_excluded, mu_cut, keep)
 
     p_value, chi2_rep, chi2_obs, d_rep = ppd_pvalue(d2_obs, mu_cond, cov_cond, rng)
     n_kept = len(mu_cond)
@@ -1093,6 +1322,7 @@ def posterior_predictive_test(
         params=params_kept,
         drawn_params=list(drawn_used),
         sample_index=np.flatnonzero(keep),
+        excluded=pred_excluded,
     )
 
 
@@ -1137,10 +1367,16 @@ def _element_records(result):
         List of dicts with 'index', 'likelihood', 'spectrum_type', 'zbin0',
         'zbin1', 'ell' and 'separation', in data vector order.
     """
-    key_fields = getattr(result, "key_fields", None) or {}
+    return _records_from_keys(result.element_keys,
+                              getattr(result, "key_fields", None))
+
+
+def _records_from_keys(element_keys, key_fields):
+    """Decode a list of element keys into the records the panels are built from."""
+    key_fields = key_fields or {}
 
     records = []
-    for i, key in enumerate(result.element_keys):
+    for i, key in enumerate(element_keys):
         fields = dict(zip(_key_field_names(key, key_fields), key))
         records.append(
             {
@@ -1321,18 +1557,17 @@ def format_marginal_pvalues(result):
     return "\n".join(lines)
 
 
-def _grid_positions(panel_keys, max_cols=4):
+def _grid_positions(panel_keys):
     """Place each (zbin0, zbin1) panel in the grid of one figure.
 
     Statistics with cross-bin pairs get the layout the data vector plotting
     routines use -- zbin0 along the columns, zbin1 along the rows -- so the
     auto-spectra sit on the diagonal and each row and column is one tomographic
     bin.  A statistic with only auto-spectra would leave everything but that
-    diagonal empty, so those wrap into a compact grid instead.
+    diagonal empty, so those go in a single row instead.
 
     Args:
         panel_keys: Iterable of (zbin0, zbin1) pairs.
-        max_cols: Columns to wrap at in the auto-spectrum-only layout.
 
     Returns:
         Tuple of (n_rows, n_cols, positions), positions mapping each key to its
@@ -1342,10 +1577,8 @@ def _grid_positions(panel_keys, max_cols=4):
 
     if all(b0 == b1 for b0, b1 in panel_keys):
         ordered = sorted(panel_keys)
-        n_cols = min(max_cols, len(ordered))
-        n_rows = int(np.ceil(len(ordered) / n_cols))
 
-        return n_rows, n_cols, {k: divmod(i, n_cols) for i, k in enumerate(ordered)}
+        return 1, len(ordered), {k: (0, i) for i, k in enumerate(ordered)}
 
     b0s = sorted({b0 for b0, _ in panel_keys})
     b1s = sorted({b1 for _, b1 in panel_keys})
@@ -1419,10 +1652,12 @@ def _panel_axes(fig, n_rows, n_cols, predictions, occupied, sharex, sharey):
     """
     per_cell = 2 if predictions else 1
     axes = np.empty((per_cell * n_rows, n_cols), dtype=object)
-    # Columns can sit almost flush while they share a value axis, since only the
-    # leftmost carries tick labels; once they do not, every panel needs room for
-    # its own.
-    wspace = 0.05 if sharey in (True, "all", "row") else 0.28
+    # Columns can sit almost flush while they share their axes, since only the
+    # panels at the edge carry tick labels.  Once they do not, every panel needs
+    # room for its own -- value labels to its left, and the end labels of its
+    # separation axis, which overhang the panel on both sides.
+    flush = (sharey in (True, "all", "row")) and (sharex in (True, "all", "col"))
+    wspace = 0.05 if flush else 0.3
     outer = fig.add_gridspec(n_rows, n_cols, hspace=0.25, wspace=wspace)
 
     refs = {}
@@ -1468,11 +1703,62 @@ def _panel_axes(fig, n_rows, n_cols, predictions, occupied, sharex, sharey):
     return axes
 
 
-def _sorted_ells(panels):
+def _sorted_ells(*panel_sets):
     """Multipole orders present in a figure, with the None placeholder last."""
-    ells = {ell for series in panels.values() for ell in series}
+    ells = {ell for panels in panel_sets
+            for series in panels.values() for ell in series}
 
     return sorted(ells, key=lambda e: (e is None, e))
+
+
+def _cut_curve_segments(cx, cut_mu, fitted):
+    """The cut model curve, split into runs and joined onto the fitted curve.
+
+    Drawing the cut points as one curve leaves a blank interval wherever they
+    straddle the fitted range, and the alpha changes across it, so a continuous
+    model reads as a step. Each run of cut scales is drawn separately with the
+    fitted endpoint it abuts attached, which closes the gap.
+
+    Args:
+        cx: (n,) cut separations.
+        cut_mu: (median, lo, hi) of the model at `cx`.
+        fitted: (x, (median, lo, hi)) of the fitted curve in the same panel, or
+            None when nothing was fitted there.
+
+    Returns:
+        List of (x, (median, lo, hi)) segments, each sorted by x.
+    """
+    order = np.argsort(cx)
+    cx, cut_mu = cx[order], tuple(m[order] for m in cut_mu)
+    if fitted is None:
+        return [(cx, cut_mu)]
+
+    fx, fmu = fitted
+    runs = (
+        (cx < fx.min(), np.argmin(fx), True),
+        (cx > fx.max(), np.argmax(fx), False),
+        # A cut scale inside the fitted range is an interior hole, with a fitted
+        # neighbour on both sides and so nothing to join onto.
+        ((cx >= fx.min()) & (cx <= fx.max()), None, None),
+    )
+
+    out = []
+    for run, edge, before in runs:
+        if not run.any():
+            continue
+        x, mu = cx[run], tuple(m[run] for m in cut_mu)
+        if edge is None:
+            out.append((x, mu))
+        elif before:
+            out.append((np.concatenate([x, [fx[edge]]]),
+                        tuple(np.concatenate([m, [f[edge]]])
+                              for m, f in zip(mu, fmu))))
+        else:
+            out.append((np.concatenate([[fx[edge]], x]),
+                        tuple(np.concatenate([[f[edge]], m])
+                              for m, f in zip(mu, fmu))))
+
+    return out
 
 
 def _auto_xscale(x):
@@ -1484,8 +1770,8 @@ def _auto_xscale(x):
     return "log" if x.max() / x.min() > 20.0 else "linear"
 
 
-def _x_limits(x, scale, pad=0.05):
-    """Padded separation limits, computed rather than left to autoscale.
+def _padded_limits(x, scale, pad=0.05, factor=None):
+    """Padded axis limits, computed rather than left to autoscale.
 
     The zero line of a residual panel is an ``axhline``, whose endpoints enter
     the data limits as x = 0 and x = 1: on a log axis autoscaling would then
@@ -1493,9 +1779,13 @@ def _x_limits(x, scale, pad=0.05):
     actually measured.
 
     Args:
-        x: Every separation plotted in the figure.
+        x: Every value the axis has to hold.
         scale: 'log' or 'linear'.
         pad: Fraction of the range, or of the number of decades, to add.
+        factor: Multiplicative margin instead of ``pad`` -- 1.5 reaches half
+            again past the outermost point, which is where the scales a bin was
+            cut at are drawn.  Falls back to ``pad`` when the data reaches zero
+            and there is nothing to multiply.
 
     Returns:
         (low, high), or None if there is nothing plottable to bound.
@@ -1507,23 +1797,124 @@ def _x_limits(x, scale, pad=0.05):
         return None
 
     lo, hi = float(x.min()), float(x.max())
+    if factor is not None and lo > 0.0:
+        return lo / factor, hi * factor
     if lo == hi:
         delta = abs(lo) * 0.1 or 1.0
         return (lo / 1.1, hi * 1.1) if scale == "log" else (lo - delta, hi + delta)
+    if factor is not None:
+        return lo - (factor - 1.0) * (hi - lo), hi + (factor - 1.0) * (hi - lo)
     if scale == "log":
-        factor = (hi / lo) ** pad
-        return lo / factor, hi * factor
+        margin = (hi / lo) ** pad
+        return lo / margin, hi * margin
 
     return lo - pad * (hi - lo), hi + pad * (hi - lo)
 
 
-def _y_label(spectrum_type, x_power):
+def _compact_log_ticks(ax, bounds):
+    """Keep a narrow log separation axis from crowding its own tick labels.
+
+    Inside one decade matplotlib falls back to labelling the minor ticks, in
+    scientific notation, which is how a panel trimmed to a single bin's scale
+    cuts ends up with '2x10^2 3x10^2 4x10^2 6x10^2' overlapping itself.  Plain
+    numbers on a few chosen minor ticks say the same thing in a third of the
+    width.  Wider axes are left alone: their decade labels are already sparse.
+
+    Args:
+        ax: The axes whose x axis to retick.
+        bounds: The (low, high) limits set on it.
+
+    Returns:
+        None; the axis is modified in place.
+    """
+    from matplotlib.ticker import LogLocator, ScalarFormatter
+
+    if bounds[0] <= 0.0 or bounds[1] / bounds[0] >= 10.0:
+        return
+
+    ax.xaxis.set_minor_locator(LogLocator(base=10.0, subs=(2.0, 3.0, 5.0)))
+    for formatter in (ax.xaxis.set_major_formatter, ax.xaxis.set_minor_formatter):
+        scalar = ScalarFormatter()
+        scalar.set_useOffset(False)
+        formatter(scalar)
+
+
+def _resolve_limits(limits, lname, stype, tag):
+    """Axis limits for one figure: a pair, a dict of pairs per statistic, or None."""
+    if limits is None:
+        return None
+    if isinstance(limits, dict):
+        for key in (tag, (lname, stype), stype):
+            if key in limits:
+                return tuple(limits[key])
+        return None
+
+    return tuple(limits)
+
+
+# Latex for each statistic: which separation it is measured against, and the
+# symbol for the statistic itself.  Angular spectra follow the conventions of
+# DataVector.plot_spectra_vs_model so the two sets of figures read alike.
+_SEPARATION_LATEX = {
+    "ell": (r"$\ell$", r"\ell"),
+    "k": (r"$k$ [$h\,{\rm Mpc}^{-1}$]", "k"),
+}
+
+_SPECTRUM_LATEX = {
+    "c_dd": ("ell", r"C_\ell^{\delta_g \delta_g}"),
+    "c_dk": ("ell", r"C_\ell^{\delta_g \gamma_E}"),
+    "c_kk": ("ell", r"C_\ell^{\gamma_E \gamma_E}"),
+    "c_bb": ("ell", r"C_\ell^{\gamma_B \gamma_B}"),
+    "c_dcmbk": ("ell", r"C_\ell^{\delta_g \kappa_{\rm CMB}}"),
+    "c_cmbkcmbk": ("ell", r"C_\ell^{\kappa_{\rm CMB} \kappa_{\rm CMB}}"),
+    "p_gg_ell": ("k", r"P_\ell(k)"),
+    "alpha_iso": (None, r"\alpha_{\rm iso}"),
+    "alpha_par": (None, r"\alpha_\parallel"),
+    "alpha_perp": (None, r"\alpha_\perp"),
+}
+
+
+def _separation_kind(spectrum_type, has_multipole):
+    """Which separation a statistic is measured against, or None for neither.
+
+    Known statistics say so themselves; an unknown one is read off its shape,
+    since only a multipole decomposition carries a multipole order alongside its
+    separation, and that separation is a wavenumber.
+    """
+    if spectrum_type in _SPECTRUM_LATEX:
+        return _SPECTRUM_LATEX[spectrum_type][0]
+    if has_multipole:
+        return "k"
+
+    return "ell" if spectrum_type.startswith("c_") else None
+
+
+def _x_label(spectrum_type, has_multipole):
+    """Default separation axis label of one statistic."""
+    kind = _separation_kind(spectrum_type, has_multipole)
+    if kind is not None:
+        return _SEPARATION_LATEX[kind][0]
+
+    return "" if spectrum_type in _SPECTRUM_LATEX else "separation"
+
+
+def _y_label(spectrum_type, x_power, has_multipole=False):
     """Default label for a prediction panel, noting the separation weighting."""
-    if not x_power:
-        return spectrum_type
+    kind, symbol = _SPECTRUM_LATEX.get(spectrum_type, (None, None))
     power = "" if x_power == 1 else f"^{{{x_power:g}}}"
 
-    return rf"$x{power}\,\times\,$" + spectrum_type
+    if symbol is None:
+        kind = _separation_kind(spectrum_type, has_multipole)
+        if kind is None:
+            return spectrum_type if not x_power else (
+                rf"$x{power}\,\times\,$" + spectrum_type)
+        return (rf"${_SEPARATION_LATEX[kind][1]}{power}\,\times\,$"
+                + spectrum_type)
+
+    if kind is None or not x_power:
+        return f"${symbol}$"
+
+    return rf"${_SEPARATION_LATEX[kind][1]}{power}\,{symbol}$"
 
 
 def _resolve_label(label, lname, stype, tag, default):
@@ -1557,11 +1948,25 @@ def _resolve_label(label, lname, stype, tag, default):
     return default
 
 
-def plot_chi2(result):
+# Size of the text written inside a panel -- the bin pair, its p-value, and the
+# p-value of the chi2 figure.  Larger than the tick labels: it is the number the
+# figure exists to report, and it is read at whatever size the panel is printed.
+ANNOTATION_FONTSIZE = 13
+
+# How far past the outermost fitted scale a panel reaches, so the measurements
+# the scale cuts removed have somewhere to be drawn.
+CUT_XLIM_FACTOR = 1.5
+
+
+def plot_chi2(result, fontsize=None):
     """Replica versus observed discrepancy, the picture behind the p-value.
+
+    The p-value is written inside the axes rather than in a title, so it
+    survives a caller that strips the titles off before saving.
 
     Args:
         result: A PPDResult.
+        fontsize: Size of the inset text.
 
     Returns:
         A matplotlib figure.
@@ -1578,11 +1983,16 @@ def plot_chi2(result):
             label=r"$T(d_{\rm obs}, \Theta)$")
     ax.set_xlabel(r"$T(d, \Theta)$")
     ax.set_ylabel("density")
-    ax.set_title(
-        f"{result.mode}: $p = {result.p_value:.3f} \\pm {result.p_value_error:.3f}$"
-        f"  ($N_{{\\rm pred}} = {result.n_pred}$)"
+    ax.text(
+        0.97, 0.97,
+        f"{result.mode}\n"
+        f"$p = {result.p_value:.3f} \\pm {result.p_value_error:.3f}$\n"
+        f"$N_{{\\rm pred}} = {result.n_pred}$",
+        transform=ax.transAxes, ha="right", va="top",
+        fontsize=ANNOTATION_FONTSIZE if fontsize is None else fontsize,
+        bbox={"facecolor": "w", "alpha": 0.7, "edgecolor": "none", "pad": 2.0},
     )
-    ax.legend()
+    ax.legend(loc="upper left")
 
     return fig
 
@@ -1590,7 +2000,8 @@ def plot_chi2(result):
 def plot_ppd_panels(result, predictions=False, x_power=1.0, xscale=None,
                     yscale="linear", panel_size=None, resid_ylim=None,
                     xlabel=None, ylabel=None, resid_ylabel=None,
-                    sharex=True, sharey="row"):
+                    sharex=True, sharey="row", xlim=None, cut_data=True,
+                    excluded=None, annotate_fontsize=None):
     """Residuals -- and optionally the predictions themselves -- panel by panel.
 
     One figure is produced per summary statistic, laid out like
@@ -1612,7 +2023,10 @@ def plot_ppd_panels(result, predictions=False, x_power=1.0, xscale=None,
     With ``predictions=True`` every panel gains the data and the model itself
     above it -- observed points with predictive error bars, the median model
     prediction and its 68% posterior interval -- with the residual panel
-    underneath.
+    underneath.  Those panels reach half again past the outermost fitted scale
+    and show, faded, the measurements the scale cuts removed together with the
+    model there, so what was cut is visible as data against a prediction rather
+    than as blank or shaded space.
 
     Args:
         result: A PPDResult.
@@ -1628,14 +2042,15 @@ def plot_ppd_panels(result, predictions=False, x_power=1.0, xscale=None,
         resid_ylim: (low, high) limits of the residual panels. None widens the
             default +/-5 sigma just enough to keep every observed residual on
             the page, up to a limit of 50 sigma.
-        xlabel: Separation axis label, defaulting to 'separation'. A string
-            labels every figure; a dict keyed by figure tag, by (likelihood,
-            spectrum_type) or by spectrum type labels them individually, which
-            is what a data vector mixing wavenumbers with angular separations
-            needs.
+        xlabel: Separation axis label. None labels each figure from its own
+            statistic -- ell for an angular spectrum, k for a multipole
+            decomposition. A string labels every figure; a dict keyed by figure
+            tag, by (likelihood, spectrum_type) or by spectrum type labels them
+            individually.
         ylabel: Value axis label of the prediction panels, in the same forms,
-            defaulting to the spectrum type and the separation weighting. Only
-            has an effect with ``predictions``, which is what creates that axis.
+            defaulting to the statistic in latex with its separation weighting
+            (l C_l, k P_l(k)). Only has an effect with ``predictions``, which is
+            what creates that axis.
         resid_ylabel: Residual axis label, in the same forms, defaulting to
             (d - <mu>) / sigma.
         sharex: Separation axis sharing, as in ``plt.subplots``: True/'all',
@@ -1647,6 +2062,21 @@ def plot_ppd_panels(result, predictions=False, x_power=1.0, xscale=None,
             to each kind separately -- they are in different units and never
             share with each other. With 'none', residual panels also autoscale
             individually instead of taking the common ``resid_ylim``.
+        xlim: Explicit (low, high) separation limits, or a dict of them keyed as
+            for ``xlabel``. None fits the limits to the data of each group of
+            panels sharing the axis, widened to ``CUT_XLIM_FACTOR`` times the
+            outermost fitted scale wherever cut data is drawn, so
+            ``sharex='none'`` gives every panel its own range around its own
+            scale cuts.
+        cut_data: Draw the elements the scale cuts removed, faded, past the
+            fitted ones. Needs the prediction panels -- nothing predicts at
+            those scales, so there is no residual to put in the panel below --
+            and a result carrying ``excluded``.
+        excluded: ExcludedElements to draw instead of ``result.excluded``, for a
+            result computed before it was recorded; see
+            :func:`excluded_elements`.
+        annotate_fontsize: Size of the bin pair and p-value written inside each
+            panel.
 
     Returns:
         Dict of matplotlib figures, keyed 'residuals.<statistic>' or, with
@@ -1679,15 +2109,29 @@ def plot_ppd_panels(result, predictions=False, x_power=1.0, xscale=None,
     prefix = "predictions" if predictions else "residuals"
     named_by_likelihood = len({lname for lname, _ in groups}) > 1
 
+    # Nothing predicts at a cut scale, so the removed points can only go in a
+    # prediction panel; a residuals-only figure keeps its tight fitted range.
+    excluded = getattr(result, "excluded", None) if excluded is None else excluded
+    cut_groups = {}
+    if cut_data and predictions and excluded is not None and len(excluded.keys):
+        cut_groups = _group_panels(
+            _records_from_keys(excluded.keys, getattr(excluded, "key_fields", None))
+        )
+
     figs = {}
     for (lname, stype), panels in groups.items():
-        ells = _sorted_ells(panels)
+        cut_panels = {pkey: series for pkey, series
+                      in cut_groups.get((lname, stype), {}).items()
+                      if pkey in panels}
+        ells = _sorted_ells(panels, cut_panels)
+        has_multipole = any(ell is not None for ell in ells)
         n_rows, n_cols, positions = _grid_positions(panels)
 
         tag = f"{lname}_{stype}" if named_by_likelihood else stype
-        x_text = _resolve_label(xlabel, lname, stype, tag, "separation")
+        x_text = _resolve_label(xlabel, lname, stype, tag,
+                                _x_label(stype, has_multipole))
         y_text = _resolve_label(ylabel, lname, stype, tag,
-                                _y_label(stype, x_power))
+                                _y_label(stype, x_power, has_multipole))
         resid_text = _resolve_label(resid_ylabel, lname, stype, tag,
                                     r"$(d - \langle \mu \rangle) / \sigma$")
 
@@ -1697,36 +2141,74 @@ def plot_ppd_panels(result, predictions=False, x_power=1.0, xscale=None,
         axes = _panel_axes(fig, n_rows, n_cols, predictions, occupied,
                            sharex, sharey)
 
-        all_x = np.concatenate([x for s in panels.values() for _, x in s.values()])
+        all_x = np.concatenate(
+            [x for s in list(panels.values()) + list(cut_panels.values())
+             for _, x in s.values()]
+        )
         scale = _auto_xscale(all_x) if xscale is None else xscale
+
+        # Values of the *fitted* points, per group of panels sharing a value
+        # axis. The cut points are drawn outside it and must not set its scale:
+        # they are the noisiest part of the measurement, and the axis exists to
+        # show the fit.
+        fitted_y = {}
 
         for (b0, b1), series in panels.items():
             row, col = positions[(b0, b1)]
             ax_main = axes[2 * row, col] if predictions else None
             ax_res = axes[2 * row + 1, col] if predictions else axes[row, col]
+            cut_series = cut_panels.get((b0, b1), {})
 
             for ell in ells:
-                if ell not in series:
-                    continue
-                idx, x = series[ell]
                 color = f"C{ells.index(ell)}"
                 label = None if ell is None else rf"$\ell={ell}$"
 
-                ax_res.fill_between(x, z_lo95[idx], z_hi95[idx], color=color,
-                                    alpha=0.15, linewidth=0)
-                ax_res.fill_between(x, z_lo68[idx], z_hi68[idx], color=color,
-                                    alpha=0.3, linewidth=0)
-                ax_res.plot(x, z_obs[idx], color=color, ls="", marker="o", ms=3,
-                            label=label)
+                if ell in series:
+                    idx, x = series[ell]
+                    ax_res.fill_between(x, z_lo95[idx], z_hi95[idx], color=color,
+                                        alpha=0.15, linewidth=0)
+                    ax_res.fill_between(x, z_lo68[idx], z_hi68[idx], color=color,
+                                        alpha=0.3, linewidth=0)
+                    ax_res.plot(x, z_obs[idx], color=color, ls="", marker="o",
+                                ms=3, label=label)
 
-                if predictions:
-                    w = x ** x_power if x_power else np.ones_like(x)
-                    ax_main.errorbar(x, w * result.d_obs[idx], w * sigma[idx],
-                                     color=color, ls="", marker="o", ms=3,
-                                     capsize=3, label=label)
-                    ax_main.plot(x, w * mu_med[idx], color=color)
-                    ax_main.fill_between(x, w * mu_lo[idx], w * mu_hi[idx],
-                                         color=color, alpha=0.3, linewidth=0)
+                    if predictions:
+                        w = x ** x_power if x_power else np.ones_like(x)
+                        ax_main.errorbar(x, w * result.d_obs[idx], w * sigma[idx],
+                                         color=color, ls="", marker="o", ms=3,
+                                         capsize=3, label=label)
+                        ax_main.plot(x, w * mu_med[idx], color=color)
+                        ax_main.fill_between(x, w * mu_lo[idx], w * mu_hi[idx],
+                                             color=color, alpha=0.3, linewidth=0)
+                        scope = _share_scope(sharey, row, col)
+                        fitted_y.setdefault(
+                            scope if scope is not None else (b0, b1), []
+                        ).extend([w * (result.d_obs[idx] - sigma[idx]),
+                                  w * (result.d_obs[idx] + sigma[idx]),
+                                  w * mu_lo[idx], w * mu_hi[idx]])
+
+                if ell in cut_series:
+                    cidx, cx = cut_series[ell]
+                    w = cx ** x_power if x_power else np.ones_like(cx)
+                    ax_main.errorbar(cx, w * excluded.d_obs[cidx],
+                                     w * excluded.sigma[cidx], color=color,
+                                     ls="", marker="o", ms=3, mfc="w", alpha=0.35,
+                                     capsize=3)
+                    # The model is predicted at the cut scales too, and seeing
+                    # where it leaves the data is the point of drawing them.
+                    if excluded.mu_med is not None:
+                        cut_mu = (excluded.mu_med[cidx], excluded.mu_lo[cidx],
+                                  excluded.mu_hi[cidx])
+                        fitted = None
+                        if ell in series:
+                            fidx, fx = series[ell]
+                            fitted = (fx, (mu_med[fidx], mu_lo[fidx], mu_hi[fidx]))
+                        for jx, jmu in _cut_curve_segments(cx, cut_mu, fitted):
+                            jw = jx ** x_power if x_power else np.ones_like(jx)
+                            ax_main.plot(jx, jw * jmu[0], color=color, alpha=0.35)
+                            ax_main.fill_between(jx, jw * jmu[1], jw * jmu[2],
+                                                 color=color, alpha=0.12,
+                                                 linewidth=0)
 
             ax_res.axhline(0.0, color="k", lw=0.8)
             if resid_ylim is not None:
@@ -1749,7 +2231,9 @@ def plot_ppd_panels(result, predictions=False, x_power=1.0, xscale=None,
             ax_label = ax_main if predictions else ax_res
             ax_label.text(
                 0.04, 0.95, label, transform=ax_label.transAxes,
-                ha="left", va="top", fontsize=9,
+                ha="left", va="top",
+                fontsize=(ANNOTATION_FONTSIZE if annotate_fontsize is None
+                          else annotate_fontsize),
                 bbox={"facecolor": "w", "alpha": 0.7, "edgecolor": "none",
                       "pad": 1.5},
             )
@@ -1808,16 +2292,40 @@ def plot_ppd_panels(result, predictions=False, x_power=1.0, xscale=None,
                 x for _, x in series.values()
             )
 
+        # Only the groups with cut points to show are widened; the rest keep the
+        # tight range, so blank space still means nothing was measured there.
+        cut_scopes = set()
+        for pkey in cut_panels:
+            row, col = positions[pkey]
+            scope = _share_scope(sharex, row, col)
+            cut_scopes.add(scope if scope is not None else pkey)
+
+        limits = _resolve_limits(xlim, lname, stype, tag)
         for pkey, series in panels.items():
             row, col = positions[pkey]
             scope = _share_scope(sharex, row, col)
-            xlim = _x_limits(np.concatenate(
-                spans[scope if scope is not None else pkey]), scale
+            gkey = scope if scope is not None else pkey
+            group_x = np.concatenate(spans[gkey])
+            bounds = limits or _padded_limits(
+                group_x, scale,
+                factor=CUT_XLIM_FACTOR if gkey in cut_scopes else None,
             )
-            if xlim is None:
+            if bounds is None:
                 continue
-            for i in ((2 * row, 2 * row + 1) if predictions else (row,)):
-                axes[i, col].set_xlim(*xlim)
+
+            cell = [axes[i, col]
+                    for i in ((2 * row, 2 * row + 1) if predictions else (row,))]
+            for ax in cell:
+                ax.set_xlim(*bounds)
+                if scale == "log":
+                    _compact_log_ticks(ax, bounds)
+
+            if cut_scopes:
+                scope_y = _share_scope(sharey, row, col)
+                ys = fitted_y.get(scope_y if scope_y is not None else pkey)
+                y_bounds = _padded_limits(np.concatenate(ys), yscale) if ys else None
+                if y_bounds is not None:
+                    axes[2 * row, col].set_ylim(*y_bounds)
 
         stat_pv = marginal_pvalue(
             result,
@@ -1849,7 +2357,7 @@ def plot_ppd(result, predictions=False, **kwargs):
         Dict of matplotlib figures: 'chi2' plus one panel figure per summary
         statistic, keyed as described in :func:`plot_ppd_panels`.
     """
-    figs = {"chi2": plot_chi2(result)}
+    figs = {"chi2": plot_chi2(result, fontsize=kwargs.get("annotate_fontsize"))}
     figs.update(plot_ppd_panels(result, predictions=predictions, **kwargs))
 
     return figs
@@ -1936,16 +2444,23 @@ def ppd_test_cli():
                              "this power (1 gives k P(k) and l C_l)")
     parser.add_argument("--xlabel", default=None,
                         help="Separation axis label of the panel plots "
-                             "(default: 'separation')")
+                             "(default: l or k, from the statistic)")
     parser.add_argument("--ylabel", default=None,
                         help="Value axis label of the prediction panels "
-                             "(default: the spectrum type and its weighting)")
+                             "(default: the statistic and its weighting)")
     parser.add_argument("--sharex", default="all",
                         choices=["all", "row", "col", "none"],
                         help="How far the panels share their separation axis")
     parser.add_argument("--sharey", default="row",
                         choices=["all", "row", "col", "none"],
                         help="How far the panels share their value axis")
+    parser.add_argument("--xlim", type=float, nargs=2, default=None,
+                        metavar=("LOW", "HIGH"),
+                        help="Separation limits of the panels (default: fitted "
+                             "to the data of each group sharing the axis)")
+    parser.add_argument("--no-cut-data", action="store_true",
+                        help="Leave the scales a bin is cut at blank instead of "
+                             "drawing the measurements the cuts removed")
     parser.add_argument("--output", default=None,
                         help="Output base name (default: derived from the config)")
     args = parser.parse_args()
@@ -1984,6 +2499,7 @@ def ppd_test_cli():
             result, predictions=args.plot_predictions, x_power=args.x_power,
             xlabel=args.xlabel, ylabel=args.ylabel,
             sharex=args.sharex, sharey=args.sharey,
+            xlim=args.xlim, cut_data=not args.no_cut_data,
         )
         for name, fig in figs.items():
             fig.savefig(f"{output}.{name}.pdf", bbox_inches="tight")

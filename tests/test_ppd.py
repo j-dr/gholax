@@ -6,11 +6,13 @@ lightweight stand-ins for Model / Likelihood / DataVector that expose only the
 attributes the PPD code actually touches.
 """
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from matplotlib.collections import PolyCollection
 from scipy import stats
 
 from gholax.likelihood.gaussian_likelihood import GaussianLikelihood
@@ -22,8 +24,11 @@ from gholax.util.ppd import (
     PPDResult,
     collect_elements,
     conditional_moments,
+    ExcludedElements,
     element_key_fields,
     element_keys,
+    excluded_elements,
+    fill_excluded_predictions,
     marginal_pvalue,
     panel_pvalues,
     plot_ppd,
@@ -298,7 +303,12 @@ class _StubDataVector:
 
 
 class _StubLikelihood:
-    """A likelihood whose model is linear in the sampled parameters."""
+    """A likelihood whose model is linear in the sampled parameters.
+
+    The design matrix spans every row of the data vector, and the scale mask is
+    applied on the way out, as a real likelihood does -- the PPD reads the
+    unmasked prediction to get the model at the scales the cuts removed.
+    """
 
     def __init__(self, dv, param_names, design):
         self.observed_data_vector = dv
@@ -307,10 +317,13 @@ class _StubLikelihood:
         self._param_names = list(param_names)
         self._design = jnp.array(design)
 
-    def predict_model(self, params, params_am=None, **kwargs):
+    def predict_model(self, params, params_am=None, apply_scale_mask=True, **kwargs):
         theta = jnp.stack([params[p] for p in self._param_names])
+        model = self._design @ theta
+        if apply_scale_mask and len(model) == self.observed_data_vector.n_dv:
+            model = model[self.observed_data_vector.scale_mask]
 
-        return self._design @ theta
+        return model
 
 
 class _StubModel:
@@ -324,7 +337,7 @@ def _make_stub(rng, separations, param_names, scale_mask=None, seed_design=None,
                values=None, cov=None):
     n = len(separations)
     design = seed_design if seed_design is not None else rng.standard_normal(
-        (n if scale_mask is None else len(scale_mask), len(param_names))
+        (n, len(param_names))
     )
     cov = _random_covariance(rng, n, scale=0.01) if cov is None else cov
     values = rng.standard_normal(n) if values is None else values
@@ -378,6 +391,92 @@ def test_collect_elements_records_the_key_field_names():
     )
     # One name per entry of the keys they label.
     assert len(elements.key_fields["L"]) == len(elements.keys[0])
+
+
+def test_excluded_elements_are_the_rows_the_scale_cuts_dropped():
+    """The panel plots need what was cut, which no p-value ever sees."""
+    rng = np.random.default_rng(13)
+    seps = np.array([10.0, 20.0, 30.0, 40.0])
+    values = rng.standard_normal(4)
+    cov = _random_covariance(rng, 4)
+    model = _make_stub(rng, seps, ["a"], scale_mask=[1, 2], values=values, cov=cov)
+
+    cut = excluded_elements(model)
+
+    assert cut.keys == [("L", "c_dd", 0, 0, 10.0), ("L", "c_dd", 0, 0, 40.0)]
+    assert np.allclose(cut.d_obs, values[[0, 3]])
+    assert np.allclose(cut.sigma, np.sqrt(np.diag(cov))[[0, 3]])
+    assert cut.key_fields == {"L": _ANGULAR_FIELDS}
+    # collect_elements carries them alongside the elements that survived.
+    assert collect_elements(model).excluded.keys == cut.keys
+
+
+def test_posterior_predictive_test_records_the_model_at_the_cut_scales():
+    """The cut elements are not tested, but the model still predicts them."""
+    rng = np.random.default_rng(14)
+    seps = np.arange(1.0, 7.0)
+    model = _make_stub(rng, seps, ["a", "b"], scale_mask=[1, 2, 3, 4])
+    samples = rng.standard_normal((40, 2))
+    design = np.asarray(model.likelihoods["L"]._design)
+
+    result = posterior_predictive_test((model, samples, ["a", "b"]))
+
+    cut = result.excluded
+    assert [k[4] for k in cut.keys] == [1.0, 6.0]
+    # The prediction at a cut row is that row of the design matrix, so the
+    # median over samples is exactly reproducible.
+    expected = np.median(samples @ design[[0, 5]].T, axis=0)
+    assert np.allclose(cut.mu_med, expected)
+    assert np.all(cut.mu_lo <= cut.mu_med) and np.all(cut.mu_med <= cut.mu_hi)
+    # None of this leaks into the test itself.
+    assert result.n_pred == 4
+
+
+def test_fill_excluded_predictions_recovers_a_result_that_has_none():
+    """A cache written before the cut predictions existed can still get them."""
+    rng = np.random.default_rng(15)
+    seps = np.arange(1.0, 7.0)
+    model = _make_stub(rng, seps, ["a", "b"], scale_mask=[1, 2, 3, 4])
+    samples = rng.standard_normal((40, 2))
+
+    result = posterior_predictive_test((model, samples, ["a", "b"]))
+    stripped = replace(result, excluded=replace(result.excluded, mu_med=None,
+                                                mu_lo=None, mu_hi=None))
+
+    filled = fill_excluded_predictions(stripped, model, max_samples=None)
+
+    assert np.allclose(filled.excluded.mu_med, result.excluded.mu_med)
+    assert np.allclose(filled.excluded.mu_lo, result.excluded.mu_lo)
+    assert np.allclose(filled.excluded.mu_hi, result.excluded.mu_hi)
+    # The result it was handed is left alone.
+    assert stripped.excluded.mu_med is None
+
+
+def test_fill_excluded_predictions_subsamples_when_asked():
+    rng = np.random.default_rng(16)
+    model = _make_stub(rng, np.arange(1.0, 7.0), ["a", "b"], scale_mask=[1, 2, 3, 4])
+    samples = rng.standard_normal((40, 2))
+    result = posterior_predictive_test((model, samples, ["a", "b"]))
+    design = np.asarray(model.likelihoods["L"]._design)
+
+    filled = fill_excluded_predictions(result, model, max_samples=10)
+
+    take = np.linspace(0, result.n_samples - 1, 10).astype(int)
+    params = np.stack([result.params["a"][take], result.params["b"][take]], axis=1)
+    assert np.allclose(filled.excluded.mu_med,
+                       np.median(params @ design[[0, 5]].T, axis=0))
+
+
+def test_fill_excluded_predictions_rejects_the_wrong_config():
+    """The stored parameters have to be the ones the model wants."""
+    rng = np.random.default_rng(17)
+    model = _make_stub(rng, np.arange(1.0, 7.0), ["a", "b"], scale_mask=[1, 2, 3, 4])
+    samples = rng.standard_normal((20, 2))
+    result = posterior_predictive_test((model, samples, ["a", "b"]))
+    other = _make_stub(rng, np.arange(1.0, 7.0), ["a", "c"], scale_mask=[1, 2, 3, 4])
+
+    with pytest.raises(ValueError, match="does not carry every parameter"):
+        fill_excluded_predictions(result, other)
 
 
 def test_collect_elements_requires_a_covariance():
@@ -1229,6 +1328,172 @@ def test_plot_ppd_unshared_y_lets_each_residual_panel_autoscale(plt_agg):
     assert {ax.get_ylim() for ax in fixed["residuals.c_dd"].axes} == {(-3.0, 3.0)}
 
 
+def _cut_keys(like="L", stype="c_dd"):
+    """Bin pairs whose scale cuts, and so whose separations, differ a lot."""
+    seps = np.geomspace(20.0, 3000.0, 24)
+    keys = []
+    for b0, b1 in ((0, 0), (0, 1), (1, 1)):
+        keep = seps[(seps >= 20.0 * 2 ** (b0 + b1)) & (seps <= 3000.0 / 2 ** (b0 + b1))]
+        keys += [(like, stype, b0, b1, float(s)) for s in keep]
+
+    return keys
+
+
+def test_plot_ppd_unshared_x_fits_each_panel_to_its_own_scale_cuts(plt_agg):
+    """Varying cuts otherwise stretch every panel over the widest bin's range."""
+    result = _plot_result(_cut_keys(), {"L": _ANGULAR_FIELDS})
+
+    shared = plot_ppd(result)["residuals.c_dd"]
+    tight = plot_ppd(result, sharex="none")["residuals.c_dd"]
+
+    assert len({ax.get_xlim() for ax in shared.axes}) == 1
+    assert len({ax.get_xlim() for ax in tight.axes}) == 3
+    # No tight panel is wider than the union, and the most heavily cut bin is
+    # far narrower rather than mostly empty space.
+    union = max(hi / lo for lo, hi in (ax.get_xlim() for ax in shared.axes))
+    spans = sorted(hi / lo for lo, hi in (ax.get_xlim() for ax in tight.axes))
+    assert spans[-1] <= union * 1.001
+    assert spans[0] < 0.2 * union
+
+
+def _cut_excluded(like="L", stype="c_dd", value=1.0):
+    """The elements _cut_keys drops from each bin pair, as ExcludedElements."""
+    kept = set(_cut_keys(like, stype))
+    keys = [
+        key for b0, b1 in ((0, 0), (0, 1), (1, 1))
+        for key in ((like, stype, b0, b1, float(s))
+                    for s in np.geomspace(20.0, 3000.0, 24))
+        if key not in kept
+    ]
+
+    return ExcludedElements(
+        keys=keys, d_obs=np.full(len(keys), value),
+        sigma=np.full(len(keys), 0.1 * abs(value)),
+        key_fields={like: _ANGULAR_FIELDS},
+    )
+
+
+def test_plot_ppd_draws_the_data_the_scale_cuts_removed(plt_agg):
+    """Blank space at the end of an axis is ambiguous; the cut data is not."""
+    result = _plot_result(_cut_keys(), {"L": _ANGULAR_FIELDS})
+    result.excluded = _cut_excluded()
+
+    fig = plot_ppd(result, predictions=True)["predictions.c_dd"]
+
+    # The axis makes room for the cut scales rather than stopping at the fit.
+    mains = fig.axes[::2]
+    assert all(ax.get_xlim() == pytest.approx((20.0 / 1.5, 3000.0 * 1.5))
+               for ax in mains)
+    # (0, 0) spans the union and had nothing cut; the cut bins gain a second
+    # errorbar container holding exactly the separations that were dropped.
+    assert len(mains[0].containers) == 1
+    for ax, (b0, b1) in zip(mains[1:], ((0, 1), (1, 1))):
+        assert len(ax.containers) == 2
+        drawn = np.sort(ax.containers[1][0].get_xdata())
+        expected = np.sort([k[4] for k in result.excluded.keys
+                            if (k[2], k[3]) == (b0, b1)])
+        assert np.allclose(drawn, expected)
+
+    # Nothing is shaded any more, and nothing predicts at a cut scale, so the
+    # residual panels stay empty of both.
+    assert all(len(ax.patches) == 0 for ax in fig.axes)
+    assert all(len(ax.containers) == 0 for ax in fig.axes[1::2])
+
+
+def test_plot_ppd_draws_the_model_at_the_cut_scales(plt_agg):
+    """Where the model leaves the data past the cut is what the panel is for."""
+    result = _plot_result(_cut_keys(), {"L": _ANGULAR_FIELDS})
+    excluded = _cut_excluded()
+    excluded.mu_med = np.full(len(excluded.keys), 0.9)
+    excluded.mu_lo = excluded.mu_med - 0.05
+    excluded.mu_hi = excluded.mu_med + 0.05
+    result.excluded = excluded
+
+    fig = plot_ppd(result, predictions=True)["predictions.c_dd"]
+
+    def model_lines(ax):
+        """The faded model curves, i.e. the ones over the cut scales.
+
+        The cut data is faded the same way, but errorbar draws it as markers and
+        caps rather than as a connected line.
+        """
+        return [ln for ln in ax.lines if ln.get_alpha() == 0.35
+                and ln.get_linestyle() not in ("None", " ", "")
+                and ln.get_marker() in (None, "", "None")]
+
+    def bands(ax):
+        return [c for c in ax.collections if isinstance(c, PolyCollection)]
+
+    cut_seps = {k[4] for k in result.excluded.keys}
+    fitted_seps = {k[4] for k in result.element_keys}
+
+    mains = fig.axes[::2]
+    # (0, 0) had nothing cut: no second model line, and only the fitted band.
+    assert model_lines(mains[0]) == []
+    assert len(bands(mains[0])) == 1
+    for ax in mains[1:]:
+        # One curve below the fitted scales and one above, each with its own
+        # 68% band, beside the fitted curve's.
+        lines = model_lines(ax)
+        assert len(lines) == 2
+        assert len(bands(ax)) == 3
+        for line in lines:
+            x = np.asarray(line.get_xdata())
+            y = np.asarray(line.get_ydata())
+            assert set(x) <= cut_seps | fitted_seps
+            # Every point is the model at a cut scale, bar one: the curve is
+            # joined onto the fitted curve at one end, so that it does not break
+            # where the cut starts.
+            cut_points = np.isclose(y, 0.9 * x)
+            assert (~cut_points).sum() == 1
+            assert not (cut_points[0] and cut_points[-1])
+
+
+def test_plot_ppd_cut_data_does_not_set_the_value_scale(plt_agg):
+    """The axis is there to show the fit; the cut points are the noisy tail."""
+    result = _plot_result(_cut_keys(), {"L": _ANGULAR_FIELDS})
+    result.excluded = _cut_excluded(value=1e6)
+
+    fig = plot_ppd(result, predictions=True)["predictions.c_dd"]
+
+    assert all(ax.get_ylim()[1] < 100.0 for ax in fig.axes[::2])
+
+
+def test_plot_ppd_keeps_the_fitted_range_with_nothing_cut_to_draw(plt_agg):
+    """No room is made for cut data that is absent or not being drawn."""
+    result = _plot_result(_cut_keys(), {"L": _ANGULAR_FIELDS})
+
+    bare = plot_ppd(result, predictions=True)["predictions.c_dd"]
+    result.excluded = _cut_excluded()
+    off = plot_ppd(result, predictions=True, cut_data=False)["predictions.c_dd"]
+    # Residual panels have no model at the cut scales to draw them against.
+    resid = plot_ppd(result)["residuals.c_dd"]
+
+    for fig in (bare, off, resid):
+        assert all(ax.get_xlim()[1] < 3000.0 * 1.5 for ax in fig.axes)
+    assert all(len(ax.containers) == 1 for ax in off.axes[::2])
+
+
+def test_plot_ppd_takes_explicit_separation_limits(plt_agg):
+    result = _plot_result(
+        _angular_keys() + _multipole_keys(),
+        {"L": _ANGULAR_FIELDS, "R": _MULTIPOLE_FIELDS},
+    )
+
+    figs = plot_ppd(result, xlim={"c_dd": (50.0, 900.0)})
+
+    assert {ax.get_xlim() for ax in figs["residuals.L_c_dd"].axes} == {(50.0, 900.0)}
+    # The statistic the dict does not mention keeps its fitted limits.
+    assert (50.0, 900.0) not in {
+        ax.get_xlim() for ax in figs["residuals.R_p_gg_ell"].axes
+    }
+
+    both = plot_ppd(result, xlim=(50.0, 900.0))
+    assert {ax.get_xlim() for ax in both["residuals.R_p_gg_ell"].axes} == {
+        (50.0, 900.0)
+    }
+
+
 def test_plot_ppd_rejects_an_unknown_sharing_mode(plt_agg):
     result = _plot_result(_angular_keys(), {"L": _ANGULAR_FIELDS})
 
@@ -1237,14 +1502,47 @@ def test_plot_ppd_rejects_an_unknown_sharing_mode(plt_agg):
 
 
 def test_plot_ppd_axis_labels_fall_back_when_nothing_matches(plt_agg):
-    result = _plot_result(_angular_keys(), {"L": _ANGULAR_FIELDS})
+    """An unrecognized statistic keeps the generic label."""
+    result = _plot_result(_angular_keys(stype="mystery"), {"L": _ANGULAR_FIELDS})
 
-    fig = plot_ppd(result, xlabel={"p_gg_ell": "$k$"})["residuals.c_dd"]
+    fig = plot_ppd(result, xlabel={"p_gg_ell": "$k$"})["residuals.mystery"]
 
     assert "separation" in {ax.get_xlabel() for ax in fig.axes}
 
 
-def test_plot_ppd_auto_spectra_wrap_rather_than_filling_a_diagonal(plt_agg):
+def test_plot_ppd_labels_the_axes_from_the_statistic(plt_agg):
+    """A C_l figure is against l and a multipole one against k, unprompted."""
+    result = _plot_result(
+        _angular_keys() + _multipole_keys(),
+        {"L": _ANGULAR_FIELDS, "R": _MULTIPOLE_FIELDS},
+    )
+
+    figs = plot_ppd(result, predictions=True)
+    angular = figs["predictions.L_c_dd"]
+    multipole = figs["predictions.R_p_gg_ell"]
+
+    assert {ax.get_xlabel() for ax in angular.axes} == {"", r"$\ell$"}
+    assert any("$k$" in ax.get_xlabel() for ax in multipole.axes)
+    assert "separation" not in {ax.get_xlabel() for ax in
+                                angular.axes + multipole.axes}
+    # The value axis names the spectrum and its separation weighting.
+    assert any(r"$\ell\,C_\ell^{\delta_g \delta_g}$" == ax.get_ylabel()
+               for ax in angular.axes)
+    assert any(r"$k\,P_\ell(k)$" == ax.get_ylabel() for ax in multipole.axes)
+
+
+def test_plot_chi2_insets_the_pvalue_instead_of_titling_it(plt_agg):
+    """A caller that strips titles before saving must not lose the p-value."""
+    result = _plot_result(_angular_keys(), {"L": _ANGULAR_FIELDS})
+
+    ax = plot_ppd(result)["chi2"].axes[0]
+
+    assert ax.get_title() == ""
+    assert f"{result.p_value:.3f}" in ax.texts[0].get_text()
+    assert ax.texts[0].get_transform() is ax.transAxes
+
+
+def test_plot_ppd_auto_spectra_form_a_single_row(plt_agg):
     """Six auto-spectra should not become a 6x6 grid with 30 blank cells."""
     result = _plot_result(
         _multipole_keys(bins=range(6), ells=(0,)), {"R": _MULTIPOLE_FIELDS}
@@ -1255,7 +1553,7 @@ def test_plot_ppd_auto_spectra_wrap_rather_than_filling_a_diagonal(plt_agg):
     assert len(fig.axes) == 6
     n_rows = len({ax.get_position().y0 for ax in fig.axes})
     n_cols = len({ax.get_position().x0 for ax in fig.axes})
-    assert (n_rows, n_cols) == (2, 4)
+    assert (n_rows, n_cols) == (1, 6)
 
 
 def test_plot_ppd_keeps_the_separation_axis_on_the_data(plt_agg):

@@ -185,7 +185,9 @@ class Limber(LikelihoodModule):
         def _interp_to_proj(s_one, zfield_one):
             # Factor 2D interpolation into two 1D steps:
             # Step 1: interpolate s(k, z_pk) along z at the projection redshifts.
-            # zfield_one is (n_ell, nz_proj), (nz_proj,), or scalar (zeff).
+            # zfield_one is (nz_proj,) or scalar (zeff).  It used to be tiled
+            # to (n_ell, nz_proj) per bin pair, although the redshift query is
+            # independent of ell.
             if zfield_one.ndim >= 2:
                 z_query = zfield_one[0, :]  # (nz_proj,) — constant across ells
             elif zfield_one.ndim == 1:
@@ -273,16 +275,13 @@ class Limber(LikelihoodModule):
                     elif td_ == 1:
                         s = jnp.tile(s, (n_i, 1, 1))                        
 
-                if zfield.shape[0] == self.nz_proj:
-                    zfield = jnp.tile(zfield[None, :], (n_i * n_j, self.n_ell, 1))
-                elif zfield.shape[0] == n_i:
-                    zfield = jnp.repeat(
-                        zfield, n_j * self.n_ell * self.nz_proj, 0
-                    ).reshape(n_i * n_j, self.n_ell, self.nz_proj)
-                elif zfield.shape[0] == n_j:
-                    zfield = jnp.tile(
-                        zfield[:, None, None], (n_i, self.n_ell, self.nz_proj)
-                    )
+                if not interp_shared:
+                    if zfield.shape[0] == self.nz_proj:
+                        zfield = jnp.broadcast_to(zfield, (n_i * n_j, self.nz_proj))
+                    elif zfield.shape[0] == n_i:
+                        zfield = jnp.repeat(zfield, n_j, axis=0)
+                    elif zfield.shape[0] == n_j:
+                        zfield = jnp.tile(zfield, (n_i, 1))
 
             else:
                 if n_i != n_j:
@@ -292,15 +291,20 @@ class Limber(LikelihoodModule):
                         w_j = jnp.tile(w_j, (n_i * n_j, 1))
                     if s.shape[0] == 1:
                         s = jnp.tile(s, (n_i * n_j, 1, 1))
-                    if zfield.shape[0] == self.nz_proj:
-                        zfield = jnp.tile(zfield[None, :], (n_i * n_j, self.n_ell, 1))
+                    if not interp_shared and zfield.shape[0] == self.nz_proj:
+                        zfield = jnp.broadcast_to(zfield, (n_i * n_j, self.nz_proj))
                 else:
-                    if zfield.shape[0] == self.nz_proj:
-                        zfield = jnp.tile(zfield[None, :], (n_i, self.n_ell, 1))
-                    else:
-                        zfield = jnp.tile(
-                            zfield[:, None, None], (1, self.n_ell, self.nz_proj)
-                        )
+                    if not interp_shared:
+                        if zfield.shape[0] == self.nz_proj:
+                            zfield = jnp.broadcast_to(zfield, (n_i, self.nz_proj))
+                        elif zfield.ndim == 1:
+                            # One effective redshift per bin pair.
+                            zfield = jnp.broadcast_to(
+                                zfield[:, None], (n_i, self.nz_proj)
+                            )
+                        else:
+                            # zfield already has one row per bin pair.
+                            zfield = jnp.reshape(zfield, (n_i, self.nz_proj))
                     if s.shape[0] == 1:
                         s = jnp.tile(s, (n_i, 1, 1))
 

@@ -39,7 +39,9 @@ def train_posterior_flow(theta, weights, train_split=0.8, flow_settings={}):
     
     key, subkey = jax.random.split(key)
     flow, losses = fit_to_data(subkey, flow, u_training,\
-                            learning_rate=flow_settings.get("learning_rate", 1e-3))
+                            learning_rate=flow_settings.get("learning_rate", 1e-3),
+                            max_epochs=flow_settings.get("max_epochs", 500),
+                            max_patience=flow_settings.get("max_patience", 20))
     
     return flow, mean, std
 
@@ -216,7 +218,12 @@ def run_flow_diagnostics(flow, mean, std, theta_true, weights_true, param_names,
     )
 
 
-if __name__ == "__main__":
+def main():
+    """CLI entry point: train-flow-likelihood <config.yaml>"""
+    if len(sys.argv) < 2:
+        print("Usage: train-flow-likelihood <config.yaml>")
+        sys.exit(1)
+
     config_name = sys.argv[1]
     with open(config_name, "r") as f:
         config = yaml.load(f, Loader=yaml.FullLoader)
@@ -237,3 +244,7 @@ if __name__ == "__main__":
         save_path=config["save_path"],
         n_flow_samples=config.get("n_diagnostic_samples", 10000),
     )
+
+
+if __name__ == "__main__":
+    main()
