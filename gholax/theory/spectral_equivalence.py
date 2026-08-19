@@ -8,7 +8,6 @@ from .expansion_history import comoving_distance_integral_full, speed_of_light
 
 import jax
 import jax.numpy as jnp
-from jax.experimental.ode import odeint
 from functools import partial
 from scipy.special import roots_laguerre
 
@@ -97,15 +96,36 @@ class SpectralEquivalence(LikelihoodModule):
         return chi
 
     def _compute_D_unnorm(self, Omega_m, Omega_Lambda, f_nu, w0, wa, z_arr):
-        """Compute unnormalized growth factor D(z) via ODE."""
+        """Compute unnormalized growth factor D(z) via fixed-step RK4.
+
+        Two RK4 substeps per interval of the log-spaced a-grid; matches the
+        previous adaptive odeint solution to fp32 roundoff on this smooth,
+        non-stiff ODE while being cheaper (no adjoint solve in the gradient)
+        and forward-mode differentiable.
+        """
         a_points = jnp.logspace(jnp.log10(self.a_init_ode), 0.0, self.n_a_ode)
         y0 = jnp.array([self.a_init_ode, 1.0])
         ode_func = partial(growth_ode_system,
                            Omega_m=Omega_m, Omega_Lambda=Omega_Lambda,
                            Omega_k=0.0, Omega_r=0.0,
                            w0=w0, wa=wa, f_nu=f_nu)
-        solution = odeint(ode_func, y0, a_points)
-        D_solution = solution[:, 0]
+
+        def rk4_step(y, a0, h):
+            k1 = ode_func(y, a0)
+            k2 = ode_func(y + 0.5 * h * k1, a0 + 0.5 * h)
+            k3 = ode_func(y + 0.5 * h * k2, a0 + 0.5 * h)
+            k4 = ode_func(y + h * k3, a0 + h)
+            return y + (h / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+
+        def scan_fn(y, ab):
+            a0, a1 = ab
+            h = 0.5 * (a1 - a0)
+            y = rk4_step(y, a0, h)
+            y = rk4_step(y, a0 + h, h)
+            return y, y[0]
+
+        _, D_steps = jax.lax.scan(scan_fn, y0, (a_points[:-1], a_points[1:]))
+        D_solution = jnp.concatenate([y0[:1], D_steps])
         a_target = 1.0 / (1.0 + z_arr)
         return jnp.interp(a_target, a_points, D_solution)
 
@@ -144,20 +164,41 @@ class SpectralEquivalence(LikelihoodModule):
 
         # 2. Newton root-finding: for each z_i, find w s.t. chi_wCDM(z_i->z_LSS; w) = chi_target(z_i)
         def newton_one_z(z_i, chi_tgt):
-            """Find w_equiv for one redshift via Newton's method."""
-            w_curr = w0  # initial guess
+            """Find w_equiv for one redshift via Newton's method.
+
+            The w-independent part of E^2 at the quadrature nodes is hoisted
+            out of the loop and dchi/dw is closed-form, so each iteration is a
+            few vectorized ops (no reverse-mode AD in the inner loop).
+            """
+            u_start = jnp.log1p(z_i)
+            u_lss = jnp.log1p(self.z_lss)
+            half_width = 0.5 * (u_lss - u_start)
+            mid = 0.5 * (u_lss + u_start)
+            u_nodes = half_width * self.gl_chi_nodes + mid
+            z_nodes = jnp.expm1(u_nodes)
+            a_nodes = 1.0 / (1.0 + z_nodes)
+            # w-independent piece of E^2 (radiation + cb + neutrinos)
+            y_nu = mnu_per_species * a_nodes / _T_NU0_EV
+            F_y = jax.vmap(
+                lambda y: neutrino_density_ratio(y, self.gl_nu_nodes, self.gl_nu_weights)
+            )(y_nu)
+            Omega_nu_a = n_species * (_OMEGA_NU_REL_H2_PER_SPECIES / h**2) * F_y / a_nodes**4
+            E2_base = Omega_r_photon / a_nodes**4 + Omega_cb / a_nodes**3 + Omega_nu_a
+
+            def chi_of_w(ww):
+                Omega_de = Omega_Lambda * a_nodes ** (-3.0 * (1.0 + ww))
+                E_vals = jnp.sqrt(E2_base + Omega_de)
+                integrand = (1.0 + z_nodes) / E_vals
+                return (speed_of_light / 100.0) * half_width * jnp.dot(
+                    self.gl_chi_weights, integrand
+                )
 
             def newton_step(i, w):
-                def chi_of_w(ww):
-                    return self._chi_z_to_zlss(
-                        z_i, ww, Omega_cb, Omega_Lambda,
-                        Omega_r_photon, mnu_per_species, h
-                    )
                 residual = chi_of_w(w) - chi_tgt
                 dchi_dw = jax.grad(chi_of_w)(w)
                 return w - residual / dchi_dw
 
-            w_equiv = jax.lax.fori_loop(0, self.n_newton, newton_step, w_curr)
+            w_equiv = jax.lax.fori_loop(0, self.n_newton, newton_step, w0)
             return w_equiv
 
         w_equiv_z = jax.vmap(newton_one_z)(self.z, chi_target)

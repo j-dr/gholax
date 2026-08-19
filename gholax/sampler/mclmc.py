@@ -1,3 +1,4 @@
+import inspect
 import json
 import os
 
@@ -11,6 +12,16 @@ import numpy as np
 from blackjax.adaptation.mclmc_adaptation import MCLMCAdaptationState
 
 from .base import BaseSampler
+
+# Older blackjax (e.g. 1.2.5) derives initial adaptation params internally and
+# has no `params` kwarg on the unadjusted tuner.
+_UNADJ_ADAPT_HAS_PARAMS = (
+    "params" in inspect.signature(blackjax.mclmc_find_L_and_step_size).parameters
+)
+_ADJ_ADAPT_HAS_PARAMS = (
+    "params"
+    in inspect.signature(blackjax.adjusted_mclmc_find_L_and_step_size).parameters
+)
 
 
 class MCLMC(BaseSampler):
@@ -40,8 +51,16 @@ class MCLMC(BaseSampler):
         self.random_start = c.get("random_start", True)
         self.restart = c.get("restart", False)
         self.minimize_and_sample = c.get("minimize_and_sample", True)
+        self.chains_per_device = int(c.get("chains_per_device", 1))
+        if self.chains_per_device < 1:
+            raise ValueError("chains_per_device must be >= 1")
         self.step_size_init = c.get("step_size_init", 0.01)
-        self.mass_matrix_init = c.get("mass_matrix_init", "ones")  # "ones" or "hessian"
+        # "ones", "hessian", or "mclmc" (NaN-guarded multi-chain MCLMC
+        # within-chain variance estimate, see BaseSampler._mclmc_mass_matrix).
+        self.mass_matrix_init = c.get("mass_matrix_init", "ones")
+        # Optional path to a previous run's .mclmc_warmup_parameters.json used
+        # to warm-start adaptation.
+        self.warmup_init_file = c.get("warmup_init_file", None)
         # Floor for L to prevent phase-3 collapse when mass matrix is well-tuned.
         # L >= L_floor_factor * sqrt(dim) * step_size
         self.L_floor_factor = c.get("L_floor_factor", 1.0)
@@ -78,6 +97,7 @@ class MCLMC(BaseSampler):
             n_devices,
             initial_positions,
         ) = self._init_chains(model)
+        n_chains = n_devices * self.chains_per_device
 
         checkpoint_file = f"{output_file}.mclmc_warmup_parameters.json"
 
@@ -105,16 +125,16 @@ class MCLMC(BaseSampler):
             sampler = self._build_sampler(
                 jlp, L, step_size, inverse_mass_matrix
             )
-            rng_key, *init_keys = jax.random.split(rng_key, n_devices + 1)
+            rng_key, *init_keys = jax.random.split(rng_key, n_chains + 1)
             init_keys = jnp.array(init_keys)
-            init_pmap = jax.pmap(sampler.init, in_axes=(0, 0))
-            states = init_pmap(initial_state, init_keys)
+            init_map = self._map_chains(sampler.init, chain_axes=(0, 0))
+            states = init_map(jnp.asarray(initial_state), init_keys)
             kernel = sampler.step
 
         else:
             if self.minimize_and_sample:
                 initial_positions = self._minimize_and_sample(
-                    log_posterior, initial_positions, n_devices, output_file
+                    log_posterior, initial_positions, n_chains, output_file
                 )
 
             print(
@@ -143,19 +163,50 @@ class MCLMC(BaseSampler):
 
             if self.mass_matrix_init == "hessian":
                 print("Estimating initial mass matrix from Hessian diagonal...", flush=True)
-                init_imm = self._hessian_mass_matrix(jlp, initial_positions[0])
+                x_h = initial_positions[0]
+                if not self.minimize_and_sample:
+                    x_h = self._best_fit_position(jlp, x_h)
+                init_imm = self._hessian_mass_matrix(jlp, x_h)
                 print(f"  imm range: [{float(init_imm.min()):.4f}, {float(init_imm.max()):.4f}]", flush=True)
+            elif self.mass_matrix_init == "mclmc":
+                print("Estimating initial mass matrix from short MCLMC runs...", flush=True)
+                rng_key, mm_key = jax.random.split(rng_key)
+                init_imm, mm_info = self._mclmc_mass_matrix(
+                    jlp, initial_positions, mm_key
+                )
+                print(
+                    f"  rung={mm_info['rung']}, "
+                    f"n_survivors={mm_info['n_survivors']}, "
+                    f"imm range: [{float(init_imm.min()):.4f}, "
+                    f"{float(init_imm.max()):.4f}]",
+                    flush=True,
+                )
             else:
                 init_imm = jnp.ones((dim,))
 
-            warmup_params = MCLMCAdaptationState(
-                L=jnp.sqrt(dim),
-                step_size=self.step_size_init,
-                inverse_mass_matrix=init_imm,
-            )
+            if self.warmup_init_file is not None:
+                with open(self.warmup_init_file, "r") as fp:
+                    winit = json.load(fp)
+                warmup_params = MCLMCAdaptationState(
+                    L=jnp.asarray(winit["L"]),
+                    step_size=jnp.asarray(winit["step_size"]),
+                    inverse_mass_matrix=jnp.array(winit["inverse_mass_matrix"]),
+                )
+                print(
+                    f"Warm-starting adaptation from {self.warmup_init_file}",
+                    flush=True,
+                )
+            else:
+                warmup_params = MCLMCAdaptationState(
+                    L=jnp.sqrt(dim),
+                    step_size=self.step_size_init,
+                    inverse_mass_matrix=init_imm,
+                )
 
             state, params = self._adapt_with_convergence(
-                jlp, warmup_state, rng_key, warmup_params
+                jlp, warmup_state, rng_key, warmup_params,
+                output_file=output_file,
+                warm_start=self.warmup_init_file is not None,
             )
             rng_key, _ = jax.random.split(rng_key)
 
@@ -173,11 +224,11 @@ class MCLMC(BaseSampler):
                 jlp, L, step_size, inverse_mass_matrix
             )
 
-            positions = jnp.tile(state.position, (n_devices, 1))
-            rng_key, *init_keys = jax.random.split(rng_key, n_devices + 1)
+            positions = jnp.tile(state.position, (n_chains, 1))
+            rng_key, *init_keys = jax.random.split(rng_key, n_chains + 1)
             init_keys = jnp.array(init_keys)
-            init_pmap = jax.pmap(sampler.init, in_axes=(0, 0))
-            states = init_pmap(positions, init_keys)
+            init_map = self._map_chains(sampler.init, chain_axes=(0, 0))
+            states = init_map(positions, init_keys)
             kernel = sampler.step
 
             warmup_parameters = {
@@ -194,17 +245,20 @@ class MCLMC(BaseSampler):
             log_density = None
 
         # Inference loop
-        keys = jax.random.split(rng_key, 1 + n_devices)
+        keys = jax.random.split(rng_key, 1 + n_chains)
         rng_key = keys[0]
         sample_keys = keys[1:]
 
         pmap_inference_loop = self._make_pmap_inference_loop()
 
+        # Built once: rebuilding the mapped init every batch retriggers
+        # tracing/compilation.
+        reinit_map = self._map_chains(sampler.init, chain_axes=(0, 0))
+
         def reinit_fn(states, rng_key):
-            rng_key, *reinit_keys = jax.random.split(rng_key, n_devices + 1)
+            rng_key, *reinit_keys = jax.random.split(rng_key, n_chains + 1)
             reinit_keys = jnp.array(reinit_keys)
-            init_pmap = jax.pmap(sampler.init, in_axes=(0, 0))
-            states = init_pmap(states.position[:, -1, :], reinit_keys)
+            states = reinit_map(states.position[:, -1, :], reinit_keys)
             return states, rng_key
 
         samples, log_density = self._run_convergence_loop(
@@ -217,7 +271,7 @@ class MCLMC(BaseSampler):
             log_density,
             sigmas,
             reference,
-            n_devices,
+            n_chains,
             output_file,
             reinit_fn,
         )
@@ -246,27 +300,78 @@ class MCLMC(BaseSampler):
                 inverse_mass_matrix=inverse_mass_matrix,
             )
 
-    def _adapt_with_convergence(self, jlp, initial_state, rng_key, initial_params):
+    def _adapt_with_convergence(self, jlp, initial_state, rng_key, initial_params,
+                                output_file=None, warm_start=False):
         """Run adaptation rounds until L, step_size, and inverse_mass_matrix converge.
 
         Calls the underlying adaptation function repeatedly, checking relative
         change between successive rounds. Stops when all three quantities change
         by less than warmup_tolerance, or after max_warmup_rounds rounds.
 
+        After every round the current parameters are checkpointed to
+        {output_file}.mclmc_warmup_intermediate.json; with restart=True an
+        existing checkpoint resumes adaptation from that round. warm_start=True
+        marks initial_params as trusted so convergence may trigger on round 1.
+
         Args:
             jlp: JIT-compiled log posterior function.
             initial_state: Initial MCLMC state.
             rng_key: JAX random key.
             initial_params: Initial MCLMCAdaptationState.
+            output_file: Base path for the intermediate checkpoint (optional).
+            warm_start: Whether initial_params come from a previous run.
 
         Returns:
             Tuple of (final state, final MCLMCAdaptationState).
         """
+        from ..util.distributed import is_io_process
+
         state = initial_state
         params = initial_params
         dim = initial_params.inverse_mass_matrix.shape[0]
+        start_round = 1
+        max_rel_change = float("nan")
 
-        for round_num in range(1, self.max_warmup_rounds + 1):
+        params_injectable = (
+            _ADJ_ADAPT_HAS_PARAMS if self.adjusted else _UNADJ_ADAPT_HAS_PARAMS
+        )
+        if not params_injectable:
+            print(
+                "Warning: installed blackjax does not accept initial params for "
+                "MCLMC adaptation; initial L/step_size/inverse_mass_matrix guess "
+                "(mass_matrix_init, warmup_init_file) is ignored.",
+                flush=True,
+            )
+
+        ckpt_file = (
+            f"{output_file}.mclmc_warmup_intermediate.json" if output_file else None
+        )
+        if ckpt_file and self.restart and os.path.exists(ckpt_file):
+            with open(ckpt_file, "r") as fp:
+                ck = json.load(fp)
+            params = MCLMCAdaptationState(
+                L=jnp.asarray(ck["L"]),
+                step_size=jnp.asarray(ck["step_size"]),
+                inverse_mass_matrix=jnp.array(ck["inverse_mass_matrix"]),
+            )
+            position = jnp.array(ck["position"])
+            rng_key, init_key = jax.random.split(rng_key)
+            if self.adjusted:
+                state = blackjax.mcmc.adjusted_mclmc.init(
+                    position=position, logdensity_fn=jlp
+                )
+            else:
+                state = blackjax.mcmc.mclmc.init(
+                    position=position, logdensity_fn=jlp, rng_key=init_key
+                )
+            start_round = ck["round"] + 1
+            warm_start = True
+            print(
+                f"Resuming MCLMC adaptation from checkpointed round {ck['round']}",
+                flush=True,
+            )
+
+        for round_num in range(start_round, self.max_warmup_rounds + 1):
             rng_key, tune_key = jax.random.split(rng_key)
             prev_params = params
 
@@ -305,7 +410,30 @@ class MCLMC(BaseSampler):
                 flush=True,
             )
 
-            if round_num > 1 and max_rel_change < self.warmup_tolerance:
+            if ckpt_file and is_io_process():
+                with open(ckpt_file, "w") as fp:
+                    json.dump(
+                        {
+                            "L": float(params.L),
+                            "step_size": float(params.step_size),
+                            "inverse_mass_matrix": np.asarray(
+                                params.inverse_mass_matrix
+                            ).tolist(),
+                            "position": np.asarray(state.position).tolist(),
+                            "round": round_num,
+                        },
+                        fp,
+                    )
+
+            # When params cannot be injected, round-1 output is unrelated to
+            # the (ignored) initial/checkpointed params, so require a second
+            # executed round before declaring convergence.
+            may_converge = (
+                round_num > start_round
+                if not params_injectable
+                else (round_num > 1 or warm_start)
+            )
+            if may_converge and max_rel_change < self.warmup_tolerance:
                 print(
                     f"Warmup converged after {round_num} rounds "
                     f"(max_rel_change={max_rel_change:.4f} < tol={self.warmup_tolerance:.0%})",
@@ -342,7 +470,7 @@ class MCLMC(BaseSampler):
             frac_tune2=self.frac_tune2,
             frac_tune3=self.frac_tune3,
             diagonal_preconditioning=diagonal_preconditioning,
-            params=initial_params,
+            **({"params": initial_params} if _UNADJ_ADAPT_HAS_PARAMS else {}),
         )
 
         return state, params
@@ -379,7 +507,7 @@ class MCLMC(BaseSampler):
             frac_tune2=self.frac_tune2,
             frac_tune3=self.frac_tune3,
             diagonal_preconditioning=diagonal_preconditioning,
-            params=initial_params,
+            **({"params": initial_params} if _ADJ_ADAPT_HAS_PARAMS else {}),
         )
 
         return state, params

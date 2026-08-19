@@ -1,5 +1,6 @@
 from ...util.likelihood_module import LikelihoodModule
 from ...data_vector.two_point_spectrum import field_types
+from ...theory.spline import is_uniform_grid, uniform_cubic_interp1d
 from jax.scipy.integrate import trapezoid
 from jax.scipy.interpolate import RegularGridInterpolator
 from interpax import interp1d
@@ -27,6 +28,7 @@ class ProjectionKernels(LikelihoodModule):
         self.observed_data_vector = observed_data_vector
         self.shifted_nz = shifted_nz
         self.z = jnp.linspace(zmin, zmax, nz)
+        self._z_uniform = is_uniform_grid(self.z)
 
         if self.observed_data_vector.zeff_weighting:
             self.required_projection_kernels = {
@@ -268,7 +270,10 @@ class ProjectionKernels(LikelihoodModule):
                 nz = getattr(self.observed_data_vector, nz_name)
 
             def f(carry, nz_i):
-                nz_i = interp1d(z_limber, self.z, nz_i, extrap=True)
+                if self._z_uniform:
+                    nz_i = uniform_cubic_interp1d(z_limber, self.z, nz_i, extrap=True)
+                else:
+                    nz_i = interp1d(z_limber, self.z, nz_i, extrap=True)
                 nz_i = jnp.where(nz_i > 0, nz_i, 0)
                 nz_i = nz_i / trapezoid(nz_i, x=z_limber)
 

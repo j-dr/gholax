@@ -372,8 +372,7 @@ class RealSpaceIAExpansion(LikelihoodModule):
             
 
         self.output_requirements = {}
-        if self.scale_by_s8z:
-            self.sigma8_fid = 0.81
+        self.sigma8_fid = 0.81
 
         if self.save_spherical_harmonic_spectra:
             self.required_spectra = {
@@ -886,6 +885,18 @@ class RealSpaceIAExpansion(LikelihoodModule):
 
         return pars
 
+    def _sigma8_z(self, state):
+        """sigma8(z) feeding the bias reparameterization.
+
+        Every consumer normalizes this by ``sigma8_fid``, so returning
+        ``sigma8_fid`` when ``scale_by_s8z`` is off makes that normalization
+        unity. ``state['sigma8_z']`` is only requested when the flag is on, so
+        it must not be read otherwise.
+        """
+        if not self.scale_by_s8z:
+            return jnp.full(self.z.shape[0], self.sigma8_fid)
+        return state["sigma8_z"]
+
     def set_cs(self, param_vec, param_indices, zeff, s8z, z_evolution_model):
         """Compute IA bias coefficients with redshift evolution applied.
 
@@ -1034,7 +1045,7 @@ class RealSpaceIAExpansion(LikelihoodModule):
         bvec = [0] * len(self.spectrum_params["p_gi"][0])
         bvec[0] = 1
         p_ij = state["p_ij_real_space_density_shape_grid"]
-        s8z = state["sigma8_z"] / self.sigma8_fid
+        s8z = self._sigma8_z(state) / self.sigma8_fid
 
         pmi = combine_density_shape_spectra(
             self.k, p_ij[...], jnp.array(bvec), cvec, s8z_d=None, s8z_s=s8z, b1e=True
@@ -1089,7 +1100,7 @@ class RealSpaceIAExpansion(LikelihoodModule):
                     0,
                     (
                         self.param_indices[s][1],
-                        jnp.tile(state["sigma8_z"], n_sbins_tot).reshape(
+                        jnp.tile(self._sigma8_z(state), n_sbins_tot).reshape(
                             n_sbins_tot, -1
                         ),
                     ),
@@ -1103,7 +1114,7 @@ class RealSpaceIAExpansion(LikelihoodModule):
                 bvec = [0] * len(self.spectrum_params["p_gi"][0])
                 bvec[0] = 1
                 bvec = jnp.array(bvec)
-                s8z_s = state["sigma8_z"] / self.sigma8_fid
+                s8z_s = self._sigma8_z(state) / self.sigma8_fid
                 p_ij = state["p_ij_real_space_density_shape_grid"]
 
                 bias_poly_all = vmap(
@@ -1141,7 +1152,7 @@ class RealSpaceIAExpansion(LikelihoodModule):
                         self.param_indices[s][0],
                         state["zeff_w_d_dk"],
                         jnp.tile(
-                            state["sigma8_z"], len(self.param_indices[s][0])
+                            self._sigma8_z(state), len(self.param_indices[s][0])
                         ).reshape(len(self.param_indices[s][0]), -1),
                     ),
                 )
@@ -1153,7 +1164,7 @@ class RealSpaceIAExpansion(LikelihoodModule):
                         self.param_indices[s][1],
                         state["zeff_w_d_dk"][:, None],
                         jnp.tile(
-                            state["sigma8_z"], len(self.param_indices[s][0])
+                            self._sigma8_z(state), len(self.param_indices[s][0])
                         ).reshape(len(self.param_indices[s][0]), -1),
                     ),
                 )
@@ -1189,7 +1200,7 @@ class RealSpaceIAExpansion(LikelihoodModule):
                         self.param_indices[s][0],
                         jnp.repeat(state["zeff_w_ia"][:, None], n_sbins_tot),
                         jnp.tile(
-                            state["sigma8_z"], len(self.param_indices[s][0])
+                            self._sigma8_z(state), len(self.param_indices[s][0])
                         ).reshape(len(self.param_indices[s][0]), -1),
                     ),
                 )
@@ -1200,7 +1211,7 @@ class RealSpaceIAExpansion(LikelihoodModule):
                         self.param_indices[s][1],
                         jnp.repeat(state["zeff_w_ia"][:, None], n_sbins_tot),
                         jnp.tile(
-                            state["sigma8_z"], len(self.param_indices[s][0])
+                            self._sigma8_z(state), len(self.param_indices[s][0])
                         ).reshape(len(self.param_indices[s][1]), -1),
                     ),
                 )
@@ -1439,19 +1450,15 @@ def _contract_ia_basis(bias_poly_all, spectra):
     ``spectra`` is the fixed ``(ncomp, nk, nz)`` basis. Returns
     ``(npairs, nk, nz)``.
 
-    The reduction is the elementwise-multiply-then-sum over the component
-    axis, matching ``jnp.sum(bias_poly[:, None, :] * spectra, axis=0)`` from
-    the per-pair path exactly (bit-for-bit in float32), just batched over the
-    leading bin-pair axis so the fixed basis is contracted once instead of in
-    a per-pair scan.
+    The reduction contracts the component axis directly via einsum rather
+    than materializing the (npairs, ncomp, nk, nz) product; results agree
+    with the per-pair path to float32 accumulation order.
     """
     if bias_poly_all.ndim == 2:
-        # z-independent bias: (npairs, ncomp) -> broadcast over nk and nz
-        bp = bias_poly_all[:, :, None, None]
-    else:
-        # z-dependent bias: (npairs, ncomp, nz) -> broadcast over nk
-        bp = bias_poly_all[:, :, None, :]
-    return jnp.sum(bp * spectra[None, :, :, :], axis=1)
+        # z-independent bias: (npairs, ncomp)
+        return jnp.einsum("pc,ckz->pkz", bias_poly_all, spectra)
+    # z-dependent bias: (npairs, ncomp, nz)
+    return jnp.einsum("pcz,ckz->pkz", bias_poly_all, spectra)
 
 
 def _add_shape_shot(p, shot):

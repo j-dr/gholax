@@ -6,7 +6,7 @@ import numpy as np
 from interpax import interp1d, interp2d
 from jax.lax import scan
 from jax.scipy.integrate import trapezoid
-from ...theory.spline import spline_func_vec
+from ...theory.spline import is_uniform_grid, spline_func_vec, uniform_cubic_interp1d
 from ...util.likelihood_module import LikelihoodModule
 
 required_components = {
@@ -105,6 +105,14 @@ class Limber(LikelihoodModule):
         self.no_ia = config.get("no_ia", False)
         self.magnification_x_ia = config.get("include_magnification_x_ia", False)
         self.interpolation_order = config.get("interpolation_order", "cubic")
+        # Uniform-grid cubic path replaces interpax's per-query binary search
+        # with closed-form indexing; fall back to interpax otherwise.
+        self.uniform_cubic_k = (
+            self.interpolation_order == "cubic" and is_uniform_grid(self.logk)
+        )
+        self.uniform_cubic_z = (
+            self.interpolation_order == "cubic" and is_uniform_grid(self.z_pk)
+        )
 
         self.all_spectra = {}
 
@@ -148,7 +156,6 @@ class Limber(LikelihoodModule):
             self.output_requirements[t] = []
 
             for (w_i, w_j), (p, td_), zfield_ in self.required_components[t]:
-                self.output_requirements[f"{w_i}_{w_j}"] = [w_i, w_j, p]
                 self.output_requirements[t].extend([w_i, w_j, p])
                 
         if self.non_parametric_growth:
@@ -173,8 +180,15 @@ class Limber(LikelihoodModule):
         logk_grid = self.logk
         interp_method = self.interpolation_order
 
-        def _interp_k_column(kq, fq):
-            return interp1d(kq, logk_grid, fq, extrap=0.0, method=interp_method)
+        if self.uniform_cubic_k:
+
+            def _interp_k_column(kq, fq):
+                return uniform_cubic_interp1d(kq, logk_grid, fq, extrap=0.0)
+
+        else:
+
+            def _interp_k_column(kq, fq):
+                return interp1d(kq, logk_grid, fq, extrap=0.0, method=interp_method)
 
         _interp_k_all_columns = jax.vmap(
             _interp_k_column, in_axes=(1, 1), out_axes=1
@@ -193,11 +207,21 @@ class Limber(LikelihoodModule):
             elif zfield_one.ndim == 1:
                 z_query = zfield_one
             else:
-                z_query = jnp.broadcast_to(zfield_one.reshape(1), (nz_proj,))
+                # Scalar zeff: interpolate once to (nk,) and broadcast rather
+                # than computing nz_proj identical columns.
+                z_query = zfield_one.reshape(1)
 
-            s_at_zproj = interp1d(
-                z_query, self.z_pk, s_one.T, extrap=0.0, method=interp_method,
-            ).T  # (nk, nz_proj)
+            if self.uniform_cubic_z:
+                s_at_zproj = uniform_cubic_interp1d(
+                    z_query, self.z_pk, s_one.T, extrap=0.0
+                ).T
+            else:
+                s_at_zproj = interp1d(
+                    z_query, self.z_pk, s_one.T, extrap=0.0, method=interp_method,
+                ).T  # (nk, nz_proj) or (nk, 1) for scalar zeff
+
+            if zfield_one.ndim == 0:
+                s_at_zproj = jnp.broadcast_to(s_at_zproj, (self.nk, nz_proj))
 
             # Step 2: for each z_proj column, interpolate in k at k=(ell+0.5)/chi.
             # log_kval[:, j] differs per column; vmap over the nz_proj axis.
@@ -208,12 +232,9 @@ class Limber(LikelihoodModule):
 
             p_ij = _interp_to_proj(s, zfield)
 
+            c_l_chi = w_i * w_j * p_ij / state["chi_z_limber"][None, :] ** 2
             if self.k_cutoff is not None:
-                mask = k < self.k_cutoff
-            else:
-                mask = jnp.ones_like(k)
-
-            c_l_chi = w_i * w_j * p_ij / state["chi_z_limber"][None, :] ** 2 * mask
+                c_l_chi = c_l_chi * (k < self.k_cutoff)
             if self.non_parametric_growth:
                 A_growth_chi = state['A_growth_chi']
                 c_l_chi = c_l_chi * (A_growth_chi[None, :] ** 2)
@@ -298,10 +319,10 @@ class Limber(LikelihoodModule):
                         if zfield.shape[0] == self.nz_proj:
                             zfield = jnp.broadcast_to(zfield, (n_i, self.nz_proj))
                         elif zfield.ndim == 1:
-                            # One effective redshift per bin pair.
-                            zfield = jnp.broadcast_to(
-                                zfield[:, None], (n_i, self.nz_proj)
-                            )
+                            # One effective redshift per bin pair: keep it
+                            # scalar per scan element so _interp_to_proj does
+                            # a single z query instead of nz_proj copies.
+                            pass
                         else:
                             # zfield already has one row per bin pair.
                             zfield = jnp.reshape(zfield, (n_i, self.nz_proj))
@@ -323,17 +344,14 @@ class Limber(LikelihoodModule):
                 # ops as the scan body, broadcast over the pair axis. The
                 # tiled s/zfield above are unused here and DCE'd under jit.
                 p_ij = _interp_to_proj(s_orig[0], zfield_orig)
-                if self.k_cutoff is not None:
-                    mask = k < self.k_cutoff
-                else:
-                    mask = jnp.ones_like(k)
                 c_l_chi_w_i_w_j = (
                     w_i[:, None, :]
                     * w_j[:, None, :]
                     * p_ij[None, :, :]
                     / state["chi_z_limber"][None, None, :] ** 2
-                    * mask[None, :, :]
                 )
+                if self.k_cutoff is not None:
+                    c_l_chi_w_i_w_j = c_l_chi_w_i_w_j * (k < self.k_cutoff)[None, :, :]
                 if self.non_parametric_growth:
                     c_l_chi_w_i_w_j = c_l_chi_w_i_w_j * (
                         state["A_growth_chi"][None, None, :] ** 2
@@ -341,7 +359,6 @@ class Limber(LikelihoodModule):
             else:
                 xs = [w_i, w_j, s, zfield]
                 _, c_l_chi_w_i_w_j = scan(compute_component_c_l_chi, None, xs)
-            state[f"{w_i_}_{w_j_}"] = c_l_chi_w_i_w_j
             if spec_type in state:
                 state[spec_type] += c_l_chi_w_i_w_j
             else:

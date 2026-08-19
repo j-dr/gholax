@@ -1,10 +1,26 @@
 #!/usr/bin/python3
 import yaml
 import sys
+import os
 import jax
 import numpy as np
 jax.config.update("jax_default_matmul_precision", "float32")
 #jax.config.update("jax_log_compiles", True)
+
+def _setup_compilation_cache(cfg):
+    """Point jax at a persistent compilation cache so repeated jobs and
+    restarts skip recompilation. Configure with the top-level YAML key
+    `compilation_cache_dir` (null disables); multi-process safe. Default is
+    $SCRATCH/gholax/jax_cache when SCRATCH is set (NERSC), else ~/.cache."""
+    default = (
+        os.path.join(os.environ['SCRATCH'], 'gholax', 'jax_cache')
+        if os.environ.get('SCRATCH')
+        else '~/.cache/gholax/jax_cache'
+    )
+    cache_dir = cfg.get('compilation_cache_dir', default)
+    if cache_dir:
+        jax.config.update("jax_compilation_cache_dir", os.path.expanduser(cache_dir))
+        jax.config.update("jax_persistent_cache_min_compile_time_secs", 1)
 
 def main():
     """CLI entry point for running gholax inference.
@@ -17,6 +33,10 @@ def main():
 
     with open(sys.argv[1], 'r') as fp:
         cfg = yaml.load(fp, Loader=yaml.SafeLoader)
+
+    # Config-only; must run before the first compile, and is safe before
+    # maybe_init_distributed (no device use).
+    _setup_compilation_cache(cfg)
 
     # Must run before the first device use: joins multi-process (multi-node)
     # runs into one global JAX mesh. No-op for single-process runs.

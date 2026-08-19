@@ -11,8 +11,16 @@ import sys
 import jax
 from scipy.stats import ks_2samp
 
+# interval is in standardized units, so it bounds where the RQ spline is active:
+# outside it flowjax falls back to the identity with derivative exactly 1, while
+# the boundary knot's derivative is learned, so log|det J| -- and hence log_prob
+# -- jumps there. interval=4 put that discontinuity at 4 sigma, inside the region
+# a lensing+RSD posterior explores, which collapsed the NUTS step size to 1e-5.
+FLOW_ARCH_DEFAULTS = {"type": "maf", "knots": 32, "interval": 10}
+
+
 def train_posterior_flow(theta, weights, train_split=0.8, flow_settings={}):
-    
+
     key = jax.random.key(int(datetime.now().strftime("%Y%m%d%s")))
 
     N = theta.shape[0]
@@ -27,13 +35,14 @@ def train_posterior_flow(theta, weights, train_split=0.8, flow_settings={}):
     u_training = (theta_training - mean) / std    
     
     key, subkey = jax.random.split(key)
-    if flow_settings.get("type", "maf") == "maf": 
+    arch = {**FLOW_ARCH_DEFAULTS, **flow_settings}
+    if arch["type"] == "maf":
         flow = masked_autoregressive_flow(
             subkey,
             base_dist=Normal(jnp.zeros(u_training.shape[1])),
-            transformer=RationalQuadraticSpline(knots=flow_settings.get("knots", 16),
-                                                interval=flow_settings.get("interval", 4)),
-        )    
+            transformer=RationalQuadraticSpline(knots=arch["knots"],
+                                                interval=arch["interval"]),
+        )
     else:
         raise NotImplementedError("Currently only MAF flows are supported.")
     
@@ -230,12 +239,15 @@ def main():
         
     chain_root = config["chain_root"]
     priors = config['params']
-    param_names = list(priors.keys())
+    # Retraining from a saved config must keep its order: yaml.dump sorts `params`.
+    param_names = config.get("param_names") or list(priors.keys())
     
     theta, weights = load_getdist_samples(chain_root, param_names)
     
     flow, mean, std = train_posterior_flow(theta, weights, flow_settings=config)
-    config_out = {**config, "mean": mean.tolist(), "std": std.tolist(), "param_names": param_names}
+    # Record the resolved architecture so the saved config alone rebuilds the flow.
+    config_out = {**FLOW_ARCH_DEFAULTS, **config,
+                  "mean": mean.tolist(), "std": std.tolist(), "param_names": param_names}
 
     save_flow(config["save_path"], flow, config_out)
 
