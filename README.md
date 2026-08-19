@@ -32,3 +32,16 @@ Analogously, assuming you have `mamba` installed, you can run `sh setup_env.sh` 
 The environment can then be activated by calling `mamba activate gholax`. 
 
 
+
+## Running the tests
+From the repository root, with the `gholax` environment activated:
+
+```bash
+pytest tests
+```
+
+The analytic marginalization (AM) tests are slow; to skip them:
+
+```bash
+pytest tests -k "not am_"
+```
