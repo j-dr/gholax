@@ -691,7 +691,8 @@ class BaseSampler(object):
             states = pmap_inference_loop(
                 sample_keys, kernel, states, self.n_steps_incr
             )
-            if isinstance(states, tuple):
+            # exact tuple only: kernel states are NamedTuples (tuple subclass)
+            if type(states) is tuple:
                 states, n_leap, divergent = states
                 n_leap = np.asarray(gather_to_host(n_leap))
                 divergent = np.asarray(gather_to_host(divergent))

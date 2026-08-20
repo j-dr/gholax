@@ -50,10 +50,17 @@ class NUTS(BaseSampler):
         # pooled_window_max_doublings). Under vmap lockstep one deep-tree
         # chain stalls the whole batch; 8 bounds a step at 256 leapfrogs.
         self.max_num_doublings = c.get("max_num_doublings", 10)
+        # Auto-cap sampling depth from the converged warmup depth
+        # distribution unless the config pins max_num_doublings.
+        self.max_num_doublings_auto = "max_num_doublings" not in c
+        self.depth_cap_quantile = c.get("depth_cap_quantile", 0.9)
         self.minimize_start_scale = c.get("minimize_start_scale", 0.5)
         self.pathfinder_adaptation = c.get("pathfinder_adaptation", False)
         self.target_acceptance_rate = c.get("target_acceptance_rate", 0.65)
         self.step_size_init = c.get("step_size_init", 0.05)
+        # Search for an initial step size (doubling/halving heuristic) unless
+        # the config pins one explicitly.
+        self.step_size_search = "step_size_init" not in c
         self.parallel_warmup = c.get("parallel_warmup", False)
         self.chains_per_device = int(c.get("chains_per_device", 1))
         if self.chains_per_device < 1:
@@ -90,6 +97,13 @@ class NUTS(BaseSampler):
         self.pooled_window_steps = c.get("pooled_window_steps", 25)
         self.pooled_window_max_steps = c.get("pooled_window_max_steps", 200)
         self.pooled_window_max_doublings = c.get("pooled_window_max_doublings", 10)
+        # Convergence additionally requires the max between/within variance
+        # ratio, normalized by its measured sampling floor tau/T (tau from
+        # the window tail), to fall below this: ~1 means chain means scatter
+        # exactly as much as tau/T predicts for mixed chains; unmixed runs
+        # sit far above. Default 2.0 allows max-over-dims fluctuations.
+        self.pooled_window_mixing_gate = c.get("pooled_window_mixing_gate", 2.0)
+        self.pooled_window_max_window = c.get("pooled_window_max_window", 40)
 
     def _adaptive_window_warmup(self, jlp, rng_key, initial_position,
                                 initial_inverse_mass_matrix=None,
@@ -399,7 +413,9 @@ class NUTS(BaseSampler):
                               initial_step_size=None, output_file=None):
         """Torsten-style cross-chain windowed warmup that keeps NUTS end to end.
 
-        All chains step together through short windows with a fixed diagonal
+        All chains step together through windows that double in length each
+        boundary (Stan-style, from pooled_window_steps up to
+        pooled_window_max_window) with a fixed diagonal
         inverse mass matrix, while the step size is dual-averaged every step
         from the cross-chain mean acceptance (Stan-style within-window
         feedback). At each window boundary the mass matrix is re-estimated
@@ -417,7 +433,10 @@ class NUTS(BaseSampler):
         Returns:
             Tuple of (final per-chain positions, parameters dict).
         """
-        from blackjax.adaptation.step_size import dual_averaging_adaptation
+        from blackjax.adaptation.step_size import (
+            dual_averaging_adaptation,
+            find_reasonable_step_size,
+        )
         from blackjax.mcmc import nuts as nuts_mcmc
 
         from ..util.distributed import is_io_process
@@ -464,12 +483,13 @@ class NUTS(BaseSampler):
                 return (states, da_state), (
                     states.position,
                     jnp.mean(infos.acceptance_rate),
+                    infos.num_integration_steps,
                 )
 
-            (states, da_state), (pos, acc) = jax.lax.scan(
+            (states, da_state), (pos, acc, n_leap) = jax.lax.scan(
                 one_step, (states, da_state), jax.random.split(key, n_window)
             )
-            return states, da_state, pos, acc
+            return states, da_state, pos, acc, n_leap
 
         positions = initial_positions
         imm = (
@@ -484,6 +504,7 @@ class NUTS(BaseSampler):
         )
         prev_mass = None
         prev_step = None
+        chunks = 1
         if initial_inverse_mass_matrix is not None and initial_step_size is not None:
             # Warm start: seed the convergence check so a single window can
             # suffice.
@@ -504,11 +525,33 @@ class NUTS(BaseSampler):
                 prev_mass = imm
                 prev_step = step_size
                 total_steps = ck["total_steps"]
+                chunks = ck.get("window_chunks", 1)
                 print(
                     f"Resuming pooled window warmup from checkpointed step "
                     f"{total_steps}",
                     flush=True,
                 )
+
+        if self.step_size_search and initial_step_size is None and total_steps == 0:
+            # Halve/double from a large guess until acceptance crosses target:
+            # a few gradient evaluations replace whole windows spent crawling
+            # from a mismatched hand-set initial step size.
+            rng_key, srch_key = jax.random.split(rng_key)
+            step_size = jnp.asarray(
+                find_reasonable_step_size(
+                    srch_key,
+                    lambda eps: lambda k, s: kernel(
+                        k, s, jlp, eps, imm,
+                        max_num_doublings=max_doublings,
+                    ),
+                    nuts_mcmc.init(positions[0], jlp),
+                    0.5,
+                    target_accept=self.target_acceptance_rate,
+                )
+            )
+            print(
+                f"Initial step size search: {float(step_size):.3g}", flush=True
+            )
 
         print(
             f"Running pooled window warmup ({n_chains} chains, "
@@ -519,12 +562,29 @@ class NUTS(BaseSampler):
         da_state = da_init(float(step_size))
         states = vinit(positions)
 
+        n_leap = None
+        # Stan-style growing windows built from k base-length scans (one
+        # compiled executable): short windows early for fast metric feedback,
+        # doubling each boundary so the tail statistics (within variance,
+        # between/within ratio, dual-averaged eps) are judged on enough
+        # samples that the mixing gate's tau/T floor drops below 1.
+        k_max = max(1, self.pooled_window_max_window // n_window)
+        k = min(chunks, k_max)
         while total_steps < self.pooled_window_max_steps:
-            rng_key, sub_key = jax.random.split(rng_key)
-            states, da_state, pos, acc = run_window(
-                sub_key, states, da_state, imm
-            )
-            total_steps += n_window
+            pos_c, acc_c, leap_c = [], [], []
+            for _ in range(k):
+                rng_key, sub_key = jax.random.split(rng_key)
+                states, da_state, p_i, a_i, l_i = run_window(
+                    sub_key, states, da_state, imm
+                )
+                pos_c.append(p_i)
+                acc_c.append(a_i)
+                leap_c.append(l_i)
+                total_steps += n_window
+            pos = jnp.concatenate(pos_c, axis=0)
+            acc = jnp.concatenate(acc_c, axis=0)
+            n_leap = jnp.concatenate(leap_c, axis=0)
+            w_len = k * n_window
 
             # Diagonal imm from the pooled WITHIN-chain variance (mean over
             # chains of each chain's variance across its window samples).
@@ -542,13 +602,33 @@ class NUTS(BaseSampler):
             # estimate. It is deflated by the between/within mixing ratio
             # so unmixed chains collapse the weight and the seed stays
             # sticky.
-            # pos: (n_window, n_chains, dim)
-            tail = pos[n_window // 5:]
+            # pos: (w_len, n_chains, dim)
+            tail = pos[w_len // 5:]
             within = jnp.mean(jnp.var(tail, axis=0, ddof=1), axis=0)
             # Mixing diagnostic: between-chain variance of chain means over
             # within; >> 1 means the chains are unmixed.
             between = jnp.var(jnp.mean(tail, axis=0), axis=0, ddof=1)
             bw_ratio = float(jnp.max(between / (within + 1e-30)))
+            # Principled mixing gate: for mixed chains E[between/within] is
+            # the sampling floor tau/T (T tail samples of integrated
+            # autocorrelation time tau), so judge mixing on the per-dim ratio
+            # normalized by the measured floor (Geyer-truncated tau from the
+            # same tail, averaged over chains).
+            x = np.asarray(tail)
+            T = x.shape[0]
+            xc = x - x.mean(axis=0, keepdims=True)
+            var0 = (xc**2).mean(axis=0) + 1e-30
+            rho_sum = np.zeros(x.shape[2])
+            for lag in range(1, max(1, T // 2)):
+                rho = ((xc[:-lag] * xc[lag:]).mean(axis=0) / var0).mean(axis=0)
+                rho = np.maximum(rho, 0.0)
+                if not np.any(rho > 0.0):
+                    break
+                rho_sum += rho
+            tau = np.clip(1.0 + 2.0 * rho_sum, 1.0, T)
+            bw_norm = float(np.max(
+                np.asarray(between) / (np.asarray(within) + 1e-30) / (tau / T)
+            ))
             n_eff = tail.shape[0] / (1.0 + bw_ratio)
             w = n_eff / (n_eff + 5)
             mass = w * within + (1 - w) * imm
@@ -568,6 +648,7 @@ class NUTS(BaseSampler):
                             "positions": np.asarray(states.position).tolist(),
                             "total_steps": total_steps,
                             "between_within_ratio": bw_ratio,
+                            "window_chunks": k,
                         },
                         fp,
                     )
@@ -581,23 +662,33 @@ class NUTS(BaseSampler):
                     jnp.abs(step - prev_step) / (jnp.abs(prev_step) + 1e-10)
                 )
                 print(
-                    f"Pooled warmup step {total_steps}: "
+                    f"Pooled warmup step {total_steps} (window {w_len}): "
                     f"max_rel_mass_change={mass_change:.4f}, "
                     f"rel_step_change={step_change:.4f}, "
                     f"mean_acceptance={mean_acc:.3f}, "
-                    f"max_between_within_ratio={bw_ratio:.2f}"
-                    + (" (chains unmixed)" if bw_ratio > 1.0 else ""),
+                    f"max_between_within_ratio={bw_ratio:.2f}, "
+                    f"bw/floor={bw_norm:.2f} (tau_max={tau.max():.1f})"
+                    + (
+                        " (chains unmixed)"
+                        if bw_norm > self.pooled_window_mixing_gate
+                        else ""
+                    ),
                     flush=True,
                 )
+                # Mixing gate: rtol-luck while chains are unmixed freezes a
+                # seed-dominated metric and an eps tuned to it (observed: 83%
+                # divergent sampling after converging at bw_ratio 23).
                 converged = (
                     mass_change < self.adaptive_warmup_rtol_mass
                     and step_change < self.adaptive_warmup_rtol_step
+                    and bw_norm < self.pooled_window_mixing_gate
                 )
 
             prev_mass = mass
             prev_step = step
             imm = mass
             step_size = jnp.asarray(step)
+            k = min(2 * k, k_max)
 
             if converged:
                 print(
@@ -616,6 +707,27 @@ class NUTS(BaseSampler):
             "inverse_mass_matrix": imm,
             "step_size": step_size,
         }
+        if self.max_num_doublings_auto and n_leap is not None:
+            # Sampling depth cap from the last (converged) window: under vmap
+            # lockstep the deepest chain sets the per-step cost, so cap just
+            # above the bulk of the depth distribution instead of blackjax's
+            # default 10.
+            depth = jnp.ceil(jnp.log2(n_leap.astype(jnp.float32) + 1.0))
+            qs = (0.1, 0.25, 0.5, 0.75, 0.9, 1.0)
+            dq = [int(jnp.quantile(depth, q)) for q in qs]
+            print(
+                "Warmup tree depth percentiles: "
+                + ", ".join(f"q{q:g}={d}" for q, d in zip(qs, dq)),
+                flush=True,
+            )
+            q_depth = int(jnp.quantile(depth, self.depth_cap_quantile))
+            self.max_num_doublings = min(q_depth + 1, self.max_num_doublings)
+            parameters["max_num_doublings"] = self.max_num_doublings
+            print(
+                f"Sampling depth cap: {self.max_num_doublings} "
+                f"(q{self.depth_cap_quantile:g} warmup depth {q_depth})",
+                flush=True,
+            )
         return jnp.asarray(states.position), parameters
 
     def run(self, model, output_file):
@@ -673,6 +785,8 @@ class NUTS(BaseSampler):
 
             inverse_mass_matrix = jnp.array(warmup_parameters["inverse_mass_matrix"])
             step_size = jnp.array(warmup_parameters["step_size"])
+            if self.max_num_doublings_auto and "max_num_doublings" in warmup_parameters:
+                self.max_num_doublings = int(warmup_parameters["max_num_doublings"])
             if os.path.exists(f"{output_file}.samples_chk.npy"):
                 # The checkpoint stores physical-space samples, but the
                 # convergence loop accumulates normalized ones and rescales on
@@ -951,6 +1065,10 @@ class NUTS(BaseSampler):
                     gather_to_host(states.position)
                 ).tolist(),
             }
+            if "max_num_doublings" in parameters:
+                warmup_parameters["max_num_doublings"] = int(
+                    parameters["max_num_doublings"]
+                )
             if self.warmup_algorithm == "chees":
                 warmup_parameters.update(
                     trajectory_length_adjusted=parameters[
