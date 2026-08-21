@@ -63,6 +63,54 @@ def make_model(cond):
     return ToyModel()
 
 
+def make_geometry_model(logdensity, dim):
+    """Construct a small normalized-space model for geometry regressions."""
+
+    class ToyPrior:
+        def __init__(self):
+            self.params = [f"x{i}" for i in range(dim)]
+
+        def get_prior_sigmas(self):
+            return np.ones(dim)
+
+        def get_reference_values(self):
+            return np.zeros(dim)
+
+        def initial_position(self, random_start=True, key=None, normalize=True):
+            if random_start and key is not None:
+                vals = 0.1 * jax.random.normal(key, (dim,))
+            else:
+                vals = jnp.zeros(dim)
+            return {f"x{i}": vals[i] for i in range(dim)}
+
+    class ToyModel:
+        def __init__(self):
+            self.prior = ToyPrior()
+
+        def log_posterior_scaled_params(self, p):
+            return logdensity(p)
+
+    return ToyModel()
+
+
+def make_correlated_gaussian_model(dim=8, rho=0.8):
+    idx = jnp.arange(dim)
+    covariance = rho ** jnp.abs(idx[:, None] - idx[None, :])
+    precision = jnp.linalg.inv(covariance)
+    return make_geometry_model(lambda p: -0.5 * p @ precision @ p, dim)
+
+
+def make_funnel_model(dim=6):
+    """Centered Neal funnel; intentionally difficult for a diagonal metric."""
+
+    def logdensity(p):
+        y, x = p[0], p[1:]
+        scale = jnp.exp(0.5 * y)
+        return -0.5 * (y / 3.0) ** 2 - 0.5 * jnp.sum((x / scale) ** 2 + y)
+
+    return make_geometry_model(logdensity, dim)
+
+
 def _nuts(scfg):
     from gholax.sampler import NUTS
 
@@ -76,6 +124,16 @@ POOLED_CFG = {
     "target_r_minus_one": 0.1,
     "minimize_and_sample": False,
     "chains_per_device": 2,
+    # The toy target is used to exercise the full post-warmup path, not to
+    # calibrate production tolerances.  Give it enough room to satisfy the
+    # terminal-calibration contract deterministically.
+    "pooled_window_max_window": 100,
+    "adaptive_warmup_rtol_mass": 0.8,
+    "adaptive_warmup_rtol_step": 0.3,
+    "pooled_window_consecutive_windows": 1,
+    # Short-budget unit tests below intentionally inspect intermediate,
+    # unconverged windows.
+    "pooled_window_allow_unconverged": True,
 }
 
 WINDOW_DEFAULT_STEPS = 500  # n_steps_warmup default of the 'window' path
@@ -173,10 +231,10 @@ def test_pooled_window_resume_from_checkpoint(tmp_path, capsys):
     setup = nuts._init_chains(model)
     positions = setup.initial_positions
 
-    # "Killed" run: max_steps == 2 windows stops with the intermediate
-    # checkpoint on disk but no final parameters file.
+    # "Killed" run: stop exactly at a boundary.  The checkpoint records the
+    # next growing-window size so a restart does not repeat a window.
     prefix = str(tmp_path / "pooled")
-    interrupted = _nuts({**POOLED_CFG, "pooled_window_max_steps": 50})
+    interrupted = _nuts({**POOLED_CFG, "pooled_window_max_steps": 15})
     interrupted._pooled_window_warmup(
         setup.jlp, jax.random.key(0), positions, output_file=prefix
     )
@@ -184,22 +242,24 @@ def test_pooled_window_resume_from_checkpoint(tmp_path, capsys):
     assert os.path.exists(ckpt_file)
     with open(ckpt_file) as fp:
         ck = json.load(fp)
-    assert set(ck) == {
+    assert {
         "inverse_mass_matrix", "step_size", "positions", "total_steps",
-        "between_within_ratio", "window_chunks",
-    }
-    assert ck["total_steps"] == 50
+        "between_within_ratio", "window_chunks", "next_window_chunks",
+    } <= set(ck)
+    assert ck["total_steps"] == 15
+    assert ck["next_window_chunks"] == 2
     assert np.array(ck["positions"]).shape == (2 * N_DEVICES, DIM)
 
     # Restart: adaptation must resume from the checkpointed window.
-    resumed = _nuts({**POOLED_CFG, "restart": True})
+    resumed = _nuts({**POOLED_CFG, "restart": True,
+                     "pooled_window_max_steps": 50})
     states_r, params_r = resumed._pooled_window_warmup(
         setup.jlp, jax.random.key(1), positions, output_file=prefix
     )
     out = capsys.readouterr().out
-    assert "Resuming pooled window warmup from checkpointed step 50" in out
+    assert "Resuming pooled window warmup from checkpointed step 15" in out
     with open(ckpt_file) as fp:
-        assert json.load(fp)["total_steps"] > 50
+        assert json.load(fp)["total_steps"] <= 50
 
     # Uninterrupted run for comparison.
     full = _nuts(POOLED_CFG)
@@ -302,23 +362,34 @@ def test_pooled_window_depth_cap(capsys):
     max_num_doublings capped at quantile-depth + 1; pinning max_num_doublings
     in the config disables it."""
     model = make_model(10.0)
-    nuts = _nuts({**POOLED_CFG, "pooled_window_max_steps": 10})
+    cap_cfg = {
+        **POOLED_CFG,
+        "pooled_window_max_steps": 50,
+        "pooled_window_terminal_steps": 25,
+        "pooled_window_mixing_rhat": 10.0,
+        "adaptive_warmup_rtol_mass": 1e9,
+        "adaptive_warmup_rtol_step": 1e9,
+    }
+    nuts = _nuts(cap_cfg)
     assert nuts.max_num_doublings_auto
     setup = nuts._init_chains(model)
     _, params = nuts._pooled_window_warmup(
-        setup.jlp, jax.random.key(0), setup.initial_positions
+        setup.jlp, jax.random.key(0), setup.initial_positions,
+        initial_inverse_mass_matrix=jnp.asarray(_true_var(10.0)),
+        initial_step_size=0.5,
     )
     out = capsys.readouterr().out
     assert "Warmup tree depth percentiles" in out
     assert 1 <= params["max_num_doublings"] <= 10
     assert nuts.max_num_doublings == params["max_num_doublings"]
 
-    nuts = _nuts({**POOLED_CFG, "pooled_window_max_steps": 10,
-                  "max_num_doublings": 6})
+    nuts = _nuts({**cap_cfg, "max_num_doublings": 6})
     assert not nuts.max_num_doublings_auto
     setup = nuts._init_chains(model)
     _, params = nuts._pooled_window_warmup(
-        setup.jlp, jax.random.key(0), setup.initial_positions
+        setup.jlp, jax.random.key(0), setup.initial_positions,
+        initial_inverse_mass_matrix=jnp.asarray(_true_var(10.0)),
+        initial_step_size=0.5,
     )
     assert "max_num_doublings" not in params
     assert nuts.max_num_doublings == 6
@@ -329,10 +400,12 @@ def test_pooled_window_mixing_gate(capsys):
     """An unreachable mixing gate must block convergence (run to max steps)
     even when mass/step rtols are satisfied."""
     model = make_model(10.0)
-    nuts = _nuts({**POOLED_CFG, "pooled_window_max_steps": 20,
+    gate_cfg = {**POOLED_CFG, "pooled_window_max_steps": 100,
+                "pooled_window_terminal_steps": 25,
                   "adaptive_warmup_rtol_mass": 1e9,
                   "adaptive_warmup_rtol_step": 1e9,
-                  "pooled_window_mixing_gate": 0.0})
+                  "pooled_window_mixing_rhat": 1.0}
+    nuts = _nuts(gate_cfg)
     setup = nuts._init_chains(model)
     nuts._pooled_window_warmup(
         setup.jlp, jax.random.key(0), setup.initial_positions,
@@ -340,12 +413,9 @@ def test_pooled_window_mixing_gate(capsys):
         initial_step_size=0.5,
     )
     out = capsys.readouterr().out
-    assert "reached max 20 steps" in out
+    assert "reached max 100 steps" in out
 
-    nuts = _nuts({**POOLED_CFG, "pooled_window_max_steps": 20,
-                  "adaptive_warmup_rtol_mass": 1e9,
-                  "adaptive_warmup_rtol_step": 1e9,
-                  "pooled_window_mixing_gate": 1e9})
+    nuts = _nuts({**gate_cfg, "pooled_window_mixing_rhat": 1e9})
     setup = nuts._init_chains(model)
     nuts._pooled_window_warmup(
         setup.jlp, jax.random.key(0), setup.initial_positions,
@@ -353,6 +423,25 @@ def test_pooled_window_mixing_gate(capsys):
         initial_step_size=0.5,
     )
     assert "converged after" in capsys.readouterr().out
+
+
+@needs_chains
+def test_pooled_window_refuses_unconverged_warmup():
+    """Fail closed unless exploratory continuation is explicitly enabled."""
+    model = make_model(10.0)
+    nuts = _nuts({
+        **POOLED_CFG,
+        "pooled_window_max_steps": 10,
+        "pooled_window_mixing_rhat": 1.0,
+        "pooled_window_allow_unconverged": False,
+    })
+    setup = nuts._init_chains(model)
+    with pytest.raises(RuntimeError, match="failed to converge"):
+        nuts._pooled_window_warmup(
+            setup.jlp, jax.random.key(0), setup.initial_positions,
+            initial_inverse_mass_matrix=jnp.asarray(_true_var(10.0)),
+            initial_step_size=0.5,
+        )
 
 
 @needs_chains
@@ -374,5 +463,79 @@ def test_pooled_window_growing_windows(capsys):
     )
     out = capsys.readouterr().out
     for tag in ["step 5 (window 5)", "step 15 (window 10)",
-                "step 35 (window 20)", "step 55 (window 20)"]:
+                "step 35 (window 20)"]:
         assert f"Pooled warmup {tag}" in out, tag
+    # The configured budget is strict; the old implementation ran the full
+    # fourth window and overshot this 40-step budget to 55.
+    assert "step 55" not in out
+
+
+@needs_chains
+def test_pooled_window_correlated_gaussian_calibrates():
+    """A non-diagonal Gaussian must complete diagonal pooled warmup safely."""
+    model = make_correlated_gaussian_model()
+    nuts = _nuts({
+        **POOLED_CFG,
+        "pooled_window_max_steps": 100,
+        "pooled_window_terminal_steps": 25,
+        "pooled_window_mixing_rhat": 1.2,
+        "pooled_window_allow_unconverged": False,
+        "adaptive_warmup_rtol_mass": 1e9,
+        "adaptive_warmup_rtol_step": 1e9,
+    })
+    setup = nuts._init_chains(model)
+    _, params = nuts._pooled_window_warmup(
+        setup.jlp, jax.random.key(91), setup.initial_positions,
+        initial_inverse_mass_matrix=jnp.ones(8),
+        initial_step_size=0.2,
+    )
+    mass = np.asarray(params["inverse_mass_matrix"])
+    assert params["warmup_converged"]
+    assert params["warmup_calibrated"]
+    assert np.all(np.isfinite(mass))
+    assert np.all((mass > 1e-3) & (mass < 1e3))
+
+
+@needs_chains
+def test_centered_funnel_fails_closed_when_short_warmup_cannot_mix():
+    """A hard geometry must not be relabeled as a successful short warmup."""
+    model = make_funnel_model()
+    nuts = _nuts({
+        **POOLED_CFG,
+        "pooled_window_max_steps": 25,
+        "pooled_window_terminal_steps": 5,
+        "pooled_window_mixing_rhat": 1.0,
+        "pooled_window_allow_unconverged": False,
+    })
+    setup = nuts._init_chains(model)
+    with pytest.raises(RuntimeError, match="failed to converge"):
+        nuts._pooled_window_warmup(
+            setup.jlp, jax.random.key(92), setup.initial_positions,
+            initial_inverse_mass_matrix=jnp.ones(6),
+            initial_step_size=0.15,
+        )
+
+
+@needs_chains
+def test_restart_skips_minimization(tmp_path, capsys):
+    """A pooled-window warmup checkpoint + restart must skip minimization
+    and mass-matrix init in run()."""
+    model = make_model(10.0)
+    prefix = str(tmp_path / "skipmin")
+    cfg = {**POOLED_CFG, "pooled_window_max_steps": 15,
+           "minimize_and_sample": True, "mass_matrix_init": "hessian",
+           "random_start": False, "n_steps_min": 100, "n_steps_incr": 100}
+    nuts = _nuts(cfg)
+    setup = nuts._init_chains(model)
+    nuts._pooled_window_warmup(
+        setup.jlp, jax.random.key(0), setup.initial_positions,
+        output_file=prefix,
+    )
+    capsys.readouterr()
+
+    _nuts({**cfg, "restart": True}).run(model, prefix)
+    out = capsys.readouterr().out
+    assert "Warmup checkpoint found; skipping minimization" in out
+    assert "Running minimization" not in out
+    assert "Hessian diagonal" not in out
+    assert "Resuming pooled window warmup from checkpointed step 15" in out

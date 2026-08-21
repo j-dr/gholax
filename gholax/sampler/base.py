@@ -279,21 +279,41 @@ class BaseSampler(object):
             p, s, best_p, best_v = carry
             v, g = vgrad(p)
             updates, s = opt.update(g, s, p)
-            p_new = optax.apply_updates(p, updates)
-            valid = jnlp(p_new) < 1e30
-            p = jnp.where(valid, p_new, p)
-            better = (v < best_v) & (v > -1e30)
+            p_candidate = optax.apply_updates(p, updates)
+            # Evaluate the candidate at the position being recorded.  The
+            # previous implementation compared ``v = f(p)`` but stored
+            # ``p_new``; on a non-monotone Adam step this paired the old
+            # objective with a different position and could select a point
+            # that was not actually the best one seen.
+            v_candidate = jnlp(p_candidate)
+            valid = (
+                jnp.isfinite(v_candidate)
+                & (v_candidate < 1e30)
+                & (v_candidate > -1e30)
+            )
+            p = jnp.where(valid, p_candidate, p)
+            v = jnp.where(valid, v_candidate, v)
+            better = valid & (v < best_v)
             best_p = jnp.where(better, p, best_p)
             best_v = jnp.where(better, v, best_v)
             return (p, s, best_p, best_v), None
 
         v0 = jnlp(position)
+        v0_valid = (
+            jnp.isfinite(v0) & (v0 < 1e30) & (v0 > -1e30)
+        )
+        v0 = jnp.where(v0_valid, v0, jnp.inf)
         (p, _, best_p, best_v), _ = jax.lax.scan(
             adam_step, (position, opt.init(position), position, v0),
             None, length=n_adam,
         )
         vp = jnlp(p)
-        take = (vp < 1e30) & (vp <= best_v)
+        take = (
+            jnp.isfinite(vp)
+            & (vp < 1e30)
+            & (vp > -1e30)
+            & (vp <= best_v)
+        )
         best_p = jnp.where(take, p, best_p)
         best_v = jnp.where(take, vp, best_v)
         return best_p, best_v
@@ -345,12 +365,53 @@ class BaseSampler(object):
         # clip to the floor and give that direction a ~1e6 inverse mass,
         # which collapses dual averaging (observed eps -> 4e-9). Use the
         # median positive curvature as a neutral scale instead.
-        pos_med = jnp.nanmedian(jnp.where(diag_H > 0, diag_H, jnp.nan))
-        diag_H = jnp.where(diag_H > 0, diag_H, pos_med)
+        positive = jnp.isfinite(diag_H) & (diag_H > 0)
+        pos_med = jnp.nanmedian(jnp.where(positive, diag_H, jnp.nan))
+        # ``nanmedian`` is NaN when the whole diagonal is non-positive or
+        # non-finite.  Such a Hessian is possible before the MAP polish (and
+        # for genuinely flat targets); use the identity metric in that case
+        # so warmup receives finite parameters instead of poisoning dual
+        # averaging with NaNs.
+        pos_med = jnp.where(
+            jnp.isfinite(pos_med) & (pos_med > 0), pos_med, jnp.asarray(1.0)
+        )
+        diag_H = jnp.where(positive, diag_H, pos_med)
         # Relative floor: near-zero positive curvature is as damaging as
         # negative (caps imm at 1e4 x the median imm).
         diag_H = jnp.maximum(diag_H, 1e-4 * pos_med)
         return 1.0 / jnp.clip(diag_H, 1e-6, 1e6)
+
+    def _hessian_mass_matrix_dense(self, jlp, position):
+        """Dense inverse mass matrix from the full Hessian at `position`.
+
+        Same HVP count as the diagonal estimate (one per coordinate), but
+        keeps the full matrix: the inverse Hessian approximates the local
+        posterior covariance, so a dense metric absorbs the correlations a
+        diagonal metric cannot. The eigenvalue analog of the diagonal median
+        guard handles indefiniteness: non-positive eigenvalues are replaced
+        by the median positive one, with a relative floor of 1e-4 x median.
+
+        Returns:
+            (dim, dim) symmetric positive-definite inverse mass matrix.
+        """
+        grad_fn = jax.grad(lambda p: -jlp(p))
+        dim = len(position)
+
+        def hvp_row(i):
+            v = jnp.zeros(dim).at[i].set(1.0)
+            return jax.jvp(grad_fn, (position,), (v,))[1]
+
+        H = jax.lax.map(hvp_row, jnp.arange(dim))
+        H = 0.5 * (H + H.T)
+        lam, V = jnp.linalg.eigh(H)
+        positive = jnp.isfinite(lam) & (lam > 0)
+        pos_med = jnp.nanmedian(jnp.where(positive, lam, jnp.nan))
+        pos_med = jnp.where(
+            jnp.isfinite(pos_med) & (pos_med > 0), pos_med, jnp.asarray(1.0)
+        )
+        lam = jnp.where(positive, lam, pos_med)
+        lam = jnp.clip(jnp.maximum(lam, 1e-4 * pos_med), 1e-6, 1e6)
+        return (V * (1.0 / lam)) @ V.T
 
     def _mclmc_mass_matrix(self, log_posterior, initial_positions, rng_key,
                            n_tune_steps=600, n_steps=1200, n_chains=8):
@@ -664,6 +725,9 @@ class BaseSampler(object):
         n_chains,
         output_file,
         reinit_fn,
+        max_divergence_rate=None,
+        fail_on_divergence=False,
+        divergence_check_min_steps=0,
     ):
         """Run n_steps_incr batches until R-hat converges, checkpointing after
         each batch.
@@ -674,9 +738,23 @@ class BaseSampler(object):
             reinit_fn: Callable (states, rng_key) -> (states, rng_key) that
                 re-initializes the kernel states from the last positions
                 between batches (samplers differ in whether init needs keys).
+            max_divergence_rate: Optional maximum allowed cumulative fraction
+                of divergent transitions.  ``None`` disables enforcement.
+            fail_on_divergence: If true, raise when the configured divergence
+                threshold is exceeded.  With no explicit threshold, any
+                divergence fails the run.  The default is false for backwards
+                compatibility; rates are still recorded when diagnostics are
+                collected.
+            divergence_check_min_steps: Do not enforce a rate until this many
+                transitions have been observed.
         """
         print("Running inference loop", flush=True)
         rhat = 10000
+        divergent_total = 0
+        transition_total = 0
+        divergence_rates = []
+        self.last_divergence_rate = None
+        self.divergence_rates = divergence_rates
 
         if samples is None:
             counter = 0
@@ -696,6 +774,17 @@ class BaseSampler(object):
                 states, n_leap, divergent = states
                 n_leap = np.asarray(gather_to_host(n_leap))
                 divergent = np.asarray(gather_to_host(divergent))
+                batch_divergent = int(np.asarray(divergent, dtype=bool).sum())
+                batch_transitions = int(np.asarray(divergent).size)
+                divergent_total += batch_divergent
+                transition_total += batch_transitions
+                divergence_rate = (
+                    float(divergent_total / transition_total)
+                    if transition_total
+                    else 0.0
+                )
+                divergence_rates.append(divergence_rate)
+                self.last_divergence_rate = divergence_rate
                 # each device's K vmapped chains lockstep to their max tree
                 grp = n_leap.reshape(-1, self.chains_per_device,
                                      n_leap.shape[-1])
@@ -703,9 +792,26 @@ class BaseSampler(object):
                 print(
                     f"leapfrogs/step: mean {n_leap.mean():.0f}, "
                     f"max {n_leap.max()}, lockstep efficiency {eff:.2f}, "
-                    f"divergent {divergent.mean():.3f}",
+                    f"divergent {divergent.mean():.3f} "
+                    f"(cumulative {divergence_rate:.3f})",
                     flush=True,
                 )
+                threshold = max_divergence_rate
+                if fail_on_divergence and threshold is None:
+                    threshold = 0.0
+                if (
+                    threshold is not None
+                    and transition_total >= divergence_check_min_steps
+                    and divergence_rate > float(threshold)
+                ):
+                    message = (
+                        "NUTS divergence rate "
+                        f"{divergence_rate:.3f} exceeds configured maximum "
+                        f"{float(threshold):.3f}"
+                    )
+                    if fail_on_divergence:
+                        raise RuntimeError(message)
+                    print(f"WARNING: {message}", flush=True)
 
             # In multi-process runs each host holds only its shard of the
             # chain axis; gather so R-hat sees all chains and checkpoints are
@@ -723,10 +829,13 @@ class BaseSampler(object):
             # samples to exclude the initial transient; checkpoints still
             # store everything.
             half = samples.shape[1] // 2
-            rhat = jnp.mean(potential_scale_reduction(samples[:, half:]))
+            # A mean can hide a small set of unconverged coordinates in a
+            # high-dimensional posterior; stop only when the worst ordinary
+            # PSR is below the configured threshold.
+            rhat = jnp.max(potential_scale_reduction(samples[:, half:]))
 
             print(f"n_samples = {samples.shape[1]}", flush=True)
-            print(f"rhat - 1 (latter half) = {rhat - 1}", flush=True)
+            print(f"max rhat - 1 (latter half) = {rhat - 1}", flush=True)
 
             counter += 1
             if is_io_process():

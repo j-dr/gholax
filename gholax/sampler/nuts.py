@@ -58,6 +58,21 @@ class NUTS(BaseSampler):
         self.pathfinder_adaptation = c.get("pathfinder_adaptation", False)
         self.target_acceptance_rate = c.get("target_acceptance_rate", 0.65)
         self.step_size_init = c.get("step_size_init", 0.05)
+        # Divergences remain diagnostics by default for backwards
+        # compatibility.  Production runs can opt into a fail-closed rate
+        # threshold; with fail_on_divergence and no threshold, any divergent
+        # transition raises.
+        self.max_divergence_rate = c.get("max_divergence_rate", None)
+        if self.max_divergence_rate is not None:
+            self.max_divergence_rate = float(self.max_divergence_rate)
+            if not 0.0 <= self.max_divergence_rate <= 1.0:
+                raise ValueError("max_divergence_rate must be between 0 and 1")
+        self.fail_on_divergence = bool(c.get("fail_on_divergence", False))
+        self.divergence_check_min_steps = int(
+            c.get("divergence_check_min_steps", 0)
+        )
+        if self.divergence_check_min_steps < 0:
+            raise ValueError("divergence_check_min_steps must be >= 0")
         # Search for an initial step size (doubling/halving heuristic) unless
         # the config pins one explicitly.
         self.step_size_search = "step_size_init" not in c
@@ -97,13 +112,54 @@ class NUTS(BaseSampler):
         self.pooled_window_steps = c.get("pooled_window_steps", 25)
         self.pooled_window_max_steps = c.get("pooled_window_max_steps", 200)
         self.pooled_window_max_doublings = c.get("pooled_window_max_doublings", 10)
-        # Convergence additionally requires the max between/within variance
-        # ratio, normalized by its measured sampling floor tau/T (tau from
-        # the window tail), to fall below this: ~1 means chain means scatter
-        # exactly as much as tau/T predicts for mixed chains; unmixed runs
-        # sit far above. Default 2.0 allows max-over-dims fluctuations.
-        self.pooled_window_mixing_gate = c.get("pooled_window_mixing_gate", 2.0)
+        # A short correlated tail does not give the between/within ratio a
+        # universal tau/T null distribution.  Gate relative chain agreement
+        # directly with the maximum ordinary PSR (R-hat) over coordinates,
+        # after enough tail draws have accumulated.  This is a warmup safety
+        # check, not evidence that every posterior mode has been explored.
+        if "pooled_window_mixing_rhat" in c:
+            self.pooled_window_mixing_rhat = float(
+                c["pooled_window_mixing_rhat"]
+            )
+        elif "pooled_window_mixing_gate" in c:
+            # Compatibility for exploratory configurations written before
+            # pooled_window_mixing_rhat.  The former quantity was compared
+            # to a dimensionless excess, so retain that monotonic behavior
+            # without claiming that it has a calibrated tau/T interpretation.
+            self.pooled_window_mixing_rhat = 1.0 + float(
+                c["pooled_window_mixing_gate"]
+            )
+        else:
+            self.pooled_window_mixing_rhat = 1.2
+        if self.pooled_window_mixing_rhat < 1.0:
+            raise ValueError("pooled_window_mixing_rhat must be >= 1")
+        self.pooled_window_min_tail_steps = int(
+            c.get("pooled_window_min_tail_steps", 20)
+        )
+        self.pooled_window_consecutive_windows = int(
+            c.get("pooled_window_consecutive_windows", 2)
+        )
+        if self.pooled_window_min_tail_steps < 2:
+            raise ValueError("pooled_window_min_tail_steps must be >= 2")
+        if self.pooled_window_consecutive_windows < 1:
+            raise ValueError("pooled_window_consecutive_windows must be >= 1")
         self.pooled_window_max_window = c.get("pooled_window_max_window", 40)
+        # A converged pooled window is followed by a short fixed-metric
+        # calibration run.  This is deliberately separate from the growing
+        # metric windows: the step size returned by a window was tuned while
+        # using the *previous* metric, so it is not calibrated for the metric
+        # that will be used for sampling.
+        self.pooled_window_terminal_steps = int(
+            c.get("pooled_window_terminal_steps", self.pooled_window_steps)
+        )
+        if self.pooled_window_terminal_steps < 1:
+            raise ValueError("pooled_window_terminal_steps must be >= 1")
+        # Pooled convergence is a safety gate.  Keep the default fail-closed;
+        # an explicit opt-in is available for exploratory/debugging runs.
+        self.pooled_window_allow_unconverged = c.get(
+            "pooled_window_allow_unconverged",
+            c.get("allow_unconverged_warmup", False),
+        )
 
     def _adaptive_window_warmup(self, jlp, rng_key, initial_position,
                                 initial_inverse_mass_matrix=None,
@@ -449,13 +505,18 @@ class NUTS(BaseSampler):
             target=self.target_acceptance_rate
         )
 
-        # Adaptation runs vmapped on one device (it is short): the per-step
-        # dual-averaging update needs the acceptance averaged across chains
-        # every step, which _map_chains cannot reduce without axis-name
-        # collectives. Sampling afterwards uses all devices as usual.
+        # Adaptation runs pmap(vmap): K chains vmapped per device, devices
+        # synchronized through an axis-name pmean so the per-step
+        # dual-averaging update sees the acceptance averaged across ALL
+        # chains — every device advances an identical da_state. This uses
+        # all GPUs during warmup (previously all chains vmapped on device 0)
+        # and spreads the memory footprint.
         # Depth cap bounds per-step cost while the metric is still poor: an
         # untuned mass matrix drives NUTS to max depth, and vmap lockstep
         # makes every chain pay the deepest tree.
+        nd = jax.local_device_count()
+        assert n_chains % nd == 0
+        K = n_chains // nd
         max_doublings = self.pooled_window_max_doublings
         vkernel = jax.vmap(
             lambda k, s, step, imm: kernel(
@@ -465,31 +526,61 @@ class NUTS(BaseSampler):
         )
         vinit = jax.vmap(lambda p: nuts_mcmc.init(p, jlp))
 
+        def _dev_split(tree):
+            return jax.tree.map(
+                lambda x: x.reshape((nd, K) + x.shape[1:]), tree
+            )
+
+        def _flat_positions(states):
+            return np.asarray(states.position).reshape(n_chains, -1)
+
         # imm / da_state are traced arguments so every window reuses one
         # compilation. Step size feeds back per step (Stan-style), which is
         # what keeps dual averaging stable; updating it only at boundaries
         # gives no within-window feedback and ping-pongs.
-        @jax.jit
-        def run_window(key, states, da_state, imm):
+        def _run_window(dev_key, states, da_state, imm, n_steps):
             def one_step(carry, k):
                 states, da_state = carry
                 step = jnp.exp(da_state.log_step_size)
                 states, infos = vkernel(
-                    jax.random.split(k, n_chains), states, step, imm
+                    jax.random.split(k, K), states, step, imm
                 )
-                da_state = da_update(
-                    da_state, jnp.mean(infos.acceptance_rate)
-                )
+                acc = jax.lax.pmean(jnp.mean(infos.acceptance_rate), "d")
+                da_state = da_update(da_state, acc)
                 return (states, da_state), (
                     states.position,
-                    jnp.mean(infos.acceptance_rate),
+                    acc,
                     infos.num_integration_steps,
                 )
 
             (states, da_state), (pos, acc, n_leap) = jax.lax.scan(
-                one_step, (states, da_state), jax.random.split(key, n_window)
+                one_step, (states, da_state), jax.random.split(dev_key, n_steps)
             )
             return states, da_state, pos, acc, n_leap
+
+        # ``n_steps`` is static so a final partial window performs exactly the
+        # number of transitions left in the strict pooled-step budget.  A
+        # dynamic lax.scan length would either fail to compile or tempt the
+        # caller to run a full window and merely discard the excess samples.
+        # JAX caches the ordinary window and (usually) one short remainder
+        # specialization.
+        prun_window = jax.pmap(
+            _run_window,
+            axis_name="d",
+            in_axes=(0, 0, None, None),
+            static_broadcasted_argnums=(4,),
+        )
+
+        def run_window(key, states, da_state, imm, n_steps):
+            states, da_dev, pos, acc, n_leap = prun_window(
+                jax.random.split(key, nd), states, da_state, imm, n_steps
+            )
+            # da_state is device-invariant (pmean-synchronized); host
+            # consumers get flat (n_steps, n_chains, ...) arrays.
+            da_state = jax.tree.map(lambda x: x[0], da_dev)
+            pos = jnp.moveaxis(pos, 0, 1).reshape(n_steps, n_chains, -1)
+            n_leap = jnp.moveaxis(n_leap, 0, 1).reshape(n_steps, n_chains)
+            return states, da_state, pos, acc[0], n_leap
 
         positions = initial_positions
         imm = (
@@ -504,7 +595,11 @@ class NUTS(BaseSampler):
         )
         prev_mass = None
         prev_step = None
-        chunks = 1
+        # ``next_window_chunks`` is the size of the next growing boundary,
+        # rather than the size of the boundary just completed.  Keeping this
+        # distinction in the checkpoint makes a restart schedule-identical.
+        next_window_chunks = 1
+        stable_boundaries = 0
         if initial_inverse_mass_matrix is not None and initial_step_size is not None:
             # Warm start: seed the convergence check so a single window can
             # suffice.
@@ -525,7 +620,18 @@ class NUTS(BaseSampler):
                 prev_mass = imm
                 prev_step = step_size
                 total_steps = ck["total_steps"]
-                chunks = ck.get("window_chunks", 1)
+                stable_boundaries = int(ck.get("stable_boundaries", 0))
+                if "next_window_chunks" in ck:
+                    next_window_chunks = int(ck["next_window_chunks"])
+                else:
+                    # Checkpoints written before this field was introduced
+                    # stored the completed boundary.  Advance it once when
+                    # reading those checkpoints.
+                    completed_chunks = int(ck.get("window_chunks", 1))
+                    next_window_chunks = min(
+                        2 * completed_chunks,
+                        max(1, self.pooled_window_max_window // n_window),
+                    )
                 print(
                     f"Resuming pooled window warmup from checkpointed step "
                     f"{total_steps}",
@@ -560,31 +666,42 @@ class NUTS(BaseSampler):
             flush=True,
         )
         da_state = da_init(float(step_size))
-        states = vinit(positions)
+        states = _dev_split(vinit(positions))
 
         n_leap = None
+        calibration_leap = None
+        converged = False
+        calibrated = False
         # Stan-style growing windows built from k base-length scans (one
         # compiled executable): short windows early for fast metric feedback,
-        # doubling each boundary so the tail statistics (within variance,
-        # between/within ratio, dual-averaged eps) are judged on enough
-        # samples that the mixing gate's tau/T floor drops below 1.
+        # doubling each boundary so the tail statistics and mixing check are
+        # judged on enough samples to be useful.
         k_max = max(1, self.pooled_window_max_window // n_window)
-        k = min(chunks, k_max)
+        k = min(next_window_chunks, k_max)
         while total_steps < self.pooled_window_max_steps:
             pos_c, acc_c, leap_c = [], [], []
-            for _ in range(k):
+            # A growing boundary may be truncated at the hard budget.  In
+            # particular, this prevents max_steps=42 with 5-step windows
+            # from silently consuming 45 transitions.
+            remaining = self.pooled_window_max_steps - total_steps
+            boundary_steps = min(k * n_window, remaining)
+            if boundary_steps <= 0:
+                break
+            n_subwindows = (boundary_steps + n_window - 1) // n_window
+            for i in range(n_subwindows):
+                sub_steps = min(n_window, boundary_steps - i * n_window)
                 rng_key, sub_key = jax.random.split(rng_key)
                 states, da_state, p_i, a_i, l_i = run_window(
-                    sub_key, states, da_state, imm
+                    sub_key, states, da_state, imm, sub_steps
                 )
                 pos_c.append(p_i)
                 acc_c.append(a_i)
                 leap_c.append(l_i)
-                total_steps += n_window
+                total_steps += sub_steps
             pos = jnp.concatenate(pos_c, axis=0)
             acc = jnp.concatenate(acc_c, axis=0)
             n_leap = jnp.concatenate(leap_c, axis=0)
-            w_len = k * n_window
+            w_len = boundary_steps
 
             # Diagonal imm from the pooled WITHIN-chain variance (mean over
             # chains of each chain's variance across its window samples).
@@ -603,55 +720,51 @@ class NUTS(BaseSampler):
             # so unmixed chains collapse the weight and the seed stays
             # sticky.
             # pos: (w_len, n_chains, dim)
-            tail = pos[w_len // 5:]
-            within = jnp.mean(jnp.var(tail, axis=0, ddof=1), axis=0)
+            tail_start = min(max(w_len // 5, 0), max(w_len - 1, 0))
+            tail = pos[tail_start:]
+            tail_ddof = 1 if tail.shape[0] > 1 else 0
+            within = jnp.mean(jnp.var(tail, axis=0, ddof=tail_ddof), axis=0)
             # Mixing diagnostic: between-chain variance of chain means over
             # within; >> 1 means the chains are unmixed.
-            between = jnp.var(jnp.mean(tail, axis=0), axis=0, ddof=1)
+            between_ddof = 1 if n_chains > 1 else 0
+            between = jnp.var(
+                jnp.mean(tail, axis=0), axis=0, ddof=between_ddof
+            )
             bw_ratio = float(jnp.max(between / (within + 1e-30)))
-            # Principled mixing gate: for mixed chains E[between/within] is
-            # the sampling floor tau/T (T tail samples of integrated
-            # autocorrelation time tau), so judge mixing on the per-dim ratio
-            # normalized by the measured floor (Geyer-truncated tau from the
-            # same tail, averaged over chains).
-            x = np.asarray(tail)
-            T = x.shape[0]
-            xc = x - x.mean(axis=0, keepdims=True)
-            var0 = (xc**2).mean(axis=0) + 1e-30
-            rho_sum = np.zeros(x.shape[2])
-            for lag in range(1, max(1, T // 2)):
-                rho = ((xc[:-lag] * xc[lag:]).mean(axis=0) / var0).mean(axis=0)
-                rho = np.maximum(rho, 0.0)
-                if not np.any(rho > 0.0):
-                    break
-                rho_sum += rho
-            tau = np.clip(1.0 + 2.0 * rho_sum, 1.0, T)
-            bw_norm = float(np.max(
-                np.asarray(between) / (np.asarray(within) + 1e-30) / (tau / T)
-            ))
-            n_eff = tail.shape[0] / (1.0 + bw_ratio)
-            w = n_eff / (n_eff + 5)
-            mass = w * within + (1 - w) * imm
+            tail_rhat = float("inf")
+            mixing_ready = tail.shape[0] >= self.pooled_window_min_tail_steps
+            if mixing_ready and n_chains > 1:
+                from blackjax.diagnostics import potential_scale_reduction
+
+                tail_rhat = float(
+                    jnp.max(
+                        potential_scale_reduction(
+                            tail, chain_axis=1, sample_axis=0
+                        )
+                    )
+                )
+            mixing_ok = (
+                mixing_ready
+                and tail_rhat <= self.pooled_window_mixing_rhat
+            )
+            # Keep the boundary update conservative when chains disagree, but
+            # do not interpret this shrinkage factor as an ESS estimate.
+            disagreement = max(tail_rhat - 1.0, 0.0) if mixing_ready else 1.0
+            tail_weight_steps = tail.shape[0] / (1.0 + disagreement)
+            w = tail_weight_steps / (tail_weight_steps + 5)
+            if imm.ndim == 2:
+                # Dense (hessian_dense) metric is frozen through warmup: the
+                # boundary estimator is diagonal-only, so windows tune eps
+                # and verify mixing against the fixed dense metric.
+                mass = imm
+            else:
+                mass = w * within + (1 - w) * imm
             # Boundary: take the averaged step size and restart dual
             # averaging around it with the new mass matrix (blackjax
             # window_adaptation's slow_final).
             step = da_final(da_state)
             da_state = da_init(float(step))
             mean_acc = float(jnp.mean(acc))
-
-            if ckpt_file and is_io_process():
-                with open(ckpt_file, "w") as fp:
-                    json.dump(
-                        {
-                            "inverse_mass_matrix": np.asarray(mass).tolist(),
-                            "step_size": float(step),
-                            "positions": np.asarray(states.position).tolist(),
-                            "total_steps": total_steps,
-                            "between_within_ratio": bw_ratio,
-                            "window_chunks": k,
-                        },
-                        fp,
-                    )
 
             converged = False
             if prev_mass is not None:
@@ -667,30 +780,169 @@ class NUTS(BaseSampler):
                     f"rel_step_change={step_change:.4f}, "
                     f"mean_acceptance={mean_acc:.3f}, "
                     f"max_between_within_ratio={bw_ratio:.2f}, "
-                    f"bw/floor={bw_norm:.2f} (tau_max={tau.max():.1f})"
+                    f"max_tail_rhat={tail_rhat:.3f}, "
+                    f"tail_steps={tail.shape[0]}"
                     + (
-                        " (chains unmixed)"
-                        if bw_norm > self.pooled_window_mixing_gate
+                        " (mixing gate not met)"
+                        if not mixing_ok
                         else ""
                     ),
                     flush=True,
                 )
-                # Mixing gate: rtol-luck while chains are unmixed freezes a
-                # seed-dominated metric and an eps tuned to it (observed: 83%
-                # divergent sampling after converging at bw_ratio 23).
-                converged = (
+                stable = (
                     mass_change < self.adaptive_warmup_rtol_mass
                     and step_change < self.adaptive_warmup_rtol_step
-                    and bw_norm < self.pooled_window_mixing_gate
+                    and mixing_ok
+                )
+                stable_boundaries = stable_boundaries + 1 if stable else 0
+                converged = (
+                    stable_boundaries
+                    >= self.pooled_window_consecutive_windows
                 )
 
             prev_mass = mass
             prev_step = step
             imm = mass
             step_size = jnp.asarray(step)
-            k = min(2 * k, k_max)
+            completed_window_chunks = k
+            next_window_chunks = min(2 * k, k_max)
+            k = next_window_chunks
+
+            # A convergence boundary is useful only if the hard budget can
+            # also accommodate the required fixed-metric calibration phase.
+            # Do this before checkpointing so the checkpoint cannot claim a
+            # converged run that has no calibration budget left.
+            if converged and (
+                self.pooled_window_max_steps - total_steps
+                < self.pooled_window_terminal_steps
+            ):
+                converged = False
+
+            if ckpt_file and is_io_process():
+                with open(ckpt_file, "w") as fp:
+                    json.dump(
+                        {
+                            "inverse_mass_matrix": np.asarray(mass).tolist(),
+                            "step_size": float(step),
+                            "positions": _flat_positions(states).tolist(),
+                            "total_steps": total_steps,
+                            "between_within_ratio": bw_ratio,
+                            "tail_rhat": tail_rhat,
+                            "stable_boundaries": stable_boundaries,
+                            # Keep the old field for readers of existing
+                            # checkpoints, but make the restart contract
+                            # explicit with the next boundary size.
+                            "window_chunks": completed_window_chunks,
+                            "next_window_chunks": next_window_chunks,
+                            "warmup_converged": bool(converged),
+                            "calibrated": False,
+                        },
+                        fp,
+                    )
 
             if converged:
+                print(f"Pooled warmup convergence detected at {total_steps} steps", flush=True)
+                if imm.ndim == 2:
+                    # Swap the MAP-local dense metric for the pooled sample
+                    # covariance of the converged (mixed) tail: the MAP
+                    # Hessian's principal axes misalign away from the MAP
+                    # (observed 26% divergent sampling vs 10% for diagonal),
+                    # while the mixed-chain covariance captures the global
+                    # correlation structure. Shrunk toward its diagonal and
+                    # eigenvalue-guarded like the Hessian init; eps is then
+                    # re-seeded and calibrated against the new metric below.
+                    xc = tail - tail.mean(axis=0, keepdims=True)
+                    n_cov = xc.shape[0] * xc.shape[1]
+                    C = jnp.einsum("tcd,tce->de", xc, xc) / max(n_cov - 1, 1)
+                    alpha = dim / (dim + n_cov)
+                    C = (1 - alpha) * C + alpha * jnp.diag(jnp.diag(C))
+                    lam, V = jnp.linalg.eigh(C)
+                    pos = jnp.isfinite(lam) & (lam > 0)
+                    med = jnp.nanmedian(jnp.where(pos, lam, jnp.nan))
+                    med = jnp.where(
+                        jnp.isfinite(med) & (med > 0), med, jnp.asarray(1.0)
+                    )
+                    lam = jnp.where(pos, lam, med)
+                    lam = jnp.clip(
+                        jnp.maximum(lam, 1e-4 * med), 1e-6, 1e6
+                    )
+                    imm = (V * lam) @ V.T
+                    ev = jnp.linalg.eigvalsh(imm)
+                    print(
+                        f"Dense metric updated from pooled tail covariance "
+                        f"({n_cov} samples): eigenvalue range "
+                        f"[{float(ev.min()):.3e}, {float(ev.max()):.3e}]",
+                        flush=True,
+                    )
+                    rng_key, srch_key = jax.random.split(rng_key)
+                    step = float(
+                        find_reasonable_step_size(
+                            srch_key,
+                            lambda eps: lambda k, s: kernel(
+                                k, s, jlp, eps, imm,
+                                max_num_doublings=max_doublings,
+                            ),
+                            nuts_mcmc.init(
+                                jnp.asarray(_flat_positions(states))[0], jlp
+                            ),
+                            float(step),
+                            target_accept=self.target_acceptance_rate,
+                        )
+                    )
+                    print(
+                        f"Step size re-seeded for updated metric: {step:.3g}",
+                        flush=True,
+                    )
+                # Calibrate epsilon with the just-adapted metric held fixed.
+                # The ordinary boundary's da_final was tuned while ``imm``
+                # still denoted the preceding metric.  Use only transitions
+                # within the remaining hard budget and retain their depth
+                # observations for the optional automatic depth cap.
+                terminal_steps = min(
+                    max(0, int(self.pooled_window_terminal_steps)),
+                    self.pooled_window_max_steps - total_steps,
+                )
+                if terminal_steps:
+                    rng_key, terminal_key = jax.random.split(rng_key)
+                    terminal_da = da_init(float(step))
+                    states, terminal_da, _, _, terminal_leap = run_window(
+                        terminal_key,
+                        states,
+                        terminal_da,
+                        imm,
+                        terminal_steps,
+                    )
+                    step = da_final(terminal_da)
+                    step_size = jnp.asarray(step)
+                    calibration_leap = terminal_leap
+                    total_steps += terminal_steps
+                    calibrated = True
+                    print(
+                        f"Pooled fixed-metric calibration: {terminal_steps} steps, "
+                        f"step_size={float(step):.5g}",
+                        flush=True,
+                    )
+                    # Keep the final calibrated endpoint available to a
+                    # restart.  It is also useful if a run is interrupted
+                    # immediately after calibration.
+                    if ckpt_file and is_io_process():
+                        with open(ckpt_file, "w") as fp:
+                            json.dump(
+                                {
+                                    "inverse_mass_matrix": np.asarray(imm).tolist(),
+                                    "step_size": float(step),
+                                    "positions": _flat_positions(states).tolist(),
+                                    "total_steps": total_steps,
+                                    "between_within_ratio": bw_ratio,
+                                    "tail_rhat": tail_rhat,
+                                    "stable_boundaries": stable_boundaries,
+                                    "window_chunks": completed_window_chunks,
+                                    "next_window_chunks": k,
+                                    "warmup_converged": True,
+                                    "calibrated": True,
+                                },
+                                fp,
+                            )
                 print(
                     f"Pooled warmup converged after {total_steps} steps",
                     flush=True,
@@ -703,16 +955,36 @@ class NUTS(BaseSampler):
                 flush=True,
             )
 
+        if not converged:
+            message = (
+                "Pooled warmup failed to converge within "
+                f"{self.pooled_window_max_steps} steps; refusing to start "
+                "sampling. Set pooled_window_allow_unconverged=true only "
+                "for an explicitly exploratory run."
+            )
+            if not self.pooled_window_allow_unconverged:
+                raise RuntimeError(message)
+            print("WARNING: " + message, flush=True)
+
         parameters = {
             "inverse_mass_matrix": imm,
             "step_size": step_size,
+            "warmup_converged": bool(converged),
+            "warmup_calibrated": bool(calibrated),
         }
-        if self.max_num_doublings_auto and n_leap is not None:
+        if (
+            self.max_num_doublings_auto
+            and calibration_leap is not None
+            and converged
+            and calibrated
+        ):
             # Sampling depth cap from the last (converged) window: under vmap
             # lockstep the deepest chain sets the per-step cost, so cap just
             # above the bulk of the depth distribution instead of blackjax's
             # default 10.
-            depth = jnp.ceil(jnp.log2(n_leap.astype(jnp.float32) + 1.0))
+            depth = jnp.ceil(
+                jnp.log2(calibration_leap.astype(jnp.float32) + 1.0)
+            )
             qs = (0.1, 0.25, 0.5, 0.75, 0.9, 1.0)
             dq = [int(jnp.quantile(depth, q)) for q in qs]
             print(
@@ -728,7 +1000,7 @@ class NUTS(BaseSampler):
                 f"(q{self.depth_cap_quantile:g} warmup depth {q_depth})",
                 flush=True,
             )
-        return jnp.asarray(states.position), parameters
+        return jnp.asarray(_flat_positions(states)), parameters
 
     def run(self, model, output_file):
         """Run the NUTS sampler until convergence.
@@ -827,18 +1099,56 @@ class NUTS(BaseSampler):
             kernel = algo.step
 
         else:
-            if self.minimize_and_sample:
+            # A pooled-window warmup checkpoint supersedes minimization and
+            # the mass-matrix seed: the warmup resume loads positions, metric
+            # and step size from it, so redoing the MAP search and Hessian
+            # would be pure waste (they only feed the warmup's cold start).
+            warm_ckpt = False
+            if (
+                self.restart
+                and self.warmup_algorithm == "pooled_window"
+                and os.path.exists(
+                    f"{output_file}.nuts_warmup_intermediate.json"
+                )
+            ):
+                with open(
+                    f"{output_file}.nuts_warmup_intermediate.json"
+                ) as fp:
+                    # "positions" marks a pooled-window checkpoint (other
+                    # warmup modes write different intermediates).
+                    warm_ckpt = "positions" in json.load(fp)
+            if warm_ckpt:
+                print(
+                    "Warmup checkpoint found; skipping minimization and "
+                    "mass matrix initialization",
+                    flush=True,
+                )
+            if self.minimize_and_sample and not warm_ckpt:
                 initial_positions = self._minimize_and_sample(
                     log_posterior, initial_positions, n_chains, output_file
                 )
 
-            if self.mass_matrix_init == "hessian":
+            if warm_ckpt:
+                init_imm = None
+            elif self.mass_matrix_init == "hessian":
                 print("Estimating initial mass matrix from Hessian diagonal...", flush=True)
                 x_h = initial_positions[0]
                 if not self.minimize_and_sample:
                     x_h = self._best_fit_position(jlp, x_h)
                 init_imm = self._hessian_mass_matrix(jlp, x_h)
                 print(f"  imm range: [{float(init_imm.min()):.4f}, {float(init_imm.max()):.4f}]", flush=True)
+            elif self.mass_matrix_init == "hessian_dense":
+                print("Estimating dense initial mass matrix from full Hessian...", flush=True)
+                x_h = initial_positions[0]
+                if not self.minimize_and_sample:
+                    x_h = self._best_fit_position(jlp, x_h)
+                init_imm = self._hessian_mass_matrix_dense(jlp, x_h)
+                ev = jnp.linalg.eigvalsh(init_imm)
+                print(
+                    f"  dense imm eigenvalue range: "
+                    f"[{float(ev.min()):.3e}, {float(ev.max()):.3e}]",
+                    flush=True,
+                )
             elif self.mass_matrix_init == "mclmc":
                 print("Estimating initial mass matrix from MCLMC chains...", flush=True)
                 rng_key, mm_key = jax.random.split(rng_key)
@@ -1142,6 +1452,9 @@ class NUTS(BaseSampler):
             n_chains,
             output_file,
             reinit_fn,
+            max_divergence_rate=self.max_divergence_rate,
+            fail_on_divergence=self.fail_on_divergence,
+            divergence_check_min_steps=self.divergence_check_min_steps,
         )
 
         return self._finalize_samples(
