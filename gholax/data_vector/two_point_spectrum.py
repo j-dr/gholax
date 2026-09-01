@@ -15,6 +15,10 @@ datavector_requires = {
     "c_bb": ["nz_s"],
     "c_dk": ["nz_d", "nz_s"],
     "c_dd": ["nz_d"],
+    "xi_plus":  ["nz_s"],
+    "xi_minus": ["nz_s"],
+    "w_theta":  ["nz_d"],
+    "gamma_t":  ["nz_d", "nz_s"]
 }
 
 covariance_field_types = {
@@ -24,6 +28,10 @@ covariance_field_types = {
     "c_bb": ["b", "b"],
     "c_dk": ["d", "k"],
     "c_dd": ["d", "d"],
+    "xi_plus":  ["k", "k"],
+    "xi_minus": ["k", "k"],
+    "w_theta":  ["d", "d"],
+    "gamma_t":  ["d", "k"]
 }
 
 field_types = {
@@ -33,17 +41,14 @@ field_types = {
     "c_bb": ["gamma_b", "gamma_b"],
     "c_dk": ["d", "gamma_e"],
     "c_dd": ["d", "d"],
+    "xi_plus":  ["gamma_e", "gamma_e"],
+    "xi_minus": ["gamma_e", "gamma_e"],
+    "w_theta":  ["d", "d"],
+    "gamma_t":  ["d", "gamma_e"],
 }
 
 
 class TwoPointSpectrum(DataVector):
-    """Data vector for two-point angular power spectra (C_ell).
-
-    Handles loading observed spectra and covariance from HDF5, applying
-    scale cuts, computing Gaussian covariance matrices, interpolating
-    redshift distributions, and managing bandpower window functions.
-    """
-
     def __init__(
         self,
         data_vector_info_filename,
@@ -57,20 +62,6 @@ class TwoPointSpectrum(DataVector):
         zmax=2.0,
         nz=125,
     ):
-        """Initialize the two-point spectrum data vector.
-
-        Args:
-            data_vector_info_filename: Path to the HDF5 file with spectra and covariance.
-            spectrum_info: Dict of spectrum type configs (bins, cross-correlations, etc.).
-            covariance_info: Optional dict with f_sky and noise for Gaussian covariance.
-            scale_cuts: Optional dict of (ell_min, ell_max) per bin pair per spectrum type.
-            zeff_weighting: If True, load extra n(z) for effective-z weighting.
-            dummy_cov: If True, skip loading the covariance matrix.
-            generate_data_vector: If True, generate a synthetic data vector.
-            zmin: Minimum redshift for n(z) interpolation grid.
-            zmax: Maximum redshift for n(z) interpolation grid.
-            nz: Number of redshift grid points.
-        """
         self.data_vector_info_filename = data_vector_info_filename
         self.spectrum_info = spectrum_info
         self.scale_cuts = scale_cuts
@@ -82,7 +73,6 @@ class TwoPointSpectrum(DataVector):
         self.z = jnp.linspace(zmin, zmax, nz)
 
     def load_data(self):
-        """Load observed data, requirements, scale cuts, and covariance."""
         self.load_data_vector()
         self.load_requirements()
         self.setup_scale_cuts()
@@ -94,39 +84,7 @@ class TwoPointSpectrum(DataVector):
 
     #        print(self.cW, flush=True)
 
-    def _compute_ell_binning(self):
-        """Compute the bandpower ell_eff and delta_ell arrays and store them as
-        instance attributes.  Returns the bpws index array so callers that also
-        need to build a window matrix can reuse it."""
-        ells = np.arange(3 * 2048, dtype="int32")
-        bpws = np.zeros_like(ells) - 1
-
-        i = 0
-        counter = 25  # ell_start
-        delta_ell = int(3 * np.sqrt(counter))
-        bpw_widths = [delta_ell]
-
-        while counter + delta_ell < ells.shape[0]:
-            bpws[counter : counter + delta_ell] = i
-            counter = counter + delta_ell
-            delta_ell = int(3 * np.sqrt(ells[counter]))
-            bpw_widths.append(delta_ell)
-            i += 1
-
-        self.delta_ell = np.array(bpw_widths)[:-1]
-        ell_eff = np.bincount(bpws + 1, weights=ells * (2 * ells + 1)) / np.bincount(
-            bpws + 1, weights=(2 * ells + 1)
-        )
-        self.ell_eff = ell_eff[1:]
-        return bpws
-
     def generate_data(self):
-        """Generate a synthetic data vector with bandpower binning and window matrices.
-
-        Returns:
-            Structured numpy array of spectra with fields (spectrum_type,
-            zbin0, zbin1, separation, value).
-        """
         required_spectra = []
         for si in self.spectrum_info:
             for sj in self.spectrum_info:
@@ -167,9 +125,32 @@ class TwoPointSpectrum(DataVector):
                     bin_pairs[t].append((i, j))
                     n_bins += 1
 
-        bpws = self._compute_ell_binning()
-        ell_eff = self.ell_eff
-        window = np.zeros((len(ell_eff), 3 * 2048))
+        ells = np.arange(3 * 2048, dtype="int32")  # Array of multipoles
+        weights = np.zeros(len(ells))  # Array of weights
+        bpws = np.zeros_like(ells) - 1  # Array of bandpower indices
+        ell_start = 25
+        delta_ell = 30
+
+        i = 0
+        counter = ell_start
+        delta_ell = int(3 * np.sqrt(ell_start))
+        bpw_widths = [delta_ell]
+
+        while counter + delta_ell < ells.shape[0]:
+            bpws[counter : counter + delta_ell] = i
+            weights[counter : counter + delta_ell] = 1 / float(delta_ell)
+            counter = counter + delta_ell
+            delta_ell = int(3 * np.sqrt(ells[counter]))
+            bpw_widths.append(delta_ell)
+            i += 1
+
+        self.delta_ell = np.array(bpw_widths)[:-1]
+        ell_eff = np.bincount(bpws + 1, weights=ells * (2 * ells + 1)) / np.bincount(
+            bpws + 1, weights=(2 * ells + 1)
+        )
+        ell_eff = ell_eff[1:]
+        window = np.zeros((len(ell_eff), len(ells)))
+        self.ell_eff = ell_eff
         for i, ell in enumerate(ell_eff):
             window[i, bpws == i] = 1 / float(self.delta_ell[i])
 
@@ -200,11 +181,6 @@ class TwoPointSpectrum(DataVector):
         return spectra
 
     def process_spectrum_info(self, spectra):
-        """Parse spectrum metadata, apply bin selection, and populate spectrum_info.
-
-        Args:
-            spectra: Structured numpy array of spectra from the data file.
-        """
         self.spectra = []
         for t in self.spectrum_types:
             n_bins0_tot = len(
@@ -318,12 +294,6 @@ class TwoPointSpectrum(DataVector):
         self.process_spectrum_info(spectra)
         
     def save_data_vector(self, filename, model):
-        """Save a model prediction as a new data vector HDF5 file.
-
-        Args:
-            filename: Output HDF5 file path.
-            model: Array of model values to store as the 'value' field.
-        """
         with h5.File(filename, "w") as f:
             dt = np.dtype(
                 [
@@ -342,11 +312,8 @@ class TwoPointSpectrum(DataVector):
             data["value"] = model
 
             f.create_dataset("spectra", data=data)
-            try:
-                f.create_dataset("covariance", data=self.cov.flatten())
-            except AttributeError:
-                print("No covariance matrix to save.")
-
+            f.create_dataset("covariance", data=self.cov.flatten())
+            
             for k_i in self.data_vector_info.keys():
                 if k_i in ["spectra", "covariance"]:
                     continue
@@ -360,7 +327,6 @@ class TwoPointSpectrum(DataVector):
                     f.create_dataset(k_i, data=self.data_vector_info[k_i][:])
 
     def load_requirements(self):
-        """Load redshift distributions and bandpower window matrices from the data file."""
         requirements = []
         for t in self.spectrum_info:
             requirements = datavector_requires[t]
@@ -403,7 +369,6 @@ class TwoPointSpectrum(DataVector):
                     self.cW[k][ij] = window_matrix_files[k][ij][:]
 
     def setup_scale_cuts(self):
-        """Build per-bin-pair scale cut masks and the combined scale_mask index array."""
         # make scale cut mask
         if self.scale_cuts is not None:
             for t in self.spectrum_info:
@@ -494,11 +459,11 @@ class TwoPointSpectrum(DataVector):
         self.measured_spectra = jnp.array(self.spectra["value"])
 
     def load_covariance_matrix(self):
-        """Load the covariance matrix from the data file and compute its inverse.
+        # Always need a covariance matrix. This should be a text file
+        # with columns specifying the two data vector types, and four redshift
+        # bin indices for each element, as well as a column for the elements
+        # themselves
 
-        Matches covariance entries to the current spectrum ordering and applies
-        scale-cut masking before inverting.
-        """
         cov_raw = self.data_vector_info["covariance"][:]
         cov_raw = cov_raw.reshape(
             int(cov_raw.shape[0] ** 0.5), int(cov_raw.shape[0] ** 0.5)
@@ -534,7 +499,7 @@ class TwoPointSpectrum(DataVector):
 
         covidx, covidy = np.meshgrid(idxi, idxi, indexing="ij")
         self.cov = cov_raw[covidx, covidy]
-        assert np.allclose(self.cov["value"], self.cov["value"].T, 1e-12)
+        assert np.allclose(self.cov["value"], self.cov["value"].T, 1e-16)
 
         cov_scale_mask_i, cov_scale_mask_j = np.meshgrid(
             self.scale_mask, self.scale_mask, indexing="ij"
@@ -548,61 +513,7 @@ class TwoPointSpectrum(DataVector):
     #        if jnp.any(jnp.linalg.eigvals(self.cinv) < 0):
     #            raise(ValueError('APS covariance matrix not PSD.'))
 
-    def _ensure_covariance_info(self):
-        """Prompt interactively for any f_sky or noise terms missing from covariance_info.
-        Also ensures ell_eff and delta_ell are computed if not already set."""
-        if not hasattr(self, 'ell_eff') or self.ell_eff is None:
-            self._compute_ell_binning()
-
-        if self.covariance_info is None:
-            self.covariance_info = {}
-
-        if ("f_sky" not in self.covariance_info):
-            for s in self.covariance_info:
-                try:
-                    f_sky = self.covariance_info[s]["f_sky"]
-                except KeyError:
-                    val = input("f_sky not found in config. Enter f_sky: ")
-                    self.covariance_info[s]["f_sky"] = float(val)
-
-        for t in self.spectrum_info:
-            if t not in self.covariance_info:
-                self.covariance_info[t] = {}
-            for (b0, b1) in self.spectrum_info[t]["bin_pairs"]:
-                key = f"{b0}_{b1}"
-                entry = self.covariance_info[t].get(key, {})
-                if "noise" not in entry:
-                    val = input(
-                        f"noise for {t} bin pair ({b0}, {b1}) not found in config. Enter noise: "
-                    )
-                    entry["noise"] = float(val)
-                    self.covariance_info[t][key] = entry
-
-    def _lookup_spectrum(self, spec, za, zb, model_spectra):
-        """Look up a spectrum value from model_spectra dict or observed data."""
-        if model_spectra is not None and (spec, za, zb) in model_spectra:
-            return model_spectra[(spec, za, zb)]
-        return self.spectra["value"][
-            (self.spectra["spectrum_type"] == spec.encode('utf-8'))
-            & (self.spectra["zbin0"] == za)
-            & (self.spectra["zbin1"] == zb)
-        ]
-
-    def gaussian_variance(self, si, sj, z00, z01, z10, z11, model_spectra=None):
-        """Compute the diagonal Gaussian variance for a pair of spectrum blocks.
-
-        Args:
-            si: First spectrum type string.
-            sj: Second spectrum type string.
-            z00: First redshift bin of spectrum si.
-            z01: Second redshift bin of spectrum si.
-            z10: First redshift bin of spectrum sj.
-            z11: Second redshift bin of spectrum sj.
-            model_spectra: Optional dict of model spectra to use instead of observed.
-
-        Returns:
-            Array of variance values per ell bin.
-        """
+    def gaussian_variance(self, si, sj, z00, z01, z10, z11):
         c0 = f"c_{covariance_field_types[si][0]}{covariance_field_types[sj][0]}"
         if c0 not in field_types:
             c0 = f"c_{covariance_field_types[sj][0]}{covariance_field_types[si][0]}"
@@ -638,41 +549,37 @@ class TwoPointSpectrum(DataVector):
             ],
         ):
             if (za, zb) in self.spectrum_info[spec]["bin_pairs"]:
-                c_w_n = self._lookup_spectrum(spec, za, zb, model_spectra) \
-                        + float(self.covariance_info[spec][f"{za}_{zb}"]["noise"])
+                c_w_n = self.spectra["value"][
+                    (self.spectra["spectrum_type"] == spec)
+                    & (self.spectra["zbin0"] == za)
+                    & (self.spectra["zbin1"] == zb)
+                ] + float(self.covariance_info[spec][f"{za}_{zb}"]["noise"])
             elif covariance_field_types[spec][0] == covariance_field_types[spec][1]:
-                c_w_n = self._lookup_spectrum(spec, zb, za, model_spectra) \
-                        + float(self.covariance_info[spec][f"{zb}_{za}"]["noise"])
+                c_w_n = self.spectra["value"][
+                    (self.spectra["spectrum_type"] == spec)
+                    & (self.spectra["zbin0"] == zb)
+                    & (self.spectra["zbin1"] == za)
+                ] + float(self.covariance_info[spec][f"{zb}_{za}"]["noise"])
             elif f1 == "d":
-                c_w_n = self._lookup_spectrum(spec, zb, za, model_spectra) \
-                        + float(self.covariance_info[spec][f"{zb}_{za}"]["noise"])
+                c_w_n = self.spectra["value"][
+                    (self.spectra["spectrum_type"] == spec)
+                    & (self.spectra["zbin0"] == zb)
+                    & (self.spectra["zbin1"] == za)
+                ] + float(self.covariance_info[spec][f"{zb}_{za}"]["noise"])
             else:
                 raise (
                     ValueError(f"No spectrum {spec} with zbin comination {za}, {zb}")
                 )
 
             spec_w_n.append(c_w_n)
-        try:
-            f_sky = np.min([self.covariance_info[c]['f_sky'] for c in [c0, c1, c2, c3] if c in self.covariance_info])
-        except ValueError:
-            f_sky = self.covariance_info["f_sky"]
 
         var = (spec_w_n[0] * spec_w_n[1] + spec_w_n[2] * spec_w_n[3]) / (
-            float(f_sky) * self.delta_ell * (2 * self.ell_eff)
+            float(self.covariance_info["f_sky"]) * self.delta_ell * (2 * self.ell_eff)
         )
 
         return var
 
-    def gaussian_covariance(self, model_spectra=None):
-        """Compute the full Gaussian covariance matrix for all spectrum pairs.
-
-        Args:
-            model_spectra: Optional dict of model spectra for signal-dependent covariance.
-
-        Returns:
-            Structured numpy array of shape (n_dv, n_dv) with covariance values.
-        """
-        self._ensure_covariance_info()
+    def gaussian_covariance(self):
         dt = np.dtype(
             [
                 ("spectrum_type0", "S10"),
@@ -729,8 +636,7 @@ class TwoPointSpectrum(DataVector):
                             counter_j : counter_j + n_ell_j,
                         ]["separation1"] = self.spectrum_info[sj]["separation"][None, :]
 
-                        var = self.gaussian_variance(si, sj, z00, z01, z10, z11,
-                                                    model_spectra=model_spectra)
+                        var = self.gaussian_variance(si, sj, z00, z01, z10, z11)
                         np.fill_diagonal(
                             cov[
                                 counter_i : counter_i + n_ell_i,
@@ -743,163 +649,4 @@ class TwoPointSpectrum(DataVector):
                 counter_i += n_ell_i
 
         return cov
-
-    def spectra_dict_from_vector(self, model_vector):
-        """Convert a flat model vector into a dict keyed by (type, bin0, bin1).
-
-        Args:
-            model_vector: Flat array of model predictions in data vector ordering.
-
-        Returns:
-            Dict mapping (spectrum_type, bin0, bin1) tuples to per-bin arrays.
-        """
-        d = {}
-        offset = 0
-        for t in self.spectrum_types:
-            n = self.spectrum_info[t]["n_dv_per_bin"]
-            for (b0, b1) in self.spectrum_info[t]["bin_pairs"]:
-                d[(t, b0, b1)] = np.asarray(model_vector[offset:offset + n])
-                offset += n
-        return d
-
-    def plot_spectra_vs_model(self, model_pred=None, log_x_scale=True, log_y_scale=True):
-        """Plot measured spectra, optionally compared to model predictions.
-
-        One figure is created per spectrum type.  When *model_pred* is given,
-        each figure has a grid of (data panel, residual panel) column pairs.
-        When *model_pred* is ``None``, only the data panels are shown.
-        Regions excluded by scale cuts are shaded.
-
-        Parameters
-        ----------
-        model_pred : array_like, optional
-            Full (unmasked) model prediction in the same ordering as
-            ``self.spectra`` (i.e. ``apply_scale_mask=False``).  If ``None``,
-            only the measurements are plotted.
-
-        Returns
-        -------
-        dict[str, matplotlib.figure.Figure]
-            Keys are spectrum type strings (e.g. ``'c_kk'``).
-        """
-        import matplotlib.pyplot as plt
-
-        _YLABEL = {
-            'c_kk':       r'$\ell\,C_\ell^{\gamma_E \gamma_E}$',
-            'c_bb':       r'$\ell\,C_\ell^{\gamma_B \gamma_B}$',
-            'c_dk':       r'$\ell\,C_\ell^{\delta_g \gamma_E}$',
-            'c_dd':       r'$\ell\,C_\ell^{\delta_g \delta_g}$',
-            'c_dcmbk':    r'$\ell\,C_\ell^{\delta_g \kappa_{\rm CMB}}$',
-            'c_cmbkcmbk': r'$\ell\,C_\ell^{\kappa_{\rm CMB} \kappa_{\rm CMB}}$',
-        }
-
-        has_model = model_pred is not None
-        if has_model:
-            model_pred = np.asarray(model_pred)
-        figs = {}
-
-        for t in self.spectrum_types:
-            bin_pairs = self.spectrum_info[t]["bin_pairs"]
-            sep = self.spectrum_info[t]["separation"]
-
-            unique_b0 = sorted(set(b0 for b0, b1 in bin_pairs))
-            unique_b1 = sorted(set(b1 for b0, b1 in bin_pairs))
-            n_cols = len(unique_b0)
-            n_rows = len(unique_b1)
-            occupied = {(unique_b1.index(b1), unique_b0.index(b0))
-                        for b0, b1 in bin_pairs}
-
-            if has_model:
-                fig, axes = plt.subplots(
-                    2 * n_rows, n_cols,
-                    sharex=True, sharey='row',
-                    gridspec_kw={'height_ratios': [3, 1] * n_rows},
-                    squeeze=False,
-                )
-            else:
-                fig, axes = plt.subplots(
-                    n_rows, n_cols,
-                    sharex=True, sharey='row',
-                    squeeze=False,
-                )
-
-            for b0, b1 in bin_pairs:
-                col = unique_b0.index(b0)
-                row = unique_b1.index(b1)
-                if has_model:
-                    ax_main = axes[2 * row, col]
-                    ax_res  = axes[2 * row + 1, col]
-                else:
-                    ax_main = axes[row, col]
-
-                idx = np.where(
-                    (self.spectra["spectrum_type"] == t.encode('utf-8'))
-                    & (self.spectra["zbin0"] == b0)
-                    & (self.spectra["zbin1"] == b1)
-                )[0]
-
-                data  = self.spectra["value"][idx]
-
-                if hasattr(self, 'cov') and self.cov is not None:
-                    idxx, idxy = np.meshgrid(idx, idx, indexing='ij')
-                    err = np.sqrt(np.diag(self.cov["value"][idxx, idxy]))
-                else:
-                    err = np.ones_like(data)
-
-                ax_main.errorbar(sep, sep * data, sep * err,
-                                 color='k', ls='', marker='o', ms=3, capsize=3)
-
-                if has_model:
-                    model = model_pred[idx]
-                    ax_main.plot(sep, sep * model, color='k')
-                    ax_res.plot(sep, (data - model) / err,
-                                color='k', ls='', marker='o', ms=3)
-                    ax_res.axhline(0, color='k', lw=0.8)
-
-                # shade excluded scale ranges
-                has_cuts = (self.scale_cuts is not None
-                            and t in self.scale_cuts
-                            and f'{b0}_{b1}' in self.scale_cuts[t])
-                if has_cuts:
-                    ell_min, ell_max = self.scale_cuts[t][f'{b0}_{b1}']
-                    x_max_plot = ell_max * 1.5
-                    shade_axes = [ax_main, ax_res] if has_model else [ax_main]
-                    for ax in shade_axes:
-                        ax.axvspan(sep[0] * 0.5, ell_min,
-                                   color='k', alpha=0.15, linewidth=0)
-                        ax.axvspan(ell_max, x_max_plot * 2,
-                                   color='k', alpha=0.15, linewidth=0)
-                    ax_main.set_xlim(sep[0] * 0.8, x_max_plot)
-                if log_x_scale:
-                    ax_main.set_xscale('log')
-                if log_y_scale:
-                    ax_main.set_yscale('log')
-                ax_main.set_title(f'({b0}, {b1})', fontsize=9)
-
-                if has_model:
-                    ax_res.set_ylim(-4, 4)
-
-                if row == n_rows - 1:
-                    (ax_res if has_model else ax_main).set_xlabel(r'$\ell$')
-                if col == 0:
-                    ax_main.set_ylabel(_YLABEL.get(t, rf'$\ell\,C_\ell$ [{t}]'))
-                    if has_model:
-                        ax_res.set_ylabel(r'$(d-m)/\sigma$')
-
-            # hide unused subplots
-            for row in range(n_rows):
-                for col in range(n_cols):
-                    if (row, col) not in occupied:
-                        if has_model:
-                            axes[2 * row, col].axis('off')
-                            axes[2 * row + 1, col].axis('off')
-                        else:
-                            axes[row, col].axis('off')
-
-            fig.suptitle(_YLABEL.get(t, t).replace(r'\ell\,', ''), y=1.01)
-            fig.set_size_inches(4 * n_cols, 5 * n_rows)
-            fig.subplots_adjust(wspace=0.02, hspace=0.14)
-            figs[t] = fig
-
-        return figs
 

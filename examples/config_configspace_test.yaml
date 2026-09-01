@@ -1,0 +1,243 @@
+# Test config for Nx2PTCorrelationFunction (config space)
+# Run with: run-gholax config_configspace_test.yaml
+
+output_file: chains/test_configspace
+
+likelihood:
+  params:
+    As:
+      prior: {dist: uniform, min: 1.101, max: 3.101}
+      ref: 2.107
+      proposal: 0.4
+      latex: A_s
+    omch2:
+      prior: {dist: uniform, min: 0.08, max: 0.16}
+      ref: 0.11923
+      proposal: 0.01
+      latex: \omega_c
+    ombh2:
+      value: 0.022447
+    H0:
+      value: 67.7
+    w:
+      value: -1.0
+    logmnu:
+      value: -2.0
+    mnu:
+      derived: 'lambda logmnu: 10**logmnu'
+      latex: \Sum m_\nu
+    ns:
+      value: 0.9649
+
+    # Lens bias (2 lens bins)
+    b_1_0:
+      prior: {dist: uniform, min: 0.5, max: 4.0}
+      ref: 1.5
+      proposal: 0.1
+      latex: b_1^0
+    b_1_1:
+      prior: {dist: uniform, min: 0.5, max: 4.0}
+      ref: 1.7
+      proposal: 0.1
+      latex: b_1^1
+    b_2_0:
+      value: 0.0
+    b_2_1:
+      value: 0.0
+    b_s_0:
+      value: 0.0
+    b_s_1:
+      value: 0.0
+    b_3_0:
+      value: 0.0
+    b_3_1:
+      value: 0.0
+    b_ka_0:
+      value: 0.0
+    b_ka_1:
+      value: 0.0
+    b_kx_0:
+      value: 0.0
+    b_kx_1:
+      value: 0.0
+    b_kma_0:
+      value: 0.0
+    b_kma_1:
+      value: 0.0
+    b_kma_2:
+      value: 0.0
+    b_kma_3:
+      value: 0.0
+    r_pade_0:
+      value: 1.0
+    r_pade_1:
+      value: 1.0
+    r_pade_2:
+      value: 1.0
+    r_pade_3:
+      value: 1.0
+
+    # Magnification (2 lens bins)
+    smag_0:
+      value: 1.0
+    smag_1:
+      value: 1.0
+
+    # Shot noise (2 lens bins)
+    sn_0:
+      value: 0.0
+    sn_1:
+      value: 0.0
+
+    # Photo-z shifts (2 source bins)
+    delta_z_source_0:
+      value: 0.0
+    delta_z_source_1:
+      value: 0.0
+
+    # Shear calibration (2 source bins)
+    m_bias_0:
+      value: 0.0
+    m_bias_1:
+      value: 0.0
+
+    # IA
+    A_IA_0:
+      value: 0.0
+    A_IA_1:
+      value: 0.0
+
+    # Counterterms (fixed to 0 for testing)
+    c_s_0_0: {value: 0.0}
+    c_s_0_1: {value: 0.0}
+    c_s_1_0: {value: 0.0}
+    c_s_1_1: {value: 0.0}
+    c_ds_0_0: {value: 0.0}
+    c_ds_0_1: {value: 0.0}
+    c_ds_1_0: {value: 0.0}
+    c_ds_1_1: {value: 0.0}
+    c_s2_0_0: {value: 0.0}
+    c_s2_0_1: {value: 0.0}
+    c_s2_1_0: {value: 0.0}
+    c_s2_1_1: {value: 0.0}
+    c_L2_0_0: {value: 0.0}
+    c_L2_0_1: {value: 0.0}
+    c_L2_1_0: {value: 0.0}
+    c_L2_1_1: {value: 0.0}
+    c_3_0_0: {value: 0.0}
+    c_3_0_1: {value: 0.0}
+    c_3_1_0: {value: 0.0}
+    c_3_1_1: {value: 0.0}
+    c_dt_0_0: {value: 0.0}
+    c_dt_0_1: {value: 0.0}
+    c_dt_1_0: {value: 0.0}
+    c_dt_1_1: {value: 0.0}
+    alpha_s_0_0: {value: 0.0}
+    alpha_s_0_1: {value: 0.0}
+    alpha_s_1_0: {value: 0.0}
+    alpha_s_1_1: {value: 0.0}
+    r_pade_0: {value: 1.0}
+    r_pade_1: {value: 1.0}
+    A_IA_0:
+      value: 0.0
+    A_IA_1:
+      value: 0.0
+    eta_IA_0:
+      value: 0.0
+    eta_IA_1:
+      value: 0.0
+    sigma_2_0:
+      value: 0.0
+    sigma_2_1:
+      value: 0.0
+    sigma_3_0:
+      value: 0.0
+    sigma_3_1:
+      value: 0.0
+    sigma_4_0:
+      value: 0.0
+    sigma_4_1:
+      value: 0.0
+    sigma_4_2:
+      value: 0.0
+
+  Nx2PTCorrelationFunction:
+    params: {}
+    analytic_marginalization: false
+    zmin_proj: 0.1
+    zmax_proj: 1.5
+    use_boltzmann: true
+    data_vector:
+      data_vector_info_filename: examples/dummy_configspace_dv.h5
+      scale_cuts: null
+      dummy_cov: false
+      zeff_weighting: false
+      spectrum_info:
+        xi_plus:
+          bins0: [0, 1]
+          bins1: [0, 1]
+          use_cross: true
+        xi_minus:
+          bins0: [0, 1]
+          bins1: [0, 1]
+          use_cross: true
+
+theory:
+  LinearPowerSpectrum: {}
+  
+  Boltzmann: {}
+  
+  ExpansionHistory:
+    use_emulator: false
+
+  LinearGrowth:
+    use_emulator: false
+
+  RealSpaceMatterPowerSpectrum:
+    use_emulator: false
+    use_boltzmann: true
+
+  RealSpaceBiasedTracerSpectra:
+    bias_model: cleft
+    use_emulator: false
+
+  RealSpaceBiasExpansion:
+    bias_model: cleft
+    baryon_z_evolution_model: spline
+    p_mm_ct_order: 1
+    p_mm_ct_pade: true
+    spline_N: 3
+    spline_Delta: 0.6
+    scale_by_s8z: true
+    p_mm_uv_behavior: dmo
+
+  DensityShapeIA:
+    use_emulator: false
+
+  ShapeShapeIA:
+    use_emulator: false
+
+  RealSpaceIAExpansion:
+    z_evolution_model: powerlaw
+    scale_by_s8z: false
+    include_magnification_x_ia: false
+    no_ia: true
+    zeff_weighting: false
+
+projection:
+  k_cutoff: 2.0
+  LensingCounterterm:
+    non_parametric_growth: false
+    lensing_counterterm_order: 3
+    mean_model: dmo
+  Limber:
+    non_parametric_growth: false
+    k_cutoff: null
+    no_ia: true
+  AngularPowerSpectrum_to_CorrelationFunction: {}
+
+sampler:
+  NUTS:
+    n_steps_warmup: 50
+    n_steps: 10
+    random_start: true
