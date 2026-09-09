@@ -58,18 +58,16 @@ def main():
     from . import sampler
     from .util import Model
 
-    if len(sys.argv) > 2:
-        restart = bool(int(sys.argv[2]))
-        if restart:
-            print('Trying to restart from checkpoint.', flush=True)
-    else:
-        restart = False
-        
     model = Model(cfg)
 
     scfg = cfg['sampler']
     sampler_type = list(scfg.keys())[0]
-    scfg[sampler_type]['restart'] = restart
+    # CLI arg overrides; otherwise honor the config's restart key (which
+    # this used to silently clobber with False).
+    if len(sys.argv) > 2:
+        scfg[sampler_type]['restart'] = bool(int(sys.argv[2]))
+    if scfg[sampler_type].get('restart', False):
+        print('Trying to restart from checkpoint.', flush=True)
     s = getattr(sampler, sampler_type)(cfg)
     
     samples, param_names = s.run(model, cfg['output_file'])

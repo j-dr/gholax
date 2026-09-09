@@ -119,30 +119,3 @@ def test_mclmc_sampler_integration(tmp_path):
     assert np.all(np.isfinite(samples))
     assert param_names[-1] == "log_posterior"
 
-
-@needs_chains
-def test_nuts_pooled_window_with_mclmc_metric(tmp_path):
-    """Full production recipe: MCLMC metric seeding pooled-window NUTS."""
-    from tests.test_sampler_consolidation import ToyModel
-    from gholax.sampler import NUTS
-
-    cfg = {
-        "sampler": {
-            "NUTS": {
-                "warmup_algorithm": "pooled_window",
-                "mass_matrix_init": "mclmc",
-                "chains_per_device": 2,
-                "pooled_window_steps": 10,
-                "pooled_window_max_steps": 40,
-                "n_steps_min": 20,
-                "n_steps_incr": 10,
-                "target_r_minus_one": 0.5,
-                "minimize_and_sample": False,
-            }
-        }
-    }
-    prefix = str(tmp_path / "nuts_mm")
-    samples, param_names = NUTS(cfg).run(ToyModel(), prefix)
-    samples = np.asarray(samples)
-    assert np.all(np.isfinite(samples))
-    assert param_names[-1] == "log_posterior"

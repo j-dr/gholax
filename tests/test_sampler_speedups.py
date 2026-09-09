@@ -374,7 +374,7 @@ def test_rhat_latter_half_logged(tmp_path, capsys):
     }
     samples, _ = NUTS(cfg).run(ToyModel(), str(tmp_path / "nuts"))
     out = capsys.readouterr().out
-    assert "rhat - 1 (latter half)" in out
+    assert "rhat - 1 (latter half, bulk)" in out
     # The run stopped: retained-half R-hat reached the target on this toy
     # Gaussian at or after n_steps_min.
     assert np.asarray(samples).shape[1] >= 20
@@ -434,7 +434,7 @@ def test_nuts_chains_per_device_shapes_and_rhat(tmp_path, capsys):
 
     # All n_total chains are independent trajectories entering the R-hat.
     assert len(np.unique(chk[:, -1, :], axis=0)) == n_total
-    assert "rhat - 1 (latter half)" in capsys.readouterr().out
+    assert "rhat - 1 (latter half, bulk)" in capsys.readouterr().out
 
 
 @needs_chains

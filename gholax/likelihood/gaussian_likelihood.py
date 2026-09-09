@@ -293,7 +293,7 @@ class GaussianLikelihood(Likelihood):
     def compute_noam(self, params):
         """Compute the log-likelihood without analytic marginalization."""
         params_am = {}
-        model = self.predict_model(params, params_am)
+        model, state = self.predict_model(params, params_am, return_state=True)
 
         diff = (
             self.observed_data_vector.measured_spectra[
@@ -303,7 +303,7 @@ class GaussianLikelihood(Likelihood):
         )
 
         chi2 = jnp.dot(diff, jnp.dot(self.observed_data_vector.cinv, diff))
-        lnL = -0.5 * chi2
+        lnL = -0.5 * chi2 + state.get("log_penalty", 0.0)
 
         return lnL
 

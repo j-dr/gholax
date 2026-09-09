@@ -137,6 +137,11 @@ class MetropolisHastings(BaseSampler):
             self.proposal_covariance = None
 
     def run(self, model, output_file):
+        if getattr(model.prior, "transform", False):
+            raise NotImplementedError(
+                "sample_transform is only supported by the NUTS and Minimize "
+                "samplers; disable it for this sampler."
+            )
         (
             rng_key,
             param_names,

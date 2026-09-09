@@ -172,6 +172,42 @@ def _hidden_forward(x, W, b, alphas, betas, use_scan, hidden_stacks):
     return x
 
 
+_DEFAULT_PARAM_ORDER = ["As", "ns", "H0", "w", "ombh2", "omch2", "logmnu", "z"]
+
+
+def _build_range_arrays(param_ranges, param_order):
+    """(lo, hi) arrays aligned with param_order (+-inf where a parameter has
+    no range), or (None, None) when param_ranges is empty.  Names not in
+    param_order raise, as does lo > hi."""
+    if not param_ranges:
+        return None, None
+    if param_order is None:
+        raise ValueError("param_ranges given but the input parameter order is unknown")
+    lo = np.full(len(param_order), -np.inf, dtype=np.float32)
+    hi = np.full(len(param_order), np.inf, dtype=np.float32)
+    for name, (a, b) in param_ranges.items():
+        if name not in param_order:
+            raise ValueError(
+                f"param_ranges key {name!r} not in emulator inputs {param_order}"
+            )
+        if a > b:
+            raise ValueError(f"param_ranges for {name!r}: lo {a} > hi {b}")
+        lo[param_order.index(name)] = a
+        hi[param_order.index(name)] = b
+    return jnp.asarray(lo), jnp.asarray(hi)
+
+
+def _clip_params(parameters, lo, hi):
+    """Clip emulator inputs to the training box when ranges are set."""
+    if lo is None:
+        return parameters
+    return jnp.clip(parameters, lo, hi)
+
+
+def _range_dict(param_ranges):
+    return {k: (float(v[0]), float(v[1])) for k, v in (param_ranges or {}).items()}
+
+
 class Emulator(object):
     """MLP emulator for single-spectrum power spectrum predictions.
 
@@ -179,7 +215,8 @@ class Emulator(object):
     loaded from HDF5 files.
     """
 
-    def __init__(self, filebase, kmin=1e-3, kmax=0.5, scale_As=True):
+    def __init__(self, filebase, kmin=1e-3, kmax=0.5, scale_As=True,
+                 param_ranges=None, param_order=None):
         """Initialize the emulator and load weights.
 
         Args:
@@ -187,12 +224,22 @@ class Emulator(object):
             kmin: Minimum wavenumber for the k grid.
             kmax: Maximum wavenumber for the k grid.
             scale_As: If True, scale As by 1e9 in normalization parameters.
+            param_ranges: Optional {name: [lo, hi]} training box; inputs are
+                clipped to it in predict.
+            param_order: Input parameter names (defaults to the 8-parameter
+                gholax order when the network has 8 inputs).
         """
         super(Emulator, self).__init__()
         self.scale_As = scale_As
         self.load(filebase)
 
         self.n_parameters = self.W[0].shape[0]
+        if param_order is None and self.n_parameters == len(_DEFAULT_PARAM_ORDER):
+            param_order = _DEFAULT_PARAM_ORDER
+        self.param_ranges = _range_dict(param_ranges)
+        self.param_lo, self.param_hi = _build_range_arrays(
+            self.param_ranges, param_order
+        )
         self.n_components = self.W[-1].shape[-1]
         self.n_layers = len(self.W)
         self.nk = self.sigmas.shape[0]
@@ -229,6 +276,7 @@ class Emulator(object):
         Returns:
             Array of predicted power spectrum values.
         """
+        parameters = _clip_params(parameters, self.param_lo, self.param_hi)
         x = (parameters - self.param_mean) / self.param_sigmas
 
         for i in range(self.n_layers - 1):
@@ -303,6 +351,7 @@ class MultiSpectrumEmulator(object):
         ]
 
         self.input_param_order = input_param_order
+        self.param_ranges = _range_dict(cfg.get("param_ranges", None))
 
         if s8_tvar is None:
             self.s8_tvar = bool(cfg.get("s8_tvar", True))
@@ -331,6 +380,7 @@ class MultiSpectrumEmulator(object):
                 data_dir=data_dir,
                 input_param_order=input_param_order,
                 weight_param_order=self.param_order_d,
+                param_ranges=self.param_ranges,
             )
         else:
             self.sigma8z_emu = ScalarEmulator(
@@ -338,11 +388,15 @@ class MultiSpectrumEmulator(object):
                 scale_As=self.scale_As_d,
                 input_param_order=input_param_order,
                 weight_param_order=self.param_order_d,
+                param_ranges=self.param_ranges,
             )
 
         self.load_spec(f"{data_dir}/{spec_base}")
 
         self.n_parameters = self.W[0].shape[0]
+        self.param_lo, self.param_hi = _build_range_arrays(
+            self.param_ranges, self.input_param_order
+        )
         self.n_components = self.W[-1].shape[-1]
         self.n_layers = len(self.W)
         self.nk = self.sigmas.shape[0] // self.n_spec
@@ -381,6 +435,7 @@ class MultiSpectrumEmulator(object):
         Returns:
             Array of shape (n_samples, n_spec, nk) with predicted spectra.
         """
+        parameters = _clip_params(parameters, self.param_lo, self.param_hi)
         if self.s8_tvar:
             s8z = self.sigma8z_emu.predict(parameters)[:, 0]
             parameters = parameters.at[:, -1].set(s8z)
@@ -417,6 +472,7 @@ class ScalarEmulator(object):
         data_dir=None,
         input_param_order=None,
         weight_param_order=None,
+        param_ranges=None,
     ):
         """Initialize the scalar emulator.
 
@@ -431,6 +487,8 @@ class ScalarEmulator(object):
                 Overrides config value when explicitly provided.
             weight_param_order: Ordering of parameters used during training.
                 Overrides config value when explicitly provided.
+            param_ranges: {name: [lo, hi]} training box; inputs are clipped
+                to it in predict. Overrides config value when provided.
         """
         super(ScalarEmulator, self).__init__()
 
@@ -440,6 +498,7 @@ class ScalarEmulator(object):
             filebase = cfg["filebase"]
             cfg_param_order = cfg.get("param_order", None)
             cfg_scale_As = cfg.get("scale_As", True)
+            cfg_param_ranges = cfg.get("param_ranges", None)
         elif isinstance(filebase_or_config, str) and filebase_or_config.endswith(".yaml"):
             cfg_path = filebase_or_config
             if data_dir is None:
@@ -453,10 +512,12 @@ class ScalarEmulator(object):
             filebase = cfg["filebase"]
             cfg_param_order = cfg.get("param_order", None)
             cfg_scale_As = cfg.get("scale_As", True)
+            cfg_param_ranges = cfg.get("param_ranges", None)
         else:
             filebase = filebase_or_config
             cfg_param_order = None
             cfg_scale_As = True
+            cfg_param_ranges = None
 
         # Apply config defaults, kwargs override
         self.scale_As = cfg_scale_As if scale_As is None else scale_As
@@ -478,6 +539,15 @@ class ScalarEmulator(object):
         self.n_parameters = self.W[0].shape[0]
         self.n_components = self.W[-1].shape[-1]
         self.n_layers = len(self.W)
+        order = self.input_param_order or self.weight_param_order
+        if order is None and self.n_parameters == len(_DEFAULT_PARAM_ORDER):
+            order = _DEFAULT_PARAM_ORDER
+        self.param_ranges = _range_dict(
+            cfg_param_ranges if param_ranges is None else param_ranges
+        )
+        self.param_lo, self.param_hi = _build_range_arrays(
+            self.param_ranges, order
+        )
 
         (
             self._use_scan,
@@ -529,6 +599,7 @@ class ScalarEmulator(object):
         Returns:
             Array of predicted scalar values.
         """
+        parameters = _clip_params(parameters, self.param_lo, self.param_hi)
         x = (parameters - self.param_mean) / self.param_sigmas
         x = _hidden_forward(
             x, self.W, self.b, self.alphas, self.betas, self._use_scan,
@@ -573,6 +644,15 @@ class PijEmulator(object):
 
         self.input_param_order = cfg.get("param_order_spec", None)
         self.param_order_d = cfg.get("param_order_d", None)
+        self.param_ranges = _range_dict(cfg.get("param_ranges", None))
+        # input order used for range alignment only; input_param_order stays
+        # None for configs without param_order_spec (callers branch on it)
+        self.effective_param_order = (
+            self.input_param_order or self.param_order_d or _DEFAULT_PARAM_ORDER
+        )
+        self.param_lo, self.param_hi = _build_range_arrays(
+            self.param_ranges, self.effective_param_order
+        )
 
         self.pij_emus = []
 
@@ -584,19 +664,26 @@ class PijEmulator(object):
                         kmin=kmin,
                         kmax=kmax,
                         scale_As=scale_As,
+                        param_ranges=self.param_ranges,
+                        param_order=self.effective_param_order,
                     )
                 )
             else:
                 self.pij_emus.append(
-                    Emulator(pij_emu_bases[i], kmin=kmin, kmax=kmax, scale_As=scale_As)
+                    Emulator(pij_emu_bases[i], kmin=kmin, kmax=kmax, scale_As=scale_As,
+                             param_ranges=self.param_ranges,
+                             param_order=self.effective_param_order)
                 )
 
         if not abspath:
             self.sigma8z_emu = ScalarEmulator(
-                s8z_base, scale_As=scale_As, data_dir=data_dir
+                s8z_base, scale_As=scale_As, data_dir=data_dir,
+                param_ranges=self.param_ranges,
             )
         else:
-            self.sigma8z_emu = ScalarEmulator(s8z_base, scale_As=scale_As)
+            self.sigma8z_emu = ScalarEmulator(
+                s8z_base, scale_As=scale_As, param_ranges=self.param_ranges
+            )
 
         # Pre-stack weights across all n_spec emulators for scan-based predict.
         self._stacked_weights = self._stack_emulator_weights()
@@ -632,6 +719,7 @@ class PijEmulator(object):
         Returns:
             Array of shape (n_samples, n_spec, nk) with predicted P_ij spectra.
         """
+        parameters = _clip_params(parameters, self.param_lo, self.param_hi)
         if self.s8_tvar:
             s8z = self.sigma8z_emu.predict(parameters)[:, 0]
             parameters = parameters.at[:, -1].set(s8z)

@@ -22,12 +22,25 @@ class SpectralEquivalence(LikelihoodModule):
     """
 
     def __init__(self, z, z_lss=1089.0, n_newton=5, n_int_chi=2048,
-                 n_gl_chi=32, sigma8_emulator_file_name=None, **config):
+                 n_gl_chi=32, sigma8_emulator_file_name=None,
+                 w_equiv_bracket=(-3.0, 0.0), w_equiv_range=(-1.56, -0.44),
+                 w_equiv_softness=0.05, sigma8_anchor_w=-1.0, **config):
         self.z = jnp.array(z)
         self.nz = len(z)
         self.z_lss = z_lss
         self.n_newton = n_newton
         self.n_int_chi = n_int_chi
+        # Newton iterates are clamped to w_equiv_bracket (unguarded steps
+        # overflow to NaN once w0+wa >~ -0.3); w_equiv outside the wCDM
+        # emulator box w_equiv_range gets a smooth penalty via state["log_penalty"]
+        self.w_equiv_bracket = tuple(float(v) for v in w_equiv_bracket)
+        self.w_equiv_range = tuple(float(v) for v in w_equiv_range)
+        self.w_equiv_softness = float(w_equiv_softness)
+        # sigma8_w0wa(z) is built as sigma8_emu(w_anchor) * D_w0wa/D_wCDM(w_anchor).
+        # Anchoring at w0 puts the emulator call outside its box for extreme w0
+        # (0.29% at the DESI DR2 best fit) and maximises the scale-independent
+        # growth approximation error; w=-1 keeps both small.
+        self.sigma8_anchor_w = float(sigma8_anchor_w)
 
         _gl_nu_nodes_np, _gl_nu_weights_np = roots_laguerre(32)
         self.gl_nu_nodes = jnp.array(_gl_nu_nodes_np)
@@ -193,33 +206,41 @@ class SpectralEquivalence(LikelihoodModule):
                     self.gl_chi_weights, integrand
                 )
 
+            lo_b, hi_b = self.w_equiv_bracket
+
             def newton_step(i, w):
                 residual = chi_of_w(w) - chi_tgt
                 dchi_dw = jax.grad(chi_of_w)(w)
-                return w - residual / dchi_dw
+                w_new = w - residual / dchi_dw
+                w_new = jnp.where(jnp.isfinite(w_new), w_new, w)
+                return jnp.clip(w_new, lo_b, hi_b)
 
-            w_equiv = jax.lax.fori_loop(0, self.n_newton, newton_step, w0)
+            w_equiv = jax.lax.fori_loop(
+                0, self.n_newton, newton_step, jnp.clip(w0, lo_b, hi_b)
+            )
             return w_equiv
 
         w_equiv_z = jax.vmap(newton_one_z)(self.z, chi_target)
 
         # 3. Amplitude matching: sigma8 correction
-        # D_w0wa(z) / D_wCDM(z; w=w0) ratio
+        # D_w0wa(z) / D_wCDM(z; w=w_anchor) ratio
+        w_anchor = self.sigma8_anchor_w
         D_w0wa = self._compute_D_unnorm(Omega_m, Omega_Lambda, f_nu, w0, wa, self.z)
-        D_wcdm_w0 = self._compute_D_unnorm(Omega_m, Omega_Lambda, f_nu, w0, 0.0, self.z)
+        D_wcdm_w0 = self._compute_D_unnorm(Omega_m, Omega_Lambda, f_nu,
+                                           w_anchor, 0.0, self.z)
         growth_ratio = D_w0wa / D_wcdm_w0
 
         if self.sigma8_emu is not None:
-            # sigma8_wCDM(z; w=w0) from emulator
+            # sigma8_wCDM(z; w=w_anchor) from emulator
             cosmo_params_w0 = jnp.array([
-                As, ns, H0, w0, ombh2, omch2, jnp.log10(mnu),
+                As, ns, H0, w_anchor, ombh2, omch2, jnp.log10(mnu),
             ])
             cparam_grid_w0 = jnp.zeros((self.nz, 8))
             cparam_grid_w0 = cparam_grid_w0.at[:, :-1].set(cosmo_params_w0)
             cparam_grid_w0 = cparam_grid_w0.at[:, -1].set(self.z)
             sigma8_wcdm_w0 = self.sigma8_emu.predict(cparam_grid_w0)[:, 0]
 
-            # sigma8_w0wa(z) ~ sigma8_wCDM(z; w=w0) * growth_ratio
+            # sigma8_w0wa(z) ~ sigma8_wCDM(z; w=w_anchor) * growth_ratio
             sigma8_w0wa = sigma8_wcdm_w0 * growth_ratio
 
             # sigma8_wCDM(z; w_equiv) from emulator with z-dependent w
@@ -245,6 +266,10 @@ class SpectralEquivalence(LikelihoodModule):
             As_equiv_z = As * (D_w0wa / D_wcdm_equiv) ** 2
 
         state["w_equiv_z"] = w_equiv_z
+        lo_r, hi_r = self.w_equiv_range
+        scale = self.w_equiv_softness * (hi_r - lo_r)
+        excess = jnp.maximum(lo_r - w_equiv_z, 0.0) + jnp.maximum(w_equiv_z - hi_r, 0.0)
+        state["log_penalty"] = state.get("log_penalty", 0.0) - 0.5 * jnp.sum((excess / scale) ** 2)
         state["As_equiv_z"] = As_equiv_z
         state["z_equiv"] = self.z
 

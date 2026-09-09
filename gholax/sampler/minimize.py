@@ -68,12 +68,15 @@ class Minimize(BaseSampler):
                 json.dump(
                     {
                         "x_opt": optimal_positions.tolist(),
+                        "x_opt_physical": jnp.asarray(
+                            prior.constrain(jnp.asarray(optimal_positions))
+                        ).tolist(),
                         "value": optimal_values.tolist(),
                     },
                     fp,
                 )
 
-        samples = optimal_positions * sigmas[None, :] + reference[None, :]
+        samples = prior.constrain(jnp.asarray(optimal_positions))
         log_density = -optimal_values
 
         samples = samples[:, None, :]

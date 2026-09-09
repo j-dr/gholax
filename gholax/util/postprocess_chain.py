@@ -134,7 +134,8 @@ def load_model_samples(config_file, compute_sigma8=False, burn_in_frac=0,
         with open(minimization_path, 'r') as fp:
             opt = json.load(fp)
 
-        x_bf = np.array(opt['x_opt'][0]) * sigmas + reference
+        x_bf = (np.array(opt['x_opt_physical'][0]) if 'x_opt_physical' in opt
+            else np.array(opt['x_opt'][0]) * sigmas + reference)
         best_fit = dict(zip(names, x_bf))
         best_fit['logposterior'] = opt['value'][0]
 
@@ -247,7 +248,8 @@ def load_samples_checkpoint_nuts(output_file, model, likelihood_name, s8_module_
 
     with open(f'{output_file}.minimization_results.json', 'r') as fp:
         opt = json.load(fp)
-    samples_i = np.array(opt['x_opt'])*sigmas + reference
+    samples_i = (np.array(opt['x_opt_physical']) if 'x_opt_physical' in opt
+                 else np.array(opt['x_opt'])*sigmas + reference)
     like = model.likelihoods[likelihood_name]
     s8_emu = like.likelihood_pipeline[s8_module_index].emulator
     ipo = getattr(s8_emu, 'input_param_order', ['As', 'ns', 'H0', 'w', 'ombh2', 'omch2', 'logmnu', 'z'])
@@ -277,7 +279,7 @@ def load_samples_checkpoint_nuts(output_file, model, likelihood_name, s8_module_
     log_post = np.array(log_post)
     gds = MCSamples(samples=samples[:,:,:], names = names, labels=labels, ignore_rows=burn_in_frac, loglikes=log_post, settings={'smooth_scale_2D':smooth_scale, 'smooth_scale_1D':smooth_scale})
 
-    params_bf_chain = dict(zip(names, np.array(opt['x_opt'][0])*sigmas + reference))    
+    params_bf_chain = dict(zip(names, (np.array(opt['x_opt_physical'][0]) if 'x_opt_physical' in opt else np.array(opt['x_opt'][0])*sigmas + reference)))    
     params_bf_chain['sigma8'] = sigma8_bf[0]
     params_bf_chain['omegam'] = om_bf[0]
     params_bf_chain['s8'] = sigma8_bf[0] * np.sqrt(om_bf[0]/0.3)
@@ -316,7 +318,8 @@ def load_samples_checkpoint_mh(output_file, model, likelihood_name, s8_module_in
 
     with open(f'{output_file}.minimization_results.json', 'r') as fp:
         opt = json.load(fp)
-    samples_i = np.array(opt['x_opt'])*sigmas + reference
+    samples_i = (np.array(opt['x_opt_physical']) if 'x_opt_physical' in opt
+                 else np.array(opt['x_opt'])*sigmas + reference)
     like = model.likelihoods[likelihood_name]
     s8_emu = like.likelihood_pipeline[s8_module_index].emulator
     ipo = getattr(s8_emu, 'input_param_order', ['As', 'ns', 'H0', 'w', 'ombh2', 'omch2', 'logmnu', 'z'])
@@ -345,7 +348,7 @@ def load_samples_checkpoint_mh(output_file, model, likelihood_name, s8_module_in
     log_post = np.array(log_post)
     gds = MCSamples(samples=samples[:,:,:], names = names, labels=labels, ignore_rows=burn_in_frac, settings={'smooth_scale_2D':smooth_scale, 'smooth_scale_1D':smooth_scale})
 
-    params_bf_chain = dict(zip(names, np.array(opt['x_opt'][0])*sigmas + reference))    
+    params_bf_chain = dict(zip(names, (np.array(opt['x_opt_physical'][0]) if 'x_opt_physical' in opt else np.array(opt['x_opt'][0])*sigmas + reference)))    
     params_bf_chain['sigma8'] = sigma8_bf[0]
     params_bf_chain['omegam'] = om_bf[0]
     params_bf_chain['s8'] = sigma8_bf[0] * np.sqrt(om_bf[0]/0.3)

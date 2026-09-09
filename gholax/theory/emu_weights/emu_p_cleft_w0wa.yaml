@@ -9,3 +9,12 @@ scale_As_spec: False
 scale_As_d: False
 s8_tvar: True
 scale_by_s8zsq: True
+param_ranges:   # Aemulus-nu Tier 1 training box (arXiv:2303.09762 Table 1)
+  As: [1.10, 3.10]
+  ns: [0.93, 1.01]
+  omch2: [0.08, 0.16]
+  ombh2: [0.0173, 0.0272]
+  H0: [52.0, 82.0]
+  w: [-3.0, 1.0]
+  wa: [-3.0, 2.0]
+  logmnu: [-2.0, -0.30103]

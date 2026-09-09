@@ -6,6 +6,7 @@ verifying agreement with the previous odeint/AD-quadrature implementation to
 """
 
 import jax.numpy as jnp
+import jax
 import numpy as np
 
 from gholax.theory.spectral_equivalence import SpectralEquivalence
@@ -54,3 +55,26 @@ def test_spectral_equivalence_golden():
             np.array(D)[IDX], gold["D"], rtol=1e-5,
             err_msg=f"D(z) at (w0, wa)=({w0}, {wa})",
         )
+
+
+def test_w_equiv_finite_and_penalized_across_prior_box():
+    """Unguarded Newton returned NaN for w0+wa >~ -0.3 (24% DES divergences);
+    iterates are now clamped and out-of-box w_equiv is smoothly penalized."""
+    z_pk = jnp.linspace(0.0001, 3.0, 20)
+    se = SpectralEquivalence(z=z_pk)
+
+    def wsum(w0, wa):
+        return jnp.sum(se.compute({}, dict(REF, w=w0, wa=wa))["w_equiv_z"])
+
+    for w0 in (-1.9, -1.1, -0.7, -0.3):
+        for wa in (-2.9, -1.0, 0.0, 0.8, 1.1, 1.9):
+            st = se.compute({}, dict(REF, w=w0, wa=wa))
+            g = jax.grad(wsum, argnums=(0, 1))(jnp.asarray(w0), jnp.asarray(wa))
+            assert np.isfinite(np.asarray(st["w_equiv_z"])).all(), (w0, wa)
+            assert np.isfinite(np.asarray(st["log_penalty"])) and st["log_penalty"] <= 0
+            assert all(np.isfinite(np.asarray(v)) for v in g), (w0, wa)
+    inside = se.compute({}, dict(REF, w=-1.0, wa=0.0))
+    assert float(inside["log_penalty"]) == 0.0
+    out = se.compute({}, dict(REF, w=-0.7, wa=1.1))
+    assert float(out["log_penalty"]) < -1.0
+    assert np.all(np.asarray(out["w_equiv_z"]) <= 0.0)

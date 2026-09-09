@@ -442,7 +442,21 @@ _DEFAULT_PARAM_ORDER_SPEC = ["As", "ns", "omch2", "ombh2", "H0", "w", "logmnu", 
 _DEFAULT_PARAM_ORDER_D = ["As", "ns", "H0", "w", "ombh2", "omch2", "logmnu", "z"]
 
 
-def save_emu_config(output_path, emu_target, emu_info, k=None):
+def training_param_ranges(Ptrain_raw, param_order, scale_As=False):
+    """{name: [min, max]} of the training inputs, in gholax-dict units (As in
+    1e-9 when the raw inputs are absolute), skipping 'z'."""
+    ranges = {}
+    for i, p in enumerate(param_order):
+        if p == "z" or i >= Ptrain_raw.shape[1]:
+            continue
+        lo, hi = float(np.min(Ptrain_raw[:, i])), float(np.max(Ptrain_raw[:, i]))
+        if p == "As" and scale_As:
+            lo, hi = lo * 1e9, hi * 1e9
+        ranges[p] = [lo, hi]
+    return ranges
+
+
+def save_emu_config(output_path, emu_target, emu_info, k=None, param_ranges=None):
     """Write emulator inference YAML config alongside the trained weights.
 
     Args:
@@ -450,6 +464,8 @@ def save_emu_config(output_path, emu_target, emu_info, k=None):
         emu_target: Target name (e.g. 'pkell0', 'p_cleft').
         emu_info: Training config dictionary.
         k: Optional k-grid array from the generation config pipeline module.
+        param_ranges: Optional {name: [lo, hi]} training box; the emulator
+            clips its inputs to it and the sampler penalizes excursions.
     """
     spec_base = os.path.basename(output_path)
 
@@ -472,6 +488,8 @@ def save_emu_config(output_path, emu_target, emu_info, k=None):
         's8_tvar': emu_info.get('s8_tvar', True),
         'scale_by_s8zsq': emu_info.get('scale_by_s8zsq', True),
     }
+    if param_ranges:
+        config['param_ranges'] = param_ranges
 
     config_path = f"{output_path}_config.yaml"
     with open(config_path, 'w') as f:
@@ -733,7 +751,14 @@ def train_emulator():
             print(f"Warning: could not load z/k for residual plots: {e}")
 
     if not is_scalar:
-        save_emu_config(output_path, emu_target, emu_info, k=k_plot)
+        save_emu_config(
+            output_path, emu_target, emu_info, k=k_plot,
+            param_ranges=training_param_ranges(
+                Ptrain_raw,
+                emu_info.get('param_order_spec', _DEFAULT_PARAM_ORDER_SPEC),
+                scale_As=emu_info.get('scale_As_spec', False),
+            ),
+        )
 
     try:
         plot_residuals(emu, Pval, Fval, mean, sigmas, Fstd, use_asinh,

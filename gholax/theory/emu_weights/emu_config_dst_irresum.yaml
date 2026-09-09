@@ -18,3 +18,11 @@ pij_bases:
 s8z_base: aemulus_nu_tier1_cosmo_only_heft_sigma8z_emu
 kmin: 1e-3
 kmax: 3.9355007545577743
+param_ranges:   # Aemulus-nu Tier 1 training box (arXiv:2303.09762 Table 1)
+  As: [1.10, 3.10]
+  ns: [0.93, 1.01]
+  omch2: [0.08, 0.16]
+  ombh2: [0.0173, 0.0272]
+  H0: [52.0, 82.0]
+  w: [-1.56, -0.44]
+  logmnu: [-2.0, -0.30103]
