@@ -4,7 +4,7 @@ Unlike tests/test_bao_alphas.py -- which builds a synthetic file whose alphas ar
 1 by construction and so only exercises plumbing -- these tests use the real DESI
 DR2 BAO likelihood (arXiv:2503.14738) and check the physics against CLASS:
 
-  * the Aubourg+15 r_d fitting formula vs CLASS rs_drag over the prior volume
+  * the Aizpuru+21 r_d fitting formula vs CLASS rs_drag over the prior volume
   * D_M / D_H on the z_limber grid that BAOAlphas actually interpolates on
   * a BAO-only data vector builds and predicts (no p_gg_ell block)
   * chi^2 from RSDPK matches a direct numpy/CLASS computation
@@ -58,12 +58,12 @@ def bao_model():
 
 @requires_classy
 def test_sound_horizon_matches_class():
-    """Aubourg+15 r_d agrees with CLASS rs_drag across the LCDM prior volume.
+    """integrated r_d (Aizpuru+21 z_d) agrees with CLASS rs_drag across the LCDM prior volume.
 
     A fractional error in r_d propagates directly into H_0, so 0.15% here bounds
     the induced H_0 systematic at ~0.1 km/s/Mpc, i.e. under 0.2 sigma.
     """
-    from gholax.theory.bao_alphas import sound_horizon_aubourg
+    from gholax.theory.cmb_compression import sound_horizon_drag
 
     devs = []
     for omch2 in (0.10, 0.115, 0.12, 0.125, 0.14):
@@ -72,7 +72,7 @@ def test_sound_horizon_matches_class():
             rd_class = cosmo.rs_drag()
             cosmo.struct_cleanup()
             cosmo.empty()
-            rd_fit = float(sound_horizon_aubourg(omch2, ombh2, MNU))
+            rd_fit = float(sound_horizon_drag(67.36, ombh2, omch2, -1.0, 0.0, MNU))
             devs.append(abs(rd_fit / rd_class - 1))
 
     assert max(devs) < 1.5e-3, f"max r_d deviation {max(devs):.2e}"
@@ -236,9 +236,9 @@ def test_chi2_matches_direct_computation(bao_model, omch2, ombh2, H0):
     fitting-formula difference, so what remains is pure bookkeeping plus the tiny
     distance-interpolation error; anything larger is a bug.
     """
-    from gholax.theory.bao_alphas import sound_horizon_aubourg
+    from gholax.theory.cmb_compression import sound_horizon_drag
 
-    rd_gholax = float(sound_horizon_aubourg(omch2, ombh2, MNU))
+    rd_gholax = float(sound_horizon_drag(H0, ombh2, omch2, -1.0, 0.0, MNU))
     chi2_ref, _ = _desi_reference(omch2, ombh2, H0, rd=rd_gholax)
 
     like = bao_model.likelihoods["RSDPK"]
@@ -269,7 +269,7 @@ def test_rd_approximation_is_the_only_difference(bao_model, omch2, ombh2, H0):
     """
     import h5py
 
-    from gholax.theory.bao_alphas import sound_horizon_aubourg
+    from gholax.theory.cmb_compression import sound_horizon_drag
 
     _, model_class = _desi_reference(omch2, ombh2, H0)
 
@@ -317,7 +317,7 @@ def test_rd_approximation_is_the_only_difference(bao_model, omch2, ombh2, H0):
     rd_class = cosmo.rs_drag()
     cosmo.struct_cleanup()
     cosmo.empty()
-    expected = rd_class / float(sound_horizon_aubourg(omch2, ombh2, MNU))
+    expected = rd_class / float(sound_horizon_drag(H0, ombh2, omch2, -1.0, 0.0, MNU))
 
     # the ratio is constant to within the distance-interpolation error...
     assert ratio.max() - ratio.min() < 5e-4, (

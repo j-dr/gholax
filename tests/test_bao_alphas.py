@@ -48,7 +48,8 @@ def _fiducial_geometry():
     """Compute per-bin H(z) [km/s/Mpc], D_M(z) [Mpc], D_V(z) [Mpc], and rd
     [Mpc] at FID_PARAMS with the same ExpansionHistory settings RSDPK uses."""
     from gholax.theory.expansion_history import ExpansionHistory
-    from gholax.theory.bao_alphas import sound_horizon_aubourg, C_KMS
+    from gholax.theory.bao_alphas import C_KMS
+    from gholax.theory.cmb_compression import sound_horizon_drag
 
     with h5py.File(DATA_PATH, "r") as f:
         zeff = f["z_fid"][:]
@@ -63,8 +64,9 @@ def _fiducial_geometry():
     DM = chi / h
     DV = (DM**2 * C_KMS * zeff / Hz) ** (1.0 / 3.0)
     rd = float(
-        sound_horizon_aubourg(
-            FID_PARAMS["omch2"], FID_PARAMS["ombh2"], FID_PARAMS["mnu"]
+        sound_horizon_drag(
+            FID_PARAMS["H0"], FID_PARAMS["ombh2"], FID_PARAMS["omch2"],
+            FID_PARAMS.get("w", -1.0), FID_PARAMS.get("wa", 0.0), FID_PARAMS["mnu"],
         )
     )
     return zeff, Hz, DM, DV, rd
@@ -163,9 +165,9 @@ def fsbao_model(tmp_path_factory):
 
 @requires_classy
 def test_sound_horizon_vs_class():
-    """Aubourg+15 fitting formula agrees with CLASS rs_drag to <0.5%."""
+    """integrated sound horizon (Aizpuru+21 z_d) agrees with CLASS rs_drag to <0.5%."""
     from classy import Class
-    from gholax.theory.bao_alphas import sound_horizon_aubourg
+    from gholax.theory.cmb_compression import sound_horizon_drag
     from tests.conftest import COSMO_PARAMS
 
     for name, p in COSMO_PARAMS.items():
@@ -184,7 +186,7 @@ def test_sound_horizon_vs_class():
         cosmo.compute()
         rd_class = cosmo.rs_drag()
         cosmo.struct_cleanup()
-        rd_fit = float(sound_horizon_aubourg(p["omch2"], p["ombh2"], p["mnu"]))
+        rd_fit = float(sound_horizon_drag(p["H0"], p["ombh2"], p["omch2"], p.get("w", -1.0), p.get("wa", 0.0), p["mnu"]))
         assert abs(rd_fit / rd_class - 1.0) < 5e-3, (
             f"{name}: rd_fit={rd_fit:.3f}, rd_class={rd_class:.3f}"
         )
