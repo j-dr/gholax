@@ -70,10 +70,10 @@ projection:
     lensing_counterterm_order: 3
 
 sampler:
-  {'NUTS': {'n_steps_warmup': 500, 'n_incr': 50, 'target_r_minus_one': 0.01, 'random_start': False, 'minimize_and_sample': True, 'n_steps_min': 1000, 'warmup_algorithm': 'adaptive_window'}}
+  {'NUTS': {'warmup': {'n_steps': 500, 'algorithm': 'adaptive_window'}, 'n_incr': 50, 'target_r_minus_one': 0.01, 'random_start': False, 'minimize_and_sample': True, 'n_steps_min': 1000}}
 
 #  NUTS:
-#    n_steps_warmup: 1000
+#    warmup: {n_steps: 1000}
 #    n_steps: 10000
 #    random_start: True
 

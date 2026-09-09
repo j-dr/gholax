@@ -76,3 +76,54 @@ def test_round1_convergence_allowed_when_params_injectable(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "is ignored" not in out
     assert "converged after 1 rounds" in out
+
+
+def test_shared_warmup_defaults_match_legacy():
+    """MCLMC's own defaults must survive the shared WarmupConfig."""
+    s = _mclmc()
+    assert s.warmup_config.algorithm == "mclmc"
+    assert (s.n_steps_warmup, s.step_size_init, s.target_acceptance_rate) == (
+        5000, 0.01, 0.65
+    )
+    assert s.diagonal_preconditioning is True
+    assert s.warmup_init_file is None
+
+
+def test_pooled_pre_adaptation_is_opt_in(monkeypatch):
+    """Default MCLMC never runs the pooled engine; opt-in seeds L/eps/imm."""
+    from gholax.sampler.warmup import Warmup, WarmupResult
+
+    calls = []
+
+    def fake(self, req):
+        calls.append(req)
+        return WarmupResult(
+            inverse_mass_matrix=jnp.full(req.initial_positions.shape[1], 3.0),
+            step_size=jnp.asarray(0.25),
+            positions=req.initial_positions,
+        )
+
+    monkeypatch.setattr(Warmup, "run_pooled_window", fake)
+    seen = {}
+
+    def fake_adapt(self, jlp, state, key, params, output_file=None, warm_start=False):
+        seen["params"] = params
+        return state, params
+
+    monkeypatch.setattr(mclmc_mod.MCLMC, "_adapt_with_convergence", fake_adapt)
+    monkeypatch.setattr(
+        mclmc_mod.MCLMC, "_run_convergence_loop",
+        lambda self, *a, **k: (jnp.zeros((1, 1, 2)), jnp.zeros((1, 1))),
+    )
+
+    from tests.test_sampler_consolidation import ToyModel
+
+    cfg = {"minimize_and_sample": False, "warmup": {"algorithm": "pooled_window"}}
+    _mclmc(cfg).run(ToyModel(), None)
+    assert len(calls) == 1
+    assert float(seen["params"].step_size) == 0.25
+    assert float(seen["params"].inverse_mass_matrix[0]) == 3.0
+
+    calls.clear()
+    _mclmc({"minimize_and_sample": False}).run(ToyModel(), None)
+    assert not calls

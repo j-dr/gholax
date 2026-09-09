@@ -1,6 +1,7 @@
 import inspect
 import json
 import os
+from dataclasses import replace
 
 import blackjax
 import blackjax.mcmc.adjusted_mclmc
@@ -12,6 +13,12 @@ import numpy as np
 from blackjax.adaptation.mclmc_adaptation import MCLMCAdaptationState
 
 from .base import BaseSampler
+from .warmup import (
+    Warmup,
+    WarmupCheckpoint,
+    WarmupConfig,
+    WarmupRequest,
+)
 
 # Older blackjax (e.g. 1.2.5) derives initial adaptation params internally and
 # has no `params` kwarg on the unadjusted tuner.
@@ -41,26 +48,20 @@ class MCLMC(BaseSampler):
         c = config["sampler"]["MCLMC"]
 
         self.adjusted = c.get("adjusted", False)
-        self.n_steps_warmup = c.get("n_steps_warmup", 5000)
         self.warmup_tolerance = c.get("warmup_tolerance", 0.2)
         self.max_warmup_rounds = c.get("max_warmup_rounds", 10)
         self.target_r_minus_one = c.get("target_r_minus_one", 0.1)
         self.n_steps_incr = c.get("n_steps_incr", 50)
         self.n_steps_min = c.get("n_steps_min", 250)
-        self.diagonal_preconditioning = c.get("diagonal_preconditioning", True)
         self.random_start = c.get("random_start", True)
         self.restart = c.get("restart", False)
         self.minimize_and_sample = c.get("minimize_and_sample", True)
         self.chains_per_device = int(c.get("chains_per_device", 1))
         if self.chains_per_device < 1:
             raise ValueError("chains_per_device must be >= 1")
-        self.step_size_init = c.get("step_size_init", 0.01)
         # "ones", "hessian", or "mclmc" (NaN-guarded multi-chain MCLMC
         # within-chain variance estimate, see BaseSampler._mclmc_mass_matrix).
         self.mass_matrix_init = c.get("mass_matrix_init", "ones")
-        # Optional path to a previous run's .mclmc_warmup_parameters.json used
-        # to warm-start adaptation.
-        self.warmup_init_file = c.get("warmup_init_file", None)
         # Floor for L to prevent phase-3 collapse when mass matrix is well-tuned.
         # L >= L_floor_factor * sqrt(dim) * step_size
         self.L_floor_factor = c.get("L_floor_factor", 1.0)
@@ -70,8 +71,21 @@ class MCLMC(BaseSampler):
         self.frac_tune2 = c.get("frac_tune2", 0.1)
         self.frac_tune3 = c.get("frac_tune3", 0.1)
 
-        # Adjusted-only parameters
-        self.target_acceptance_rate = c.get("target_acceptance_rate", 0.65)
+        # Metric and step size are adapted by the shared warmup object; only
+        # L tuning is MCLMC's own.  algorithm "mclmc" (the default) keeps
+        # blackjax's three-phase adaptation as the sole source of both;
+        # "pooled_window" pre-adapts them with the shared engine first.
+        self.warmup_config = replace(
+            WarmupConfig.from_sampler_config(c, sampler="MCLMC", tree_depth=False),
+            restart=self.restart,
+        )
+        self.n_steps_warmup = self.warmup_config.n_steps
+        self.step_size_init = self.warmup_config.step_size_init
+        self.target_acceptance_rate = self.warmup_config.target_acceptance_rate
+        self.diagonal_preconditioning = self.warmup_config.diagonal_mass_matrix
+        # Optional path to a previous run's .mclmc_warmup_parameters.json used
+        # to warm-start adaptation.
+        self.warmup_init_file = self.warmup_config.init_file
 
     def run(self, model, output_file):
         """Run the MCLMC sampler until convergence.
@@ -202,9 +216,34 @@ class MCLMC(BaseSampler):
                     flush=True,
                 )
             else:
+                step_size = self.step_size_init
+                if self.warmup_config.algorithm == "pooled_window":
+                    # NUTS-based pooled warmup for the metric and step size;
+                    # L stays MCLMC's, seeded from the adapted metric.
+                    rng_key, pw_key = jax.random.split(rng_key)
+                    pooled = Warmup(
+                        self.warmup_config,
+                        self._warmup_host("mclmc"),
+                        tune_tree_depth=False,
+                    ).run_pooled_window(
+                        WarmupRequest(
+                            jlp,
+                            initial_positions,
+                            pw_key,
+                            initial_inverse_mass_matrix=init_imm,
+                            output_file=output_file,
+                        )
+                    )
+                    init_imm = pooled.inverse_mass_matrix
+                    step_size = float(pooled.step_size)
+                    print(
+                        f"Pooled warmup seeded MCLMC adaptation: "
+                        f"step_size={step_size:.6g}",
+                        flush=True,
+                    )
                 warmup_params = MCLMCAdaptationState(
                     L=jnp.sqrt(dim),
-                    step_size=self.step_size_init,
+                    step_size=step_size,
                     inverse_mass_matrix=init_imm,
                 )
 
@@ -329,7 +368,7 @@ class MCLMC(BaseSampler):
         Returns:
             Tuple of (final state, final MCLMCAdaptationState).
         """
-        from ..util.distributed import is_io_process
+        ckpt = WarmupCheckpoint(output_file, self._warmup_host("mclmc"))
 
         state = initial_state
         params = initial_params
@@ -348,12 +387,8 @@ class MCLMC(BaseSampler):
                 flush=True,
             )
 
-        ckpt_file = (
-            f"{output_file}.mclmc_warmup_intermediate.json" if output_file else None
-        )
-        if ckpt_file and self.restart and os.path.exists(ckpt_file):
-            with open(ckpt_file, "r") as fp:
-                ck = json.load(fp)
+        ck = ckpt.read_intermediate(check_transform=False) if self.restart else None
+        if ck is not None:
             params = MCLMCAdaptationState(
                 L=jnp.asarray(ck["L"]),
                 step_size=jnp.asarray(ck["step_size"]),
@@ -415,20 +450,17 @@ class MCLMC(BaseSampler):
                 flush=True,
             )
 
-            if ckpt_file and is_io_process():
-                with open(ckpt_file, "w") as fp:
-                    json.dump(
-                        {
-                            "L": float(params.L),
-                            "step_size": float(params.step_size),
-                            "inverse_mass_matrix": np.asarray(
-                                params.inverse_mass_matrix
-                            ).tolist(),
-                            "position": np.asarray(state.position).tolist(),
-                            "round": round_num,
-                        },
-                        fp,
-                    )
+            ckpt.write_intermediate(
+                {
+                    "L": float(params.L),
+                    "step_size": float(params.step_size),
+                    "inverse_mass_matrix": np.asarray(
+                        params.inverse_mass_matrix
+                    ).tolist(),
+                    "position": np.asarray(state.position).tolist(),
+                    "round": round_num,
+                }
+            )
 
             # When params cannot be injected, round-1 output is unrelated to
             # the (ignored) initial/checkpointed params, so require a second

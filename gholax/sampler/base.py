@@ -74,6 +74,20 @@ class BaseSampler(object):
     mesh = None
     chains_per_device = 1
 
+    def _warmup_host(self, prefix):
+        """Bundle for the warmup engine (see gholax.sampler.warmup)."""
+        from .warmup import WarmupHost
+
+        return WarmupHost(
+            chains_per_device=self.chains_per_device,
+            param_names=getattr(self, "_param_names", None),
+            sample_transform=bool(
+                getattr(getattr(self, "_prior", None), "transform", False)
+            ),
+            mesh=self.mesh,
+            prefix=prefix,
+        )
+
     def _init_chains(self, model, jit_logpost=True):
         """Seed the rng, extract prior scaling, and draw per-chain initial
         positions in normalized parameter space.

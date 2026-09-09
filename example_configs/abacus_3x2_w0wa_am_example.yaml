@@ -1204,7 +1204,8 @@ projection:
     lensing_counterterm_order: 3
 sampler:
   NUTS:
-    n_steps_warmup: 500
+    warmup:
+      n_steps: 500
     n_incr: 50
     target_r_minus_one: 0.01
     random_start: false
