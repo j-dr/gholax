@@ -1,13 +1,10 @@
 import json
-import threading
 from collections import namedtuple
 from datetime import datetime
 
 import jax
-import jax.scipy.linalg
 import jax.scipy.special
 import jax.numpy as jnp
-import jaxopt
 import numpy as np
 from blackjax.diagnostics import (
     effective_sample_size,
@@ -236,625 +233,113 @@ class BaseSampler(object):
             return mapped
         return self._chain_map(fn, chain_axes)
 
-    def _best_fit_position(self, jlp, position, n_adam=300, n_lbfgs_restarts=3,
-                           n_starts=None, start_scale=None, rng_key=None):
-        """Multi-start Adam warm-start then restarted L-BFGS to the MAP.
+    def _seeding_host(self, map_chains=None):
+        """Bundle for the seeding engine (see gholax.sampler.seeding).
 
-        A single descent can settle in a data-likelihood ridge far from the
-        joint optimum (observed with FlowLikelihood configs: 3x2pt curvature
-        traps the minimizer ~59 logp above the CMB+BAO-compatible basin), so
-        The basin search is a vmapped Adam-only pass over all starts (a
-        simple scan graph that compiles quickly; memory is fine with
-        gradient checkpointing on every likelihood block). L-BFGS — whose
-        zoom line search vmaps into an hours-long XLA compile — polishes
-        only the argmin winner, reusing the cached single-point compile.
+        Built lazily per call: _init_chains sets _prior/_param_names, and
+        Minimize sets self.mesh inside run(), so this must not be cached at
+        construction time.
         """
-        best = self._adam_multistart(jlp, position, n_adam, n_starts,
-                                     start_scale, rng_key)
-        if best is None:
-            return position
-        best_p, best_v = self._lbfgs_polish(jlp, *best, n_lbfgs_restarts)
-        print(f"  best fit logp: {float(-best_v):.2f}", flush=True)
-        return best_p
+        from .seeding import SeedingHost
 
-    def _adam_multistart(self, jlp, position, n_adam=300, n_starts=None,
-                         start_scale=None, rng_key=None):
-        """Vmapped multi-start Adam; returns the (position, -logp) of the
-        best start, or None when every start failed."""
-        if n_starts is None:
-            n_starts = getattr(self, "minimize_n_starts", 4)
-        if start_scale is None:
-            start_scale = getattr(self, "minimize_start_scale", 0.5)
-        if rng_key is None:
-            rng_key = jax.random.key(0)
-        starts = self._jittered_starts(
-            jlp, position, n_starts, start_scale, rng_key
+        return SeedingHost(
+            map_chains=self._map_chains if map_chains is None else map_chains,
+            mesh=self.mesh,
+            chains_per_device=self.chains_per_device,
+            param_names=getattr(self, "_param_names", None),
+            constrain=getattr(getattr(self, "_prior", None), "constrain", None),
         )
-        ps, vs = jax.vmap(
-            lambda x0: self._adam_descent(jlp, x0, n_adam)
-        )(starts)
-        vs = jnp.where(vs < 1e30, vs, jnp.inf)
-        i = int(jnp.argmin(vs))
-        if not bool(jnp.isfinite(vs[i])):
-            print("  minimization failed; using initial position", flush=True)
-            return None
-        spread = (float(vs.max() - vs.min())
-                  if bool(jnp.isfinite(vs).all()) else float("nan"))
-        print(f"  adam multi-start: best -logp {float(vs[i]):.2f} "
-              f"({n_starts} starts, spread {spread:.2f})", flush=True)
-        print("  per-start -logp (start 0 = reference): "
-              + ", ".join(f"{float(v):.1f}" for v in vs), flush=True)
-        return ps[i], vs[i]
+
+    def _seeder(self):
+        """Seeder wired to this sampler's config, host, and fisher params."""
+        from .seeding import FisherParams, Seeder, SeedingConfig
+
+        cfg = getattr(self, "seeding_config", None) or SeedingConfig()
+        wc = getattr(self, "warmup_config", None)
+        fisher = None
+        if wc is not None:
+            fisher = FisherParams(
+                wc.dense_rank or "auto", wc.fisher_cutoff, wc.fisher_reg
+            )
+        seeder = Seeder(cfg, self._seeding_host(), fisher_params=fisher)
+        seeder.pathfinder_imm = getattr(self, "_pathfinder_imm", None)
+        return seeder
+
+    # The seeding stage lives in gholax.sampler.seeding.Seeder.  These
+    # delegating shims keep the historical call surface (and the two
+    # attributes callers read back) working.
+
+    def _best_fit_position(self, jlp, position, n_adam=None,
+                           n_lbfgs_restarts=None, n_starts=None,
+                           start_scale=None, rng_key=None):
+        return self._seeder().best_fit_position(
+            jlp, position, n_adam, n_lbfgs_restarts, n_starts, start_scale,
+            rng_key,
+        )
+
+    def _adam_multistart(self, jlp, position, n_adam=None, n_starts=None,
+                         start_scale=None, rng_key=None):
+        return self._seeder().adam_multistart(
+            jlp, position, n_adam, n_starts, start_scale, rng_key
+        )
 
     def _jittered_starts(self, jlp, position, n_starts, start_scale, rng_key):
-        """position plus n_starts-1 Hessian-guided jittered copies.
+        return self._seeder().jittered_starts(
+            jlp, position, n_starts, start_scale, rng_key
+        )
 
-        Per-coordinate scale ~ sqrt(imm) at position concentrates the
-        displacement in soft/degenerate directions (where distinct basins
-        live) and barely moves stiff ones; the scale is backed off until the
-        candidate is in-box.
-        """
-        jn = jax.jit(lambda p: -jlp(p))
-        dim = position.shape[0]
-        w = jnp.sqrt(self._hessian_mass_matrix(jlp, position))
-        w = w / jnp.max(w)
-        starts = [position]
-        for i in range(n_starts - 1):
-            ki = jax.random.fold_in(rng_key, i)
-            for scale in (start_scale, start_scale / 5, 0.0):
-                cand = position + scale * w * jax.random.normal(ki, (dim,))
-                if bool(jn(cand) < 1e30):
-                    break
-            starts.append(cand)
-        return jnp.stack(starts)
+    def _adam_descent(self, jlp, position, n_adam=None):
+        return self._seeder().adam_descent(jlp, position, n_adam)
+
+    def _lbfgs_polish(self, jlp, position, value, n_lbfgs_restarts=None):
+        return self._seeder().lbfgs_polish(
+            jlp, position, value, n_lbfgs_restarts
+        )
 
     def _pathfinder_init(self, jlp, x_map, n_chains, rng_key, output_file):
-        """Multi-path Pathfinder chain seeding (Zhang et al. 2022).
-
-        L-BFGS paths start from x_map and Hessian-jittered copies.  Along
-        each path the Gaussian N(theta_l - Sigma_l grad_l, Sigma_l), with
-        Sigma_l the L-BFGS inverse-Hessian estimate, is scored by a Monte
-        Carlo ELBO and the best iterate kept (done here rather than with
-        blackjax's own scan, whose mean has the opposite sign).  Draws are
-        pooled and either importance-resampled with mixture-proposal
-        weights (pathfinder_resample) or taken as ELBO-weighted mixture
-        draws.
-        x_map itself is untouched: it stays the MAP for model comparison
-        and the Hessian metric.
-        """
-        from blackjax.vi import pathfinder
-
-        n_paths = getattr(self, "pathfinder_n_paths", 4)
-        n_elbo = getattr(self, "pathfinder_elbo_samples", 20)
-        resample = getattr(self, "pathfinder_resample", True)
-        dim = x_map.shape[0]
-        k_start, k_pf, k_draw, k_pick = jax.random.split(rng_key, 4)
-        starts = self._jittered_starts(
-            jlp, x_map, n_paths,
-            getattr(self, "pathfinder_start_scale", 0.5), k_start,
+        seeder = self._seeder()
+        positions = seeder.pathfinder_init(
+            jlp, x_map, n_chains, rng_key, output_file
         )
-        print(f"Running Pathfinder ({n_paths} paths, resample={resample})",
-              flush=True)
-        vlp = jax.jit(jax.vmap(jlp))
-
-        def gaussian(pos, grad, alpha, beta, gamma):
-            sig = jnp.diag(alpha) + beta @ gamma @ beta.T
-            return pos - sig @ grad, jnp.linalg.cholesky(sig)
-
-        def logq(mu, L, x):
-            z = jax.scipy.linalg.solve_triangular(L, (x - mu).T, lower=True)
-            return (-0.5 * jnp.sum(z**2, axis=0)
-                    - jnp.sum(jnp.log(jnp.diag(L)))
-                    - 0.5 * dim * jnp.log(2 * jnp.pi))
-
-        @jax.jit
-        def elbo_path(key, path):
-            def one(k, pos, grad, alpha, beta, gamma):
-                mu, L = gaussian(pos, grad, alpha, beta, gamma)
-                x = mu + (L @ jax.random.normal(k, (dim, n_elbo))).T
-                lp = vlp(x)
-                e = jnp.mean(lp - logq(mu, L, x))
-                ok = jnp.all(jnp.isfinite(L)) & jnp.all(lp > -1e30)
-                return jnp.where(ok, e, -jnp.inf)
-            keys = jax.random.split(key, path.position.shape[0])
-            # sequential to avoid OOM
-            
-            return jax.lax.map(
-                lambda a: one(*a),
-                (keys, path.position, path.grad_position,
-                 path.alpha, path.beta, path.gamma),
-            )
-
-        approx = jax.jit(lambda k, x0: pathfinder.approximate(
-            k, jlp, x0, num_samples=2,
-            maxiter=getattr(self, "pathfinder_maxiter", 100),
-            maxcor=getattr(self, "pathfinder_maxcor", 10),
-        )[1].path)
-        gauss, elbos, n_iter = [], [], []
-        per_path = 2 * n_chains // n_paths + 1
-        for k, x0 in zip(jax.random.split(k_pf, n_paths), starts):
-            k1, k2 = jax.random.split(k)
-            path = approx(k1, x0)
-            e = elbo_path(k2, path)
-            l = int(jnp.argmax(e))
-            elbos.append(float(e[l])); n_iter.append(l)
-            gauss.append(gaussian(path.position[l], path.grad_position[l],
-                                  path.alpha[l], path.beta[l], path.gamma[l]))
-        print("  per-path best ELBO: " + ", ".join(
-            f"{e:.1f} (iter {l})" for e, l in zip(elbos, n_iter)), flush=True)
-        phi = jnp.concatenate([
-            mu + (L @ jax.random.normal(k, (dim, per_path))).T
-            for (mu, L), k in zip(gauss, jax.random.split(k_draw, n_paths))
-        ])
-        logp = vlp(phi)
-        ok = jnp.isfinite(logp) & (logp > -1e30)
-        print(f"  finite draws {int(ok.sum())}/{phi.shape[0]}", flush=True)
-        phi, logp = phi[ok], logp[ok]
-        info = {"elbo": elbos, "best_iter": n_iter, "n_finite": int(ok.sum()),
-                "resample": resample}
-        # Plain-mixture mode weights paths by exp(ELBO)
-        # importance-sampling mode instead uses the uniform mixture the
-        # draws actually came from and lets the weights do the work.
-        log_pm = jnp.asarray(elbos) - jax.scipy.special.logsumexp(
-            jnp.asarray(elbos))
-        info["path_weights"] = np.exp(np.asarray(log_pm)).tolist()
-        path_of = jnp.repeat(jnp.arange(n_paths), per_path)[ok]
-        w = jnp.exp(log_pm)[path_of]
-        w = w / w.sum()
-        if resample:
-            lq = jax.scipy.special.logsumexp(
-                jnp.stack([logq(mu, L, phi) for mu, L in gauss]), axis=0
-            ) - jnp.log(n_paths)
-            logw = logp - lq
-            w = jnp.exp(logw - jax.scipy.special.logsumexp(logw))
-            n_eff = float(1.0 / jnp.sum(w**2))
-            info["weight_ess"] = n_eff
-            print(f"  importance-weight ESS {n_eff:.1f} of {phi.shape[0]} "
-                  f"draws", flush=True)
-            if n_eff < 2:
-                print("  weights degenerate; falling back to mixture draws",
-                      flush=True)
-                w = jnp.exp(log_pm)[path_of]
-                w = w / w.sum()
-        idx = jax.random.choice(
-            k_pick, phi.shape[0], (n_chains,),
-            replace=phi.shape[0] < n_chains, p=w,
-        )
-        positions = phi[idx]
-        info["n_unique"] = int(jnp.unique(idx).shape[0])
-        # ELBO-best path's L-BFGS covariance: bulk-scale dense metric
-        # candidate (mass_matrix_init: pathfinder)
-        Lb = gauss[int(jnp.argmax(jnp.asarray(elbos)))][1]
-        self._pathfinder_imm = Lb @ Lb.T
-        print(f"  seeded {n_chains} chains from {info['n_unique']} distinct "
-              f"draws; logp range [{float(logp[idx].min()):.1f}, "
-              f"{float(logp[idx].max()):.1f}]", flush=True)
-        if is_io_process():
-            with open(f"{output_file}.pathfinder_init.json", "w") as fp:
-                json.dump({**info, "positions": positions.tolist(),
-                           "inverse_mass_matrix":
-                               np.asarray(self._pathfinder_imm).tolist()}, fp)
+        self._pathfinder_imm = seeder.pathfinder_imm
         return positions
 
     def _polish_and_pathfinder(self, log_posterior, position, n_chains,
                                pathfinder_key, output_file):
-        """Adam multi-start, then L-BFGS polish (thread, spare device) in
-        parallel with Pathfinder seeding from the unpolished winner.
-        Returns the polished MAP; seeds go to self._pathfinder_positions."""
-        jlp = jax.jit(log_posterior)
-        best = self._adam_multistart(jlp, position)
-        if best is None:
-            self._pathfinder_positions = self._pathfinder_init(
-                jlp, position, n_chains, pathfinder_key, output_file
-            )
-            return position
-        p0, v0 = best
-        devs = jax.local_devices()
-        pol_dev = devs[1] if len(devs) > 1 else devs[0]
-        out = {}
-
-        def polish():
-            with jax.default_device(pol_dev):
-                pp = jax.device_put(p0, pol_dev)
-                out["x"], out["v"] = self._lbfgs_polish(jlp, pp, v0)
-
-        print(f"  L-BFGS polish on {pol_dev} in parallel with Pathfinder",
-              flush=True)
-        t = threading.Thread(target=polish, daemon=True)
-        t.start()
-        self._pathfinder_positions = self._pathfinder_init(
-            jlp, p0, n_chains, pathfinder_key, output_file
+        seeder = self._seeder()
+        x_opt = seeder.polish_and_pathfinder(
+            log_posterior, position, n_chains, pathfinder_key, output_file
         )
-        t.join()
-        x_opt = jax.device_put(out["x"], devs[0])
-        print(f"  best fit logp: {float(-out['v']):.2f}", flush=True)
+        self._pathfinder_imm = seeder.pathfinder_imm
+        self._pathfinder_positions = seeder.pathfinder_positions
         return x_opt
 
-    def _adam_descent(self, jlp, position, n_adam=300):
-        """Adam descent tracking the best valid point.
-
-        Adam has no line search, so the -FLT_MAX out-of-box plateau and fp32
-        noise that stall jaxopt's zoom line search don't affect it; updates
-        that land out of the box (logp <= -1e30) are rejected. Pure JAX
-        (vmap-compatible); returns (best position, -logp), -logp >= 1e30 if
-        no valid point was seen.
-        """
-        import optax
-
-        jnlp = jax.jit(lambda p: -jlp(p))
-        vgrad = jax.value_and_grad(jnlp)
-
-        opt = optax.adam(optax.cosine_decay_schedule(1e-2, n_adam, 1e-1))
-
-        def adam_step(carry, _):
-            p, s, best_p, best_v = carry
-            v, g = vgrad(p)
-            updates, s = opt.update(g, s, p)
-            p_candidate = optax.apply_updates(p, updates)
-            # Evaluate the candidate at the position being recorded.  The
-            # previous implementation compared ``v = f(p)`` but stored
-            # ``p_new``; on a non-monotone Adam step this paired the old
-            # objective with a different position and could select a point
-            # that was not actually the best one seen.
-            v_candidate = jnlp(p_candidate)
-            valid = (
-                jnp.isfinite(v_candidate)
-                & (v_candidate < 1e30)
-                & (v_candidate > -1e30)
-            )
-            p = jnp.where(valid, p_candidate, p)
-            v = jnp.where(valid, v_candidate, v)
-            better = valid & (v < best_v)
-            best_p = jnp.where(better, p, best_p)
-            best_v = jnp.where(better, v, best_v)
-            return (p, s, best_p, best_v), None
-
-        v0 = jnlp(position)
-        v0_valid = (
-            jnp.isfinite(v0) & (v0 < 1e30) & (v0 > -1e30)
-        )
-        v0 = jnp.where(v0_valid, v0, jnp.inf)
-        (p, _, best_p, best_v), _ = jax.lax.scan(
-            adam_step, (position, opt.init(position), position, v0),
-            None, length=n_adam,
-        )
-        vp = jnlp(p)
-        take = (
-            jnp.isfinite(vp)
-            & (vp < 1e30)
-            & (vp > -1e30)
-            & (vp <= best_v)
-        )
-        best_p = jnp.where(take, p, best_p)
-        best_v = jnp.where(take, vp, best_v)
-        return best_p, best_v
-
-    def _lbfgs_polish(self, jlp, position, value, n_lbfgs_restarts=3):
-        """Restarted single-point L-BFGS polish (fresh curvature memory each
-        restart), keeping improvements. Returns (position, -logp)."""
-        jnlp = jax.jit(lambda p: -jlp(p))
-        vgrad = jax.value_and_grad(jnlp)
-        solver = jaxopt.LBFGS(fun=vgrad, value_and_grad=True)
-        best_p, best_v = position, value
-        for _ in range(n_lbfgs_restarts):
-            res = solver.run(best_p)
-            val = jnlp(res.params)
-            if bool(val < 1e30) and bool(val < best_v - 0.1):
-                best_p, best_v = res.params, val
-            else:
-                break
-        return best_p, best_v
-
     def _hessian_mass_matrix(self, jlp, position):
-        """Estimate diagonal inverse mass matrix from the Hessian of the log posterior.
-
-        Uses exact forward-over-reverse Hessian-vector products (the RK4
-        spectral-equivalence rewrite made the model forward-mode
-        differentiable; finite differences produced clip-saturated entries
-        in soft directions). Requires dim HVP evaluations.
-
-        Elements are clamped to [1e-6, 1e6] to guard against degenerate
-        curvature far from the MAP.
-
-        Args:
-            jlp: JIT-compiled log posterior function (scalar output).
-            position: 1D JAX array of parameter values (normalized space).
-
-        Returns:
-            1D JAX array of shape (dim,) representing the diagonal
-            inverse mass matrix.
-        """
-        grad_fn = jax.grad(lambda p: -jlp(p))
-        dim = len(position)
-
-        def hvp_diag(i):
-            v = jnp.zeros(dim).at[i].set(1.0)
-            return jax.jvp(grad_fn, (position,), (v,))[1][i]
-
-        diag_H = jax.lax.map(hvp_diag, jnp.arange(dim))
-        # Non-positive curvature (unconverged MAP / flat directions) would
-        # clip to the floor and give that direction a ~1e6 inverse mass,
-        # which collapses dual averaging (observed eps -> 4e-9). Use the
-        # median positive curvature as a neutral scale instead.
-        positive = jnp.isfinite(diag_H) & (diag_H > 0)
-        pos_med = jnp.nanmedian(jnp.where(positive, diag_H, jnp.nan))
-        # ``nanmedian`` is NaN when the whole diagonal is non-positive or
-        # non-finite.  Such a Hessian is possible before the MAP polish (and
-        # for genuinely flat targets); use the identity metric in that case
-        # so warmup receives finite parameters instead of poisoning dual
-        # averaging with NaNs.
-        pos_med = jnp.where(
-            jnp.isfinite(pos_med) & (pos_med > 0), pos_med, jnp.asarray(1.0)
-        )
-        diag_H = jnp.where(positive, diag_H, pos_med)
-        # Relative floor: near-zero positive curvature is as damaging as
-        # negative (caps imm at 1e4 x the median imm).
-        diag_H = jnp.maximum(diag_H, 1e-4 * pos_med)
-        return 1.0 / jnp.clip(diag_H, 1e-6, 1e6)
+        return self._seeder().hessian_mass_matrix(jlp, position)
 
     def _hessian_mass_matrix_dense(self, jlp, position):
-        """Dense inverse mass matrix from the full Hessian at `position`.
-
-        Same HVP count as the diagonal estimate (one per coordinate), but
-        keeps the full matrix: the inverse Hessian approximates the local
-        posterior covariance, so a dense metric absorbs the correlations a
-        diagonal metric cannot. The eigenvalue analog of the diagonal median
-        guard handles indefiniteness: non-positive eigenvalues are replaced
-        by the median positive one, with a relative floor of 1e-4 x median.
-
-        Returns:
-            (dim, dim) symmetric positive-definite inverse mass matrix.
-        """
-        grad_fn = jax.grad(lambda p: -jlp(p))
-        dim = len(position)
-
-        def hvp_row(i):
-            v = jnp.zeros(dim).at[i].set(1.0)
-            return jax.jvp(grad_fn, (position,), (v,))[1]
-
-        H = jax.lax.map(hvp_row, jnp.arange(dim))
-        H = 0.5 * (H + H.T)
-        lam, V = jnp.linalg.eigh(H)
-        positive = jnp.isfinite(lam) & (lam > 0)
-        pos_med = jnp.nanmedian(jnp.where(positive, lam, jnp.nan))
-        pos_med = jnp.where(
-            jnp.isfinite(pos_med) & (pos_med > 0), pos_med, jnp.asarray(1.0)
-        )
-        lam = jnp.where(positive, lam, pos_med)
-        lam = jnp.clip(jnp.maximum(lam, 1e-4 * pos_med), 1e-6, 1e6)
-        return (V * (1.0 / lam)) @ V.T
+        return self._seeder().hessian_mass_matrix_dense(jlp, position)
 
     def _mclmc_mass_matrix(self, log_posterior, initial_positions, rng_key,
-                           n_tune_steps=600, n_steps=1200, n_chains=8):
-        """Estimate a diagonal inverse mass matrix from short MCLMC runs.
-
-        A short single-chain blackjax MCLMC tune finds (L, eps); n_chains
-        unadjusted MCLMC chains are then run at a conservative eps/2 from
-        jittered starts. Chains with any non-finite position in the second
-        half are dropped; the estimate is the mean over surviving chains of
-        the within-chain variance over the second half of steps. Fallback
-        ladder: retry once at eps/4, then _hessian_mass_matrix, then ones.
-        Result is clamped to [1e-8, 1e8].
-
-        Args:
-            log_posterior: Log posterior function (scalar output).
-            initial_positions: (n, dim) array of starting positions.
-            rng_key: JAX random key.
-            n_tune_steps: Steps for the single-chain L/eps tune.
-            n_steps: Steps per estimation chain.
-            n_chains: Number of estimation chains.
-
-        Returns:
-            Tuple of (imm, info_dict) where imm is a (dim,) diagonal inverse
-            mass matrix and info_dict records n_survivors, eps, and rung.
-        """
-        import blackjax
-        import blackjax.mcmc.integrators
-        import blackjax.mcmc.mclmc
-
-        jlp = jax.jit(log_posterior)
-        dim = initial_positions.shape[1]
-        rng_key, tune_key, init_key, jit_key = jax.random.split(rng_key, 4)
-
-        # Rung 0: short single-chain tune for (L, eps).
-        L, eps, tuned_imm = jnp.sqrt(dim), 0.01, jnp.ones(dim)
-        try:
-            tune_state = blackjax.mcmc.mclmc.init(
-                position=initial_positions[0], logdensity_fn=jlp,
-                rng_key=init_key,
-            )
-            kernel = lambda imm: blackjax.mcmc.mclmc.build_kernel(
-                logdensity_fn=jlp,
-                integrator=blackjax.mcmc.integrators.isokinetic_mclachlan,
-                inverse_mass_matrix=imm,
-            )
-            _, tp, _ = blackjax.mclmc_find_L_and_step_size(
-                mclmc_kernel=kernel,
-                num_steps=n_tune_steps,
-                state=tune_state,
-                rng_key=tune_key,
-                diagonal_preconditioning=True,
-            )
-            if (
-                jnp.isfinite(tp.L)
-                and jnp.isfinite(tp.step_size)
-                and bool(jnp.all(jnp.isfinite(tp.inverse_mass_matrix)))
-            ):
-                L, eps, tuned_imm = tp.L, tp.step_size, jnp.maximum(
-                    tp.inverse_mass_matrix,
-                    1e-8 * jnp.max(tp.inverse_mass_matrix),
-                )
-            else:
-                print(
-                    "MCLMC mass-matrix tune produced non-finite params; "
-                    "using conservative defaults.",
-                    flush=True,
-                )
-        except Exception as e:
-            print(
-                f"MCLMC mass-matrix tune failed ({e}); using conservative "
-                "defaults.",
-                flush=True,
-            )
-
-        step_kernel = blackjax.mcmc.mclmc.build_kernel(
-            logdensity_fn=jlp,
-            integrator=blackjax.mcmc.integrators.isokinetic_mclachlan,
-            inverse_mass_matrix=tuned_imm,
-        )
-
-        idx = jnp.arange(n_chains) % initial_positions.shape[0]
-        starts = initial_positions[idx]
-        starts = starts + 0.01 * jax.random.normal(jit_key, starts.shape)
-
-        def run_chain(pos, key, step_size):
-            init_k, run_k = jax.random.split(key)
-            state = blackjax.mcmc.mclmc.init(
-                position=pos, logdensity_fn=jlp, rng_key=init_k,
-            )
-
-            def step(state, k):
-                state, _ = step_kernel(k, state, L=L, step_size=step_size)
-                return state, state.position
-
-            _, positions = jax.lax.scan(
-                step, state, jax.random.split(run_k, n_steps)
-            )
-            return positions
-
-        def try_rung(step_size, key):
-            keys = jax.random.split(key, n_chains)
-            positions = jax.vmap(run_chain, in_axes=(0, 0, None))(
-                starts, keys, step_size
-            )  # (n_chains, n_steps, dim)
-            second = positions[:, n_steps // 2:, :]
-            finite = jnp.all(jnp.isfinite(second), axis=(1, 2))
-            n_surv = int(jnp.sum(finite))
-            if n_surv < max(n_chains // 2, 1):
-                return None, n_surv
-            var = jnp.var(second, axis=1)  # within-chain variance
-            imm = jnp.mean(var[finite], axis=0)
-            if not bool(jnp.all(jnp.isfinite(imm))):
-                return None, n_surv
-            # fp32 variance can go slightly negative for tight params
-            imm = jnp.maximum(imm, 1e-8 * jnp.max(imm))
-            return imm, n_surv
-
-        for rung, step_size in (("eps/2", eps / 2), ("eps/4", eps / 4)):
-            rng_key, run_key = jax.random.split(rng_key)
-            imm, n_surv = try_rung(step_size, run_key)
-            if imm is not None:
-                info = {
-                    "n_survivors": n_surv,
-                    "eps": float(step_size),
-                    "rung": rung,
-                }
-                return jnp.clip(imm, 1e-8, 1e8), info
-            print(
-                f"MCLMC mass-matrix estimation at {rung} "
-                f"(eps={float(step_size):.3e}) failed: only {n_surv}/"
-                f"{n_chains} chains finite.",
-                flush=True,
-            )
-
-        print(
-            "MCLMC mass-matrix estimation failed at all step sizes; "
-            "falling back to Hessian mass matrix.",
-            flush=True,
-        )
-        try:
-            imm = self._hessian_mass_matrix(
-                jlp, self._best_fit_position(jlp, initial_positions[0])
-            )
-            if bool(jnp.all(jnp.isfinite(imm))):
-                return (
-                    jnp.clip(imm, 1e-8, 1e8),
-                    {"n_survivors": 0, "eps": float(eps / 4),
-                     "rung": "hessian"},
-                )
-        except Exception as e:
-            print(f"Hessian fallback failed ({e}).", flush=True)
-        print(
-            "Hessian mass-matrix fallback failed; using ones.", flush=True
-        )
-        return (
-            jnp.ones(dim),
-            {"n_survivors": 0, "eps": float(eps / 4), "rung": "ones"},
+                           n_tune_steps=None, n_steps=None, n_chains=None):
+        return self._seeder().mclmc_mass_matrix(
+            log_posterior, initial_positions, rng_key, n_tune_steps, n_steps,
+            n_chains,
         )
 
     def _minimize_and_sample(
         self, log_posterior, initial_positions, n_chains, output_file,
         chi2_threshold=1, pathfinder_key=None,
     ):
-        """Run L-BFGS from every chain's start, save the results, and move
-        chains whose minimum is worse than chi2_threshold x the best one to
-        the best position.
-
-        With pathfinder_key (identical starts only) the L-BFGS polish of the
-        Adam winner runs in a thread on a spare device while Pathfinder seeds
-        the chains from the unpolished winner; the seeds are left in
-        self._pathfinder_positions and the polished MAP is still saved."""
-        # minimize negative log posterior
-        jnlp = jax.jit(lambda p: -log_posterior(p))
-        vgrad = jax.value_and_grad(jnlp)
-        solver = jaxopt.LBFGS(fun=vgrad, value_and_grad=True)
-
-        print("Running minimization before sampling", flush=True)
-        self._pathfinder_positions = None
-        if bool(jnp.all(initial_positions == initial_positions[0])):
-            # identical starts (random_start: false): minimize once and
-            # broadcast instead of K concurrent L-BFGS grads (OOM at K=32).
-            if pathfinder_key is not None:
-                x_opt = self._polish_and_pathfinder(
-                    log_posterior, initial_positions[0], n_chains,
-                    pathfinder_key, output_file,
-                )
-            else:
-                x_opt = self._best_fit_position(
-                    log_posterior, initial_positions[0]
-                )
-            initial_positions = np.tile(
-                np.asarray(x_opt), (n_chains, 1)
-            )
-            values = np.full(n_chains, float(jnlp(x_opt)))
-        else:
-            minimize_map = self._map_chains(solver.run)
-            res = minimize_map(initial_positions)
-            initial_positions = gather_to_host(res.params)
-            values = gather_to_host(res.state.value)
-        if is_io_process():
-            with open(f"{output_file}.minimization_results.json", "w") as fp:
-                json.dump(
-                    {
-                        "x_opt": initial_positions.tolist(),
-                        # physical-space copy: x_opt is sampling-space, whose
-                        # meaning depends on the prior transform
-                        **(
-                            {
-                                "x_opt_physical": np.asarray(
-                                    self._prior.constrain(
-                                        jnp.asarray(initial_positions)
-                                    )
-                                ).tolist()
-                            }
-                            if hasattr(self._prior, "constrain")
-                            else {}
-                        ),
-                        "value": values.tolist(),
-                    },
-                    fp,
-                )
-
-        chi2_ratio = values / np.min(values)
-        initial_positions_min = jnp.tile(
-            initial_positions[np.argmin(values)], n_chains
-        ).reshape(n_chains, -1)
-        initial_positions = jnp.where(
-            chi2_ratio[:, None] > chi2_threshold,
-            initial_positions_min,
-            initial_positions,
+        seeder = self._seeder()
+        positions = seeder.minimize(
+            log_posterior, initial_positions, n_chains, output_file,
+            chi2_threshold=chi2_threshold, pathfinder_key=pathfinder_key,
         )
-        return initial_positions
+        self._pathfinder_imm = seeder.pathfinder_imm
+        self._pathfinder_positions = seeder.pathfinder_positions
+        return positions
+
 
     def _make_pmap_inference_loop(self, collect_info=False):
         """Build the pmapped lax.scan inference loop.

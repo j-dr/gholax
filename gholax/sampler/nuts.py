@@ -8,6 +8,8 @@ import jax.numpy as jnp
 import numpy as np
 
 from .base import BaseSampler
+from .seeding import LEGACY_ATTRS as SEEDING_ATTRS
+from .seeding import SeedingConfig, SeedingRequest
 from .warmup import (  # noqa: F401  (re-exported for callers/tests)
     LEGACY_ATTRS,
     NUTS_ALGORITHMS,
@@ -57,24 +59,6 @@ class NUTS(BaseSampler):
             self.n_steps_min = 0
         self.random_start = c.get("random_start", True)
         self.restart = c.get("restart", False)
-        self.minimize_and_sample = c.get("minimize_and_sample", False)
-        self.minimize_n_starts = c.get("minimize_n_starts", 4)
-        
-        self.minimize_start_scale = c.get("minimize_start_scale", 0.5)
-        # Pathfinder chain seeding: replaces MAP tiling with draws from the
-        # ELBO-best Gaussians along L-BFGS paths (the MAP is still found
-        # and saved).
-        self.pathfinder_init = c.get("pathfinder_init", True)
-        self.pathfinder_resample = c.get("pathfinder_resample", False)
-        self.pathfinder_n_paths = c.get(
-            "pathfinder_n_paths", self.minimize_n_starts
-        )
-        self.pathfinder_elbo_samples = c.get("pathfinder_elbo_samples", 20)
-        self.pathfinder_maxiter = c.get("pathfinder_maxiter", 100)
-        self.pathfinder_maxcor = c.get("pathfinder_maxcor", 10)
-        self.pathfinder_start_scale = c.get(
-            "pathfinder_start_scale", self.minimize_start_scale
-        )
         # Divergences remain diagnostics by default for backwards
         # compatibility.  Production runs can opt into a fail-closed rate
         # threshold; with fail_on_divergence and no threshold, any divergent
@@ -96,19 +80,7 @@ class NUTS(BaseSampler):
         self.chains_per_device = int(c.get("chains_per_device", 1))
         if self.chains_per_device < 1:
             raise ValueError("chains_per_device must be >= 1")
-        # "ones", "hessian", "hessian_dense", or "pathfinder" (default when
-        # pathfinder_init is on, else hessian_dense)
-        self.mass_matrix_init = c.get(
-            "mass_matrix_init",
-            "pathfinder" if self.pathfinder_init else "hessian_dense",
-        )
-        if self.mass_matrix_init == "fisher_seeds" and not self.pathfinder_init:
-            raise ValueError("mass_matrix_init: fisher_seeds requires pathfinder_init: true")
-        if self.mass_matrix_init == "pathfinder" and not self.pathfinder_init:
-            raise ValueError(
-                "mass_matrix_init: pathfinder requires pathfinder_init: true"
-            )
-
+        self.seeding_config = SeedingConfig.from_sampler_config(c, sampler="NUTS")
         self.warmup_config = replace(
             WarmupConfig.from_sampler_config(c, sampler="NUTS"),
             restart=self.restart,
@@ -118,10 +90,14 @@ class NUTS(BaseSampler):
         self.max_num_doublings = self.warmup_config.sampling_max_num_doublings
 
     def __getattr__(self, name):
-        """Forward the deprecated flat warmup attributes to warmup_config."""
-        field = LEGACY_ATTRS.get(name)
-        if field is not None and "warmup_config" in self.__dict__:
-            return getattr(self.warmup_config, field)
+        """Forward the deprecated flat option attributes to their configs."""
+        for attrs, cfg_name in (
+            (LEGACY_ATTRS, "warmup_config"),
+            (SEEDING_ATTRS, "seeding_config"),
+        ):
+            field = attrs.get(name)
+            if field is not None and cfg_name in self.__dict__:
+                return getattr(self.__dict__[cfg_name], field)
         raise AttributeError(name)
 
 
@@ -313,69 +289,24 @@ class NUTS(BaseSampler):
             pf_key = None
             if self.pathfinder_init and not warm_ckpt:
                 rng_key, pf_key = jax.random.split(rng_key)
-            if self.minimize_and_sample and not warm_ckpt:
-                initial_positions = self._minimize_and_sample(
-                    log_posterior, initial_positions, n_chains, output_file,
+            # The split above stays here, not in the seeder: it fixes every
+            # downstream key and therefore the whole starting cloud.
+            seeds = self._seeder().run(
+                SeedingRequest(
+                    log_posterior,
+                    jlp,
+                    initial_positions,
+                    n_chains,
+                    rng_key=rng_key,
                     pathfinder_key=pf_key,
+                    output_file=output_file,
+                    skip_minimize=warm_ckpt,
+                    skip_metric=warm_ckpt,
                 )
-            x_h = initial_positions[0]
-            if pf_key is not None:
-                seeds = getattr(self, "_pathfinder_positions", None)
-                initial_positions = (
-                    seeds if seeds is not None
-                    else self._pathfinder_init(jlp, x_h, n_chains, pf_key, output_file)
-                )
-
-            if warm_ckpt:
-                init_imm = None
-            elif self.mass_matrix_init == "hessian":
-                print("Estimating initial mass matrix from Hessian diagonal...", flush=True)
-                if not self.minimize_and_sample:
-                    x_h = self._best_fit_position(jlp, x_h)
-                init_imm = self._hessian_mass_matrix(jlp, x_h)
-                print(f"  imm range: [{float(init_imm.min()):.4f}, {float(init_imm.max()):.4f}]", flush=True)
-            elif self.mass_matrix_init == "hessian_dense":
-                print("Estimating dense initial mass matrix from full Hessian...", flush=True)
-                if not self.minimize_and_sample:
-                    x_h = self._best_fit_position(jlp, x_h)
-                init_imm = self._hessian_mass_matrix_dense(jlp, x_h)
-                ev = jnp.linalg.eigvalsh(init_imm)
-                print(
-                    f"  dense imm eigenvalue range: "
-                    f"[{float(ev.min()):.3e}, {float(ev.max()):.3e}]",
-                    flush=True,
-                )
-            elif self.mass_matrix_init == "fisher_seeds":
-                # Fisher-divergence metric from the Pathfinder seed cloud and
-                # its scores: n_chains draws with gradients, no extra warmup
-                seeds = jnp.asarray(initial_positions)
-                gs = jax.vmap(jax.grad(jlp))(seeds)
-                xc = seeds - seeds.mean(0); gc = gs - gs.mean(0)
-                C = xc.T @ xc / max(seeds.shape[0] - 1, 1)
-                G = gc.T @ gc / max(seeds.shape[0] - 1, 1)
-                init_imm = _fisher_metric(
-                    C, G, self.pooled_window_dense_rank or "auto",
-                    self.pooled_window_fisher_cutoff, self.pooled_window_fisher_reg,
-                    n=int(seeds.shape[0]),
-                )
-                ev = jnp.linalg.eigvalsh(init_imm)
-                print(
-                    f"Dense initial mass matrix from Fisher divergence of the "
-                    f"seed cloud: eigenvalue range [{float(ev.min()):.3e}, "
-                    f"{float(ev.max()):.3e}]",
-                    flush=True,
-                )
-            elif self.mass_matrix_init == "pathfinder":
-                init_imm = self._pathfinder_imm
-                ev = jnp.linalg.eigvalsh(init_imm)
-                print(
-                    f"Dense initial mass matrix from Pathfinder covariance: "
-                    f"eigenvalue range [{float(ev.min()):.3e}, "
-                    f"{float(ev.max()):.3e}]",
-                    flush=True,
-                )
-            else:
-                init_imm = None
+            )
+            initial_positions = seeds.positions
+            init_imm = seeds.inverse_mass_matrix
+            self._pathfinder_imm = seeds.pathfinder_imm
 
             init_step = None
             if self.warmup_init_file is not None:

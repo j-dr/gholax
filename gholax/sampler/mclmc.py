@@ -13,6 +13,8 @@ import numpy as np
 from blackjax.adaptation.mclmc_adaptation import MCLMCAdaptationState
 
 from .base import BaseSampler
+from .seeding import LEGACY_ATTRS as SEEDING_ATTRS
+from .seeding import SeedingConfig
 from .warmup import (
     Warmup,
     WarmupCheckpoint,
@@ -55,13 +57,9 @@ class MCLMC(BaseSampler):
         self.n_steps_min = c.get("n_steps_min", 250)
         self.random_start = c.get("random_start", True)
         self.restart = c.get("restart", False)
-        self.minimize_and_sample = c.get("minimize_and_sample", True)
         self.chains_per_device = int(c.get("chains_per_device", 1))
         if self.chains_per_device < 1:
             raise ValueError("chains_per_device must be >= 1")
-        # "ones", "hessian", or "mclmc" (NaN-guarded multi-chain MCLMC
-        # within-chain variance estimate, see BaseSampler._mclmc_mass_matrix).
-        self.mass_matrix_init = c.get("mass_matrix_init", "ones")
         # Floor for L to prevent phase-3 collapse when mass matrix is well-tuned.
         # L >= L_floor_factor * sqrt(dim) * step_size
         self.L_floor_factor = c.get("L_floor_factor", 1.0)
@@ -75,6 +73,7 @@ class MCLMC(BaseSampler):
         # L tuning is MCLMC's own.  algorithm "mclmc" (the default) keeps
         # blackjax's three-phase adaptation as the sole source of both;
         # "pooled_window" pre-adapts them with the shared engine first.
+        self.seeding_config = SeedingConfig.from_sampler_config(c, sampler="MCLMC")
         self.warmup_config = replace(
             WarmupConfig.from_sampler_config(c, sampler="MCLMC", tree_depth=False),
             restart=self.restart,
@@ -86,6 +85,13 @@ class MCLMC(BaseSampler):
         # Optional path to a previous run's .mclmc_warmup_parameters.json used
         # to warm-start adaptation.
         self.warmup_init_file = self.warmup_config.init_file
+
+    def __getattr__(self, name):
+        """Forward the deprecated flat seeding attributes to seeding_config."""
+        field = SEEDING_ATTRS.get(name)
+        if field is not None and "seeding_config" in self.__dict__:
+            return getattr(self.__dict__["seeding_config"], field)
+        raise AttributeError(name)
 
     def run(self, model, output_file):
         """Run the MCLMC sampler until convergence.
@@ -151,8 +157,9 @@ class MCLMC(BaseSampler):
             kernel = sampler.step
 
         else:
+            seeder = self._seeder()
             if self.minimize_and_sample:
-                initial_positions = self._minimize_and_sample(
+                initial_positions = seeder.minimize(
                     log_posterior, initial_positions, n_chains, output_file
                 )
 
@@ -180,28 +187,14 @@ class MCLMC(BaseSampler):
 
             dim = initial_positions.shape[1]
 
-            if self.mass_matrix_init == "hessian":
-                print("Estimating initial mass matrix from Hessian diagonal...", flush=True)
-                x_h = initial_positions[0]
-                if not self.minimize_and_sample:
-                    x_h = self._best_fit_position(jlp, x_h)
-                init_imm = self._hessian_mass_matrix(jlp, x_h)
-                print(f"  imm range: [{float(init_imm.min()):.4f}, {float(init_imm.max()):.4f}]", flush=True)
-            elif self.mass_matrix_init == "mclmc":
-                print("Estimating initial mass matrix from short MCLMC runs...", flush=True)
+            # The mclmc estimator is the only branch that consumes a key;
+            # splitting only there keeps the key stream identical.
+            mm_key = None
+            if self.mass_matrix_init == "mclmc":
                 rng_key, mm_key = jax.random.split(rng_key)
-                init_imm, mm_info = self._mclmc_mass_matrix(
-                    jlp, initial_positions, mm_key
-                )
-                print(
-                    f"  rung={mm_info['rung']}, "
-                    f"n_survivors={mm_info['n_survivors']}, "
-                    f"imm range: [{float(init_imm.min()):.4f}, "
-                    f"{float(init_imm.max()):.4f}]",
-                    flush=True,
-                )
-            else:
-                init_imm = jnp.ones((dim,))
+            init_imm, _ = seeder.initial_metric(
+                jlp, initial_positions[0], initial_positions, mm_key
+            )
 
             if self.warmup_init_file is not None:
                 with open(self.warmup_init_file, "r") as fp:

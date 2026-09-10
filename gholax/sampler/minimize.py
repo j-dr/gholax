@@ -1,10 +1,7 @@
-import json
-
-import jax
 import jax.numpy as jnp
-import jaxopt
 
 from .base import BaseSampler
+from .seeding import SeedingConfig
 
 
 class Minimize(BaseSampler):
@@ -24,6 +21,9 @@ class Minimize(BaseSampler):
         self._sampler_cfg = c
 
         self.random_start = c.get("random_start", True)
+        self.seeding_config = SeedingConfig.from_sampler_config(
+            c, sampler="Minimize"
+        )
 
     def run(self, model, output_file):
         """Run L-BFGS minimization across parallel chains.
@@ -36,7 +36,7 @@ class Minimize(BaseSampler):
             Tuple of (samples array with shape (n_devices, 1, n_params+1),
             parameter names list).
         """
-        from ..util.distributed import build_mesh, gather_to_host, is_io_process
+        from ..util.distributed import build_mesh
 
         self.mesh = build_mesh(self._sampler_cfg)
 
@@ -52,29 +52,16 @@ class Minimize(BaseSampler):
             initial_positions,
         ) = self._init_chains(model, jit_logpost=False)
 
-        jnlp = jax.jit(lambda p: -log_posterior(p))
-        vgrad = jax.value_and_grad(jnlp)
-        solver = jaxopt.LBFGS(fun=vgrad, value_and_grad=True)
-
-        minimize_map = self._map_chains(solver.run)
-        print("Running minimization", flush=True)
-        res = minimize_map(initial_positions)
-
-        optimal_positions = gather_to_host(res.params)
-        optimal_values = gather_to_host(res.state.value)
-
-        if is_io_process():
-            with open(f"{output_file}.minimization_results.json", "w") as fp:
-                json.dump(
-                    {
-                        "x_opt": optimal_positions.tolist(),
-                        "x_opt_physical": jnp.asarray(
-                            prior.constrain(jnp.asarray(optimal_positions))
-                        ).tolist(),
-                        "value": optimal_values.tolist(),
-                    },
-                    fp,
-                )
+        # mode="per_chain": every chain keeps its own optimum.  The shared
+        # "auto" mode would collapse identical starts onto one solve and
+        # re-tile poor chains onto the best one, which is exactly what a
+        # minimizer must not do.
+        seeder = self._seeder()
+        optimal_positions = seeder.minimize(
+            log_posterior, initial_positions, n_devices, output_file,
+            mode="per_chain",
+        )
+        optimal_values = seeder.map_values
 
         samples = prior.constrain(jnp.asarray(optimal_positions))
         log_density = -optimal_values

@@ -89,7 +89,7 @@ def test_shared_warmup_defaults_match_legacy():
     assert s.warmup_init_file is None
 
 
-def test_pooled_pre_adaptation_is_opt_in(monkeypatch):
+def test_pooled_pre_adaptation_is_opt_in(monkeypatch, tmp_path):
     """Default MCLMC never runs the pooled engine; opt-in seeds L/eps/imm."""
     from gholax.sampler.warmup import Warmup, WarmupResult
 
@@ -119,11 +119,11 @@ def test_pooled_pre_adaptation_is_opt_in(monkeypatch):
     from tests.test_sampler_consolidation import ToyModel
 
     cfg = {"minimize_and_sample": False, "warmup": {"algorithm": "pooled_window"}}
-    _mclmc(cfg).run(ToyModel(), None)
+    _mclmc(cfg).run(ToyModel(), str(tmp_path / "a"))
     assert len(calls) == 1
     assert float(seen["params"].step_size) == 0.25
     assert float(seen["params"].inverse_mass_matrix[0]) == 3.0
 
     calls.clear()
-    _mclmc({"minimize_and_sample": False}).run(ToyModel(), None)
+    _mclmc({"minimize_and_sample": False}).run(ToyModel(), str(tmp_path / "b"))
     assert not calls
