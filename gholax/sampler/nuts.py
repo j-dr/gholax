@@ -1,23 +1,37 @@
 import json
 import os
-from datetime import datetime
+from dataclasses import replace
 
 import blackjax
 import jax
 import jax.numpy as jnp
-import jaxopt
 import numpy as np
-from blackjax.diagnostics import potential_scale_reduction
+
+from .base import BaseSampler
+from .seeding import LEGACY_ATTRS as SEEDING_ATTRS
+from .seeding import SeedingConfig, SeedingRequest
+from .warmup import (  # noqa: F401  (re-exported for callers/tests)
+    LEGACY_ATTRS,
+    NUTS_ALGORITHMS,
+    Warmup,
+    WarmupConfig,
+    WarmupRequest,
+    _fisher_metric,
+    _spd_guard,
+    _spd_sqrt,
+    _stale_warmup_parameters,
+    stuck_chains,
+)
 
 
-class NUTS(object):
+class NUTS(BaseSampler):
     """No-U-Turn Sampler using blackjax.
 
     Wraps blackjax's NUTS sampler with window adaptation warmup, convergence
     checking via R-hat, parallel chains via jax.pmap, and checkpoint restart.
     """
 
-    WARMUP_ALGORITHMS = ("window", "adaptive_window", "meads")
+    WARMUP_ALGORITHMS = NUTS_ALGORITHMS
 
     def __init__(self, config):
         """Initialize NUTS sampler from config.
@@ -26,215 +40,131 @@ class NUTS(object):
             config: Full config dict containing 'sampler' -> 'NUTS' section.
         """
         c = config["sampler"]["NUTS"]
+        self._sampler_cfg = c
 
-        self.n_steps_warmup = c.get("n_steps_warmup", 500)
         self.target_r_minus_one = c.get("target_r_minus_one", 0.1)
-        self.n_steps_incr = c.get("n_steps_incr", 50)
-        self.n_steps_min = c.get("n_steps_min", 250)
+        # Optional worst-dimension ESS floor for the stopping rule (ANDed
+        # with the R-hat gate); None disables it.
+        self.target_min_ess = c.get("target_min_ess", None)
+        if self.target_min_ess is not None:
+            self.target_min_ess = float(self.target_min_ess)
+            if self.target_min_ess <= 0:
+                raise ValueError("target_min_ess must be > 0")
+        self.n_steps_incr = c.get("n_steps_incr", 10)
+        # With an ESS target and no explicit n_steps_min, let ESS govern the
+        # minimum run length instead of the fixed default.
+        if "n_steps_min" in c or self.target_min_ess is None:
+            self.n_steps_min = c.get("n_steps_min", 250)
+        else:
+            self.n_steps_min = 0
         self.random_start = c.get("random_start", True)
         self.restart = c.get("restart", False)
-        self.diagonal_mass_matrix = c.get("diagonal_mass_matrix", True)
-        self.minimize_and_sample = c.get("minimize_and_sample", False)
-        self.pathfinder_adaptation = c.get("pathfinder_adaptation", False)
-        self.target_acceptance_rate = c.get("target_acceptance_rate", 0.65)
-        self.step_size_init = c.get("step_size_init", 0.05)
+        # Divergences remain diagnostics by default for backwards
+        # compatibility.  Production runs can opt into a fail-closed rate
+        # threshold; with fail_on_divergence and no threshold, any divergent
+        # transition raises.
+        self.max_divergence_rate = c.get("max_divergence_rate", 0.5)
+        
+        if self.max_divergence_rate is not None and self.max_divergence_rate >= 0.0:
+            self.max_divergence_rate = float(self.max_divergence_rate)
+            if not 0.0 <= self.max_divergence_rate <= 1.0:
+                raise ValueError("max_divergence_rate must be between 0 and 1")
+        self.fail_on_divergence = bool(c.get("fail_on_divergence", True))
+        self.divergence_check_min_steps = int(
+            c.get("divergence_check_min_steps", 10)
+        )
+        if self.divergence_check_min_steps < 0:
+            raise ValueError("divergence_check_min_steps must be >= 0")
+        
         self.parallel_warmup = c.get("parallel_warmup", False)
-        self.mass_matrix_init = c.get("mass_matrix_init", "ones")  # "ones" or "hessian"
-
-        self.warmup_algorithm = c.get("warmup_algorithm", "window")
-        if self.warmup_algorithm not in self.WARMUP_ALGORITHMS:
-            raise ValueError(
-                f"warmup_algorithm must be one of {self.WARMUP_ALGORITHMS}, "
-                f"got '{self.warmup_algorithm}'"
-            )
-
-        # Adaptive window parameters
-        self.adaptive_warmup_stage_steps = c.get("adaptive_warmup_stage_steps", 100)
-        self.adaptive_warmup_max_steps = c.get("adaptive_warmup_max_steps", 1000)
-        self.adaptive_warmup_min_steps = c.get("adaptive_warmup_min_steps", 200)
-        self.adaptive_warmup_rtol_mass = c.get("adaptive_warmup_rtol_mass", 0.05)
-        self.adaptive_warmup_rtol_step = c.get("adaptive_warmup_rtol_step", 0.05)
-
-        # MEADS parameters
-        self.meads_warmup_steps = c.get("meads_warmup_steps", 150)
-        self.meads_step_size_tuning_steps = c.get("meads_step_size_tuning_steps", 100)
-
-    def _hessian_mass_matrix(self, jlp, position):
-        """Estimate diagonal inverse mass matrix from the Hessian of the log posterior.
-
-        Uses forward finite differences of the gradient to estimate the diagonal
-        of the Hessian using only reverse-mode AD. Forward-mode (JVP) cannot be
-        used because odeint defines a custom_vjp without a matching custom_jvp.
-        Requires dim+1 gradient evaluations.
-
-        Elements are clamped to [1e-6, 1e6] to guard against degenerate
-        curvature far from the MAP.
-
-        Args:
-            jlp: JIT-compiled log posterior function (scalar output).
-            position: 1D JAX array of parameter values (normalized space).
-
-        Returns:
-            1D JAX array of shape (dim,) representing the diagonal
-            inverse mass matrix.
-        """
-        jnlp = lambda p: -jlp(p)
-        grad_fn = jax.grad(jnlp)
-        eps = 1e-3
-        dim = len(position)
-        g0 = grad_fn(position)
-        # Sequential loop: one gradient eval per parameter, keeping only the
-        # i-th element each time to avoid allocating dim gradient arrays at once.
-        diag_H = jnp.array([
-            (grad_fn(position.at[i].set(position[i] + eps))[i] - g0[i]) / eps
-            for i in range(dim)
-        ])
-        return 1.0 / jnp.clip(diag_H, 1e-6, 1e6)
-
-    def _adaptive_window_warmup(self, jlp, rng_key, initial_position, initial_inverse_mass_matrix=None):
-        """Run window adaptation in stages, stopping when mass matrix and step size converge."""
-        prev_mass = None
-        prev_step = None
-        position = initial_position
-        total_steps = 0
-
-        # Use provided initial mass matrix only for the first stage; subsequent
-        # stages warm-start from the previous stage's adapted mass matrix.
-        current_imm = initial_inverse_mass_matrix
-
-        while total_steps < self.adaptive_warmup_max_steps:
-            rng_key, sub_key = jax.random.split(rng_key)
-
-            warmup_kwargs = dict(
-                is_mass_matrix_diagonal=self.diagonal_mass_matrix,
-                progress_bar=False,
-                initial_step_size=self.step_size_init,
-                target_acceptance_rate=self.target_acceptance_rate,
-            )
-            if current_imm is not None:
-                warmup_kwargs["initial_inverse_mass_matrix"] = current_imm
-
-            warmup = blackjax.window_adaptation(blackjax.nuts, jlp, **warmup_kwargs)
-            (state, parameters), _ = warmup.run(
-                sub_key, position, self.adaptive_warmup_stage_steps
-            )
-            current_imm = None  # Only use initial guess for first stage
-
-            mass = parameters["inverse_mass_matrix"]
-            step = parameters["step_size"]
-            total_steps += self.adaptive_warmup_stage_steps
-
-            if prev_mass is not None and total_steps >= self.adaptive_warmup_min_steps:
-                mass_change = float(
-                    jnp.max(jnp.abs(mass - prev_mass) / (jnp.abs(prev_mass) + 1e-10))
-                )
-                step_change = float(
-                    jnp.abs(step - prev_step) / (jnp.abs(prev_step) + 1e-10)
-                )
-
-                print(
-                    f"Adaptive warmup step {total_steps}: "
-                    f"max_rel_mass_change={mass_change:.4f}, "
-                    f"rel_step_change={step_change:.4f}",
-                    flush=True,
-                )
-
-                if (
-                    mass_change < self.adaptive_warmup_rtol_mass
-                    and step_change < self.adaptive_warmup_rtol_step
-                ):
-                    print(
-                        f"Warmup converged after {total_steps} steps", flush=True
-                    )
-                    return state, parameters
-
-            prev_mass = mass
-            prev_step = step
-            position = state.position
-
-        print(
-            f"Warmup reached max {self.adaptive_warmup_max_steps} steps "
-            f"without convergence",
-            flush=True,
+        self.chains_per_device = int(c.get("chains_per_device", 1))
+        if self.chains_per_device < 1:
+            raise ValueError("chains_per_device must be >= 1")
+        self.seeding_config = SeedingConfig.from_sampler_config(c, sampler="NUTS")
+        self.warmup_config = replace(
+            WarmupConfig.from_sampler_config(c, sampler="NUTS"),
+            restart=self.restart,
         )
-        return state, parameters
+        # Mutable: the pooled warmup can cap it from the observed depth
+        # distribution (see WarmupResult.max_num_doublings).
+        self.max_num_doublings = self.warmup_config.sampling_max_num_doublings
 
-    def _meads_warmup(self, jlp, rng_key, initial_positions):
-        """Use MEADS cross-chain adaptation to estimate mass matrix, then
-        tune NUTS step size via dual averaging."""
-        from blackjax.adaptation.step_size import dual_averaging_adaptation
+    def __getattr__(self, name):
+        """Forward the deprecated flat option attributes to their configs."""
+        for attrs, cfg_name in (
+            (LEGACY_ATTRS, "warmup_config"),
+            (SEEDING_ATTRS, "seeding_config"),
+        ):
+            field = attrs.get(name)
+            if field is not None and cfg_name in self.__dict__:
+                return getattr(self.__dict__[cfg_name], field)
+        raise AttributeError(name)
 
-        n_chains = initial_positions.shape[0]
 
-        print(
-            f"Running MEADS warmup ({self.meads_warmup_steps} steps, "
-            f"{n_chains} chains)",
-            flush=True,
-        )
-
-        meads = blackjax.meads_adaptation(jlp, num_chains=n_chains)
-        rng_key, meads_key = jax.random.split(rng_key)
-        (meads_states, meads_params), meads_info = meads.run(
-            meads_key, initial_positions, self.meads_warmup_steps
-        )
-
-        # Log convergence of the mass matrix estimate
-        position_sigmas = meads_info.adaptation_state.position_sigma
-        for i in range(1, self.meads_warmup_steps):
-            prev = position_sigmas[i - 1]
-            curr = position_sigmas[i]
-            rel_change = float(
-                jnp.max(jnp.abs(curr - prev) / (jnp.abs(prev) + 1e-10))
-            )
-            print(
-                f"  MEADS step {i}: max rel change in position_sigma = "
-                f"{rel_change:.6f}",
-                flush=True,
-            )
-
-        # Use MEADS position_sigma^2 as diagonal inverse mass matrix
-        position_sigma = meads_params["momentum_inverse_scale"]
-        inverse_mass_matrix = position_sigma**2
-
-        print(
-            f"MEADS complete. Tuning NUTS step size "
-            f"({self.meads_step_size_tuning_steps} steps)",
-            flush=True,
-        )
-
-        # Tune NUTS step size via dual averaging on a single chain
-        nuts = blackjax.nuts(
-            jlp,
-            inverse_mass_matrix=inverse_mass_matrix,
-            step_size=float(meads_params["step_size"]),
-        )
-
-        da_init, da_update, da_final = dual_averaging_adaptation(
-            target=self.target_acceptance_rate
-        )
-        da_state = da_init(float(meads_params["step_size"]))
-
-        # Use the first chain's final position
-        state = nuts.init(meads_states.position[0])
-
-        for i in range(self.meads_step_size_tuning_steps):
-            rng_key, step_key = jax.random.split(rng_key)
-            nuts_kernel = blackjax.nuts(
+    def _adaptive_window_warmup(self, jlp, rng_key, initial_position,
+                                initial_inverse_mass_matrix=None,
+                                output_file=None, initial_step_size=None):
+        """Staged window adaptation; see gholax.sampler.warmup.Warmup."""
+        result = Warmup(
+            self.warmup_config, self._warmup_host("nuts")
+        ).run_adaptive_window(
+            WarmupRequest(
                 jlp,
-                inverse_mass_matrix=inverse_mass_matrix,
-                step_size=jnp.exp(da_state.log_step_size),
+                initial_position,
+                rng_key,
+                initial_inverse_mass_matrix=initial_inverse_mass_matrix,
+                initial_step_size=initial_step_size,
+                output_file=output_file,
             )
-            state, info = nuts_kernel.step(step_key, state)
-            da_state = da_update(da_state, info.acceptance_rate)
-
-        step_size = da_final(da_state)
-        print(f"Tuned step size: {float(step_size):.6f}", flush=True)
-
-        parameters = {
-            "inverse_mass_matrix": inverse_mass_matrix,
-            "step_size": step_size,
+        )
+        return result.state, {
+            "inverse_mass_matrix": result.inverse_mass_matrix,
+            "step_size": result.step_size,
         }
-        return state, parameters
+
+
+    def _jitter_positions(self, rng_key, position, inverse_mass_matrix,
+                          n_chains, scale=0.5):
+        """Overdisperse chain starts around a single warmup endpoint using the
+        adapted mass matrix, so identical starts don't bias R-hat low."""
+        noise = jax.random.normal(rng_key, (n_chains, position.shape[0]))
+        if jnp.ndim(inverse_mass_matrix) == 2:
+            chol = jnp.linalg.cholesky(inverse_mass_matrix)
+            return position[None, :] + scale * noise @ chol.T
+        return (
+            position[None, :]
+            + jnp.sqrt(inverse_mass_matrix)[None, :] * scale * noise
+        )
+
+    _stuck_chains = staticmethod(stuck_chains)
+
+    def _pooled_window_warmup(self, jlp, rng_key, initial_positions,
+                              initial_inverse_mass_matrix=None,
+                              initial_step_size=None, output_file=None):
+        """Pooled cross-chain warmup; see gholax.sampler.warmup.Warmup."""
+        result = Warmup(
+            self.warmup_config, self._warmup_host("nuts")
+        ).run_pooled_window(
+            WarmupRequest(
+                jlp,
+                initial_positions,
+                rng_key,
+                initial_inverse_mass_matrix=initial_inverse_mass_matrix,
+                initial_step_size=initial_step_size,
+                output_file=output_file,
+            )
+        )
+        parameters = {
+            "inverse_mass_matrix": result.inverse_mass_matrix,
+            "step_size": result.step_size,
+            "warmup_converged": result.converged,
+            "warmup_calibrated": result.calibrated,
+        }
+        if result.max_num_doublings is not None:
+            self.max_num_doublings = result.max_num_doublings
+            parameters["max_num_doublings"] = result.max_num_doublings
+        return result.positions, parameters
+
 
     def run(self, model, output_file):
         """Run the NUTS sampler until convergence.
@@ -249,168 +179,187 @@ class NUTS(object):
         Returns:
             Tuple of (samples array, parameter names list).
         """
-        rng_key = jax.random.key(int(datetime.now().strftime("%Y%m%d%s")))
-        param_names = model.prior.params
-        prior = model.prior
+        from ..util.distributed import build_mesh, gather_to_host, is_io_process
 
-        sigmas = prior.get_prior_sigmas()
-        reference = prior.get_reference_values()
-        log_posterior = model.log_posterior_scaled_params
-
-        n_devices = jax.local_device_count()
-        keys = jax.random.split(rng_key, n_devices + 1)
-        rng_key = keys[0]
-        initial_keys = keys[1:]
-        initial_positions = jnp.array(
-            [
-                list(
-                    prior.initial_position(
-                        random_start=self.random_start, key=k, normalize=True
-                    ).values()
+        self.mesh = build_mesh(self._sampler_cfg)
+        if self.mesh is not None:
+            if self.warmup_algorithm == "pooled_window":
+                raise ValueError(
+                    "warmup_algorithm 'pooled_window' is not supported in "
+                    "mesh mode (n_chains/model_shards or multi-process "
+                    "runs); use 'adaptive_window' or 'window'."
                 )
-                for k in initial_keys
-            ]
-        )
+            if self.parallel_warmup:
+                raise ValueError(
+                    "parallel_warmup is not supported in mesh mode; warmup "
+                    "runs on a single chain with the model-sharded posterior."
+                )
 
-        jlp = jax.jit(log_posterior)
+        (
+            rng_key,
+            param_names,
+            prior,
+            sigmas,
+            reference,
+            log_posterior,
+            jlp,
+            n_devices,
+            initial_positions,
+        ) = self._init_chains(model)
+        n_chains = n_devices * self.chains_per_device
 
-        if (os.path.exists(f"{output_file}.nuts_warmup_parameters.json")) & (
+        kernel_lp = log_posterior if self.mesh is not None else jlp
+
+        if self.restart and _stale_warmup_parameters(output_file):
+            print(
+                "Ignoring nuts_warmup_parameters.json older than the "
+                "nuts_warmup_intermediate.json checkpoint (resuming the newer warmup)",
+                flush=True,
+            )
+        if (
             self.restart
+            and os.path.exists(f"{output_file}.nuts_warmup_parameters.json")
+            and not _stale_warmup_parameters(output_file)
         ):
             with open(f"{output_file}.nuts_warmup_parameters.json", "r") as fp:
                 warmup_parameters = json.load(fp)
 
+            if bool(warmup_parameters.get("sample_transform", False)) != bool(
+                getattr(getattr(self, "_prior", None), "transform", False)
+            ):
+                raise RuntimeError(
+                    "Restart refused: checkpointed chain and current config "
+                    "use different sampling coordinates (sample_transform "
+                    "mismatch). Finish the chain with its original "
+                    "convention or start fresh."
+                )
             inverse_mass_matrix = jnp.array(warmup_parameters["inverse_mass_matrix"])
             step_size = jnp.array(warmup_parameters["step_size"])
+            if self.max_num_doublings_auto and "max_num_doublings" in warmup_parameters:
+                self.max_num_doublings = int(warmup_parameters["max_num_doublings"])
             if os.path.exists(f"{output_file}.samples_chk.npy"):
-                samples = np.load(f"{output_file}.samples_chk.npy")
+                # The checkpoint stores physical-space samples, but the
+                # convergence loop accumulates normalized ones and rescales on
+                # every write. Convert back on load, otherwise each restart
+                # re-applies sigma/reference to the whole resumed prefix.
+                samples = self._from_physical(
+                    np.load(f"{output_file}.samples_chk.npy"),
+                    np.asarray(sigmas), np.asarray(reference),
+                )
                 log_density = np.load(f"{output_file}.logposterior_chk.npy")
-                initial_state = (samples[:, -1, :] - reference[None, :]) / sigmas[
-                    None, :
-                ]
+                initial_state = samples[:, -1, :]
             else:
                 samples = None
                 log_density = None
                 initial_state = jnp.array(warmup_parameters["initial_state"])
 
-            nuts = blackjax.nuts(
-                jlp, inverse_mass_matrix=inverse_mass_matrix, step_size=step_size
+            algo = blackjax.nuts(
+                kernel_lp, inverse_mass_matrix=inverse_mass_matrix,
+                step_size=step_size,
+                max_num_doublings=self.max_num_doublings,
             )
-            init_pmap = jax.pmap(nuts.init, in_axes=(0))
-            states = init_pmap(initial_state)
-            kernel = nuts.step
+            states = self._map_chains(algo.init)(jnp.asarray(initial_state))
+            kernel = algo.step
 
         else:
-            if self.minimize_and_sample:
-                # minimize negative log posterior
-                jnlp = jax.jit(lambda p: -log_posterior(p))
-                vgrad = jax.value_and_grad(jnlp)
-                solver = jaxopt.LBFGS(fun=vgrad, value_and_grad=True)
-
-                minimize_pmap = jax.pmap(solver.run, in_axes=(0))
-                print("Running minimization before sampling", flush=True)
-                res = minimize_pmap(initial_positions)
-                initial_positions = res.params
-                with open(f"{output_file}.minimization_results.json", "w") as fp:
-                    json.dump(
-                        {
-                            "x_opt": initial_positions.tolist(),
-                            "value": res.state.value.tolist(),
-                        },
-                        fp,
-                    )
-
-                chi2_ratio = res.state.value / np.min(res.state.value)
-                initial_positions_min = jnp.tile(
-                    initial_positions[jnp.argmin(res.state.value)], n_devices
-                ).reshape(n_devices, -1)
-                initial_positions = jnp.where(
-                    (chi2_ratio[:, None] - 1) > 0,
-                    initial_positions_min,
-                    initial_positions,
+            # pooled-window warmup checkpoint supersedes minimization and
+            # the mass-matrix seed: the warmup resume loads positions, metric
+            # and step size from it, so redoing the MAP search and Hessian
+            # would be pure waste (they only feed the warmup's cold start).
+            warm_ckpt = False
+            if (
+                self.restart
+                and self.warmup_algorithm == "pooled_window"
+                and os.path.exists(
+                    f"{output_file}.nuts_warmup_intermediate.json"
                 )
+            ):
+                with open(
+                    f"{output_file}.nuts_warmup_intermediate.json"
+                ) as fp:
+                    # "positions" marks a pooled-window checkpoint (other
+                    # warmup modes write different intermediates).
+                    warm_ckpt = "positions" in json.load(fp)
+            if warm_ckpt:
+                print(
+                    "Warmup checkpoint found; skipping minimization and "
+                    "mass matrix initialization",
+                    flush=True,
+                )
+            pf_key = None
+            if self.pathfinder_init and not warm_ckpt:
+                rng_key, pf_key = jax.random.split(rng_key)
+            # The split above stays here, not in the seeder: it fixes every
+            # downstream key and therefore the whole starting cloud.
+            seeds = self._seeder().run(
+                SeedingRequest(
+                    log_posterior,
+                    jlp,
+                    initial_positions,
+                    n_chains,
+                    rng_key=rng_key,
+                    pathfinder_key=pf_key,
+                    output_file=output_file,
+                    skip_minimize=warm_ckpt,
+                    skip_metric=warm_ckpt,
+                )
+            )
+            initial_positions = seeds.positions
+            init_imm = seeds.inverse_mass_matrix
+            self._pathfinder_imm = seeds.pathfinder_imm
 
-            if self.mass_matrix_init == "hessian":
-                print("Estimating initial mass matrix from Hessian diagonal...", flush=True)
-                init_imm = self._hessian_mass_matrix(jlp, initial_positions[0])
-                print(f"  imm range: [{float(init_imm.min()):.4f}, {float(init_imm.max()):.4f}]", flush=True)
-            else:
-                init_imm = None
+            init_step = None
+            if self.warmup_init_file is not None:
+                with open(self.warmup_init_file, "r") as fp:
+                    winit = json.load(fp)
+                init_imm = jnp.array(winit["inverse_mass_matrix"])
+                init_step = float(np.asarray(winit["step_size"]))
+                print(
+                    f"Warm-starting adaptation from {self.warmup_init_file}",
+                    flush=True,
+                )
 
             if self.warmup_algorithm == "adaptive_window":
                 print("Running adaptive window warmup", flush=True)
-                keys = jax.random.split(rng_key, 2)
+                keys = jax.random.split(rng_key, 3)
                 rng_key = keys[0]
                 state, parameters = self._adaptive_window_warmup(
                     jlp, keys[1], initial_positions[0],
                     initial_inverse_mass_matrix=init_imm,
+                    output_file=output_file, initial_step_size=init_step,
                 )
                 inverse_mass_matrix = parameters["inverse_mass_matrix"]
                 step_size = parameters["step_size"]
-                states = jnp.tile(state.position, (n_devices, 1))
-                nuts = blackjax.nuts(
-                    jlp, inverse_mass_matrix=inverse_mass_matrix, step_size=step_size
+                states = self._jitter_positions(
+                    keys[2], state.position, inverse_mass_matrix, n_chains
                 )
-                init_pmap = jax.pmap(nuts.init, in_axes=(0))
-                states = init_pmap(states)
+                nuts = blackjax.nuts(
+                    kernel_lp, inverse_mass_matrix=inverse_mass_matrix, step_size=step_size,
+                    max_num_doublings=self.max_num_doublings,
+                )
+                states = self._map_chains(nuts.init)(states)
 
-            elif self.warmup_algorithm == "meads":
+            elif self.warmup_algorithm == "pooled_window":
+                # Free minimization/Hessian executables and their workspace;
+                # the single-device 128-chain warmup needs the full pool.
+                jax.clear_caches()
                 keys = jax.random.split(rng_key, 2)
                 rng_key = keys[0]
-                state, parameters = self._meads_warmup(
-                    jlp, keys[1], initial_positions
+                final_positions, parameters = self._pooled_window_warmup(
+                    jlp, keys[1], initial_positions,
+                    initial_inverse_mass_matrix=init_imm,
+                    initial_step_size=init_step, output_file=output_file,
                 )
                 inverse_mass_matrix = parameters["inverse_mass_matrix"]
                 step_size = parameters["step_size"]
-                states = jnp.tile(state.position, (n_devices, 1))
+                # Per-chain warmup endpoints are already distinct
+                # (overdispersed) starts; no jitter needed.
                 nuts = blackjax.nuts(
-                    jlp, inverse_mass_matrix=inverse_mass_matrix, step_size=step_size
+                    kernel_lp, inverse_mass_matrix=inverse_mass_matrix,
+                    step_size=step_size,
+                    max_num_doublings=self.max_num_doublings,
                 )
-                init_pmap = jax.pmap(nuts.init, in_axes=(0))
-                states = init_pmap(states)
-
-            elif self.pathfinder_adaptation:
-                print("Running pathfinder adaptation", flush=True)
-
-                warmup = blackjax.pathfinder_adaptation(
-                    blackjax.nuts,
-                    jlp,
-                )
-                if self.parallel_warmup:
-                    warmup_pmap = jax.pmap(
-                        warmup.run, in_axes=(0, 0, None), static_broadcasted_argnums=2
-                    )
-                    keys = jax.random.split(rng_key, 1 + n_devices)
-                    rng_key = keys[0]
-                    warmup_keys = keys[1:]
-                    (states, parameters), _ = warmup_pmap(
-                        warmup_keys, initial_positions, self.n_steps_warmup
-                    )
-                    inverse_mass_matrix = jnp.median(
-                        parameters["inverse_mass_matrix"], axis=0
-                    )
-                    step_size = jnp.median(parameters["step_size"], axis=0)
-
-                    with open(f"{output_file}.nuts_inverse_mass_matrix.json", "w") as fp:
-                        json.dump(parameters["inverse_mass_matrix"].tolist(), fp)
-
-                    with open(f"{output_file}.nuts_step_size.json", "w") as fp:
-                        json.dump(parameters["step_size"].tolist(), fp)
-                else:
-                    keys = jax.random.split(rng_key, 2)
-                    (state, parameters), _ = warmup.run(
-                        keys[0],
-                        initial_positions[0],
-                        self.n_steps_warmup,
-                    )
-                    inverse_mass_matrix = parameters["inverse_mass_matrix"]
-                    step_size = parameters["step_size"]
-                    states = jnp.tile(state.position, (n_devices, 1))
-                    nuts = blackjax.nuts(
-                        jlp, inverse_mass_matrix=inverse_mass_matrix, step_size=step_size
-                    )
-                    init_pmap = jax.pmap(nuts.init, in_axes=(0))
-                    states = init_pmap(states)
+                states = self._map_chains(nuts.init)(final_positions)
 
             else:
                 print("Running window adaptation", flush=True)
@@ -418,22 +367,25 @@ class NUTS(object):
                 warmup_kwargs = dict(
                     is_mass_matrix_diagonal=self.diagonal_mass_matrix,
                     progress_bar=False,
-                    initial_step_size=self.step_size_init,
+                    initial_step_size=(
+                        init_step if init_step is not None else self.step_size_init
+                    ),
                     target_acceptance_rate=self.target_acceptance_rate,
                 )
-                if init_imm is not None:
-                    warmup_kwargs["initial_inverse_mass_matrix"] = init_imm
+
+                warmup_kwargs["initial_inverse_mass_matrix"] = init_imm
 
                 warmup = blackjax.window_adaptation(blackjax.nuts, jlp, **warmup_kwargs)
                 if self.parallel_warmup:
-                    warmup_pmap = jax.pmap(
-                        warmup.run, in_axes=(0, 0, None), static_broadcasted_argnums=2
+                    warmup_map = self._map_chains(
+                        lambda k, p: warmup.run(k, p, self.n_steps_warmup),
+                        chain_axes=(0, 0),
                     )
-                    keys = jax.random.split(rng_key, 1 + n_devices)
+                    keys = jax.random.split(rng_key, 1 + n_chains)
                     rng_key = keys[0]
                     warmup_keys = keys[1:]
-                    (states, parameters), _ = warmup_pmap(
-                        warmup_keys, initial_positions, self.n_steps_warmup
+                    (states, parameters), _ = warmup_map(
+                        warmup_keys, initial_positions
                     )
                     inverse_mass_matrix = jnp.median(
                         parameters["inverse_mass_matrix"], axis=0
@@ -454,98 +406,80 @@ class NUTS(object):
                     )
                     inverse_mass_matrix = parameters["inverse_mass_matrix"]
                     step_size = parameters["step_size"]
-                    states = jnp.tile(state.position, (n_devices, 1))
-                    nuts = blackjax.nuts(
-                        jlp, inverse_mass_matrix=inverse_mass_matrix, step_size=step_size
+                    states = self._jitter_positions(
+                        keys[1], state.position, inverse_mass_matrix, n_chains
                     )
-                    init_pmap = jax.pmap(nuts.init, in_axes=(0))
-                    states = init_pmap(states)
+                    nuts = blackjax.nuts(
+                        kernel_lp, inverse_mass_matrix=inverse_mass_matrix, step_size=step_size,
+                        max_num_doublings=self.max_num_doublings,
+                    )
+                    states = self._map_chains(nuts.init)(states)
 
             warmup_parameters = {
+                "sample_transform": bool(
+                    getattr(getattr(self, "_prior", None), "transform", False)
+                ),
                 "inverse_mass_matrix": inverse_mass_matrix.tolist(),
                 "step_size": step_size.tolist(),
-                "initial_state": states.position.tolist(),
+                "initial_state": np.asarray(
+                    gather_to_host(states.position)
+                ).tolist(),
             }
+            if "max_num_doublings" in parameters:
+                warmup_parameters["max_num_doublings"] = int(
+                    parameters["max_num_doublings"]
+                )
+            if is_io_process():
+                with open(f"{output_file}.nuts_warmup_parameters.json", "w") as fp:
+                    json.dump(warmup_parameters, fp)
 
-            with open(f"{output_file}.nuts_warmup_parameters.json", "w") as fp:
-                json.dump(warmup_parameters, fp)
-
-            nuts = blackjax.nuts(
-                jlp, inverse_mass_matrix=inverse_mass_matrix, step_size=step_size
+            algo = blackjax.nuts(
+                kernel_lp, inverse_mass_matrix=inverse_mass_matrix,
+                step_size=step_size,
+                max_num_doublings=self.max_num_doublings,
             )
-            kernel = nuts.step
+            kernel = algo.step
             samples = None
+            log_density = None
 
-        keys = jax.random.split(rng_key, 1 + n_devices)
+        keys = jax.random.split(rng_key, 1 + n_chains)
         rng_key = keys[0]
         sample_keys = keys[1:]
 
-        def inference_loop(rng_key, kernel, initial_state, num_samples):
-            @jax.jit
-            def one_step(state, rng_key):
-                state, _ = kernel(rng_key, state)
-                return state, state
+        if self.mesh is None:
+            pmap_inference_loop = self._make_pmap_inference_loop(
+                collect_info="stats"
+            )
+        else:
+            pmap_inference_loop = self._make_mesh_inference_loop(
+                kernel, self.n_steps_incr
+            )
 
-            keys = jax.random.split(rng_key, num_samples)
-            _, states = jax.lax.scan(one_step, initial_state, keys)
+        # Built once: rebuilding the mapped init every batch retriggers
+        # tracing/compilation (notably in mesh mode).
+        init_map = self._map_chains(algo.init)
 
-            return states
+        def reinit_fn(states, rng_key):
+            return init_map(states.position[:, -1, :]), rng_key
 
-        pmap_inference_loop = jax.pmap(
-            inference_loop,
-            in_axes=(0, None, 0, None),
-            static_broadcasted_argnums=(1, 3),
+        samples, log_density = self._run_convergence_loop(
+            pmap_inference_loop,
+            kernel,
+            states,
+            rng_key,
+            sample_keys,
+            samples,
+            log_density,
+            sigmas,
+            reference,
+            n_chains,
+            output_file,
+            reinit_fn,
+            max_divergence_rate=self.max_divergence_rate,
+            fail_on_divergence=self.fail_on_divergence,
+            divergence_check_min_steps=self.divergence_check_min_steps,
         )
 
-        print("Running inference loop", flush=True)
-        rhat = 10000
-
-        if samples is None:
-            counter = 0
-            n_steps = 0
-        else:
-            counter = 0
-            n_steps = samples.shape[1]
-
-        while (rhat - 1 > self.target_r_minus_one) | (n_steps < self.n_steps_min):
-            if counter == 0:
-                states = pmap_inference_loop(
-                    sample_keys, kernel, states, self.n_steps_incr
-                )
-            else:
-               init_pmap = jax.pmap(nuts.init, in_axes=(0))
-               states = init_pmap(states.position[:, -1, :])
-               states = pmap_inference_loop(
-                    sample_keys, kernel, states, self.n_steps_incr
-                )
-                
-            if (counter == 0) & (n_steps == 0):
-                samples = states.position
-                log_density = states.logdensity
-            else:
-                samples = np.hstack([samples, states.position])
-                log_density = np.hstack([log_density, states.logdensity])
-
-            rhat = jnp.mean(potential_scale_reduction(samples))
-
-            print(f"n_samples = {samples.shape[1]}", flush=True)
-            print(f"rhat - 1 = {rhat - 1}", flush=True)
-
-            counter += 1
-            np.save(
-                f"{output_file}.samples_chk.npy",
-                samples * sigmas[None, None, :] + reference[None, None, :],
-            )
-            np.save(f"{output_file}.logposterior_chk.npy", log_density)
-            n_steps = samples.shape[1]
-
-            keys = jax.random.split(rng_key, 1 + n_devices)
-            rng_key = keys[0]
-            sample_keys = keys[1:]
-            
-
-        samples = samples * sigmas[None, None, :] + reference[None, None, :]
-        samples = jnp.vstack([samples.T, log_density[..., None].T]).T
-        param_names.append("log_posterior")
-
-        return samples, param_names
+        return self._finalize_samples(
+            samples, log_density, sigmas, reference, param_names
+        )

@@ -37,6 +37,11 @@ class Emcee(object):
         Returns:
             Tuple of (samples array, parameter names list).
         """
+        if getattr(model.prior, "transform", False):
+            raise NotImplementedError(
+                "sample_transform is only supported by the NUTS and Minimize "
+                "samplers; disable it for this sampler."
+            )
         rng_key = jax.random.key(int(datetime.now().strftime("%Y%m%d%s")))
         param_names = model.prior.params
         prior = model.prior

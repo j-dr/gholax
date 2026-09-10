@@ -70,10 +70,6 @@ class LinearGrowthRate(LikelihoodModule):
 
         return state
 
-    def compute_analytic(state, params_values):
-        """Compute f(z) analytically (not implemented)."""
-        raise (NotImplementedError("Analytic f(z) calculation not implemented."))
-
     def compute(self, state, params_values):
         """Compute linear growth rate and write 'f_z', 'z_pk' to state."""
         if self.use_emulator:
@@ -81,6 +77,10 @@ class LinearGrowthRate(LikelihoodModule):
         elif self.use_boltzmann:
             state = self.compute_boltzmann(state, params_values)
         else:
-            state = self.compute_analytic(params_values)
+            # __init__ raises when neither backend is selected, so this is unreachable.
+            raise RuntimeError(
+                "LinearGrowthRate has no active backend; "
+                "set use_emulator or use_boltzmann."
+            )
 
         return state

@@ -4,20 +4,29 @@ from jax.scipy.integrate import trapezoid
 import jax.numpy as jnp
 import numpy as np
 import h5py as h5
-import warnings
 
 covariance_field_types = {
     "p_gg_ell": ["drsd", "drsd"],
 }
 
+# BAO dilation parameters appended to the data vector as scalar "spectra"
+# (one row per bin, ell=0). Their joint covariance with p_gg_ell must come
+# from the data file; they are exempt from scale cuts.
+ALPHA_TYPES = ("alpha_iso", "alpha_par", "alpha_perp")
 
 
 datavector_requires = {
     "p_gg_ell": ["z_fid", "chiz_fid", "hz_fid"],
+    "alpha_iso": ["rd_fid", "zeff_bao", "DV_fid_bao"],
+    "alpha_par": ["rd_fid", "zeff_bao", "Hz_fid_bao"],
+    "alpha_perp": ["rd_fid", "zeff_bao", "DM_fid_bao"],
 }
 
 field_types = {
     "p_gg_ell": ["d_zs", "d_zs"],
+    "alpha_iso": ["bao", "bao"],
+    "alpha_par": ["bao", "bao"],
+    "alpha_perp": ["bao", "bao"],
 }
 
 
@@ -28,6 +37,9 @@ class RedshiftSpaceMultipoles(DataVector):
     applying scale cuts per (bin, ell), computing Gaussian covariance
     matrices, and managing P_ell(k) window function matrices.
     """
+
+    _field_types = field_types
+    scale_cut_exempt_types = ALPHA_TYPES
 
     def __init__(
         self,
@@ -49,7 +61,8 @@ class RedshiftSpaceMultipoles(DataVector):
             spectrum_info: Dict of spectrum type configs (bins, cross-correlations).
             ells: Tuple of multipole orders to include (default: (0, 2, 4)).
             scale_cuts: Optional dict of (k_min, k_max) per bin pair and ell.
-            covariance_info: Optional dict with f_sky and noise for Gaussian covariance.
+            covariance_info: Optional dict with v_survey (survey volume) and
+                noise for the Gaussian P_ell(k) covariance.
             dummy_cov: If True, skip loading the covariance matrix.
             generate_data_vector: If True, generate a synthetic data vector.
             zmin: Minimum redshift for n(z) interpolation grid.
@@ -58,6 +71,10 @@ class RedshiftSpaceMultipoles(DataVector):
         """
         self.data_vector_info_filename = data_vector_info_filename
         self.spectrum_info = spectrum_info
+        # alphas are per-bin scalars; only auto "pairs" (bin, bin) make sense
+        for t in ALPHA_TYPES:
+            if t in self.spectrum_info:
+                self.spectrum_info[t].setdefault("use_cross", False)
         self.scale_cuts = scale_cuts
         self.spectrum_types = list(self.spectrum_info.keys())
         self.covariance_info = covariance_info
@@ -66,16 +83,31 @@ class RedshiftSpaceMultipoles(DataVector):
         self.ells = ells
         self.z = jnp.linspace(zmin, zmax, nz)
 
-    def load_data(self):
-        """Load observed data, requirements, scale cuts, and covariance."""
-        self.load_data_vector()
-        self.load_requirements()
-        self.setup_scale_cuts()
+    def _ells_for_scale_cuts(self):
+        """Scale cuts and masks are per multipole order for P_ell(k)."""
+        return self.ells
 
-        if not self.dummy_cov:
-            self.load_covariance_matrix()
-        else:
-            self.cinv = None
+    def _spectrum_key(self, i, j, ell=None):
+        """String key identifying a bin pair and multipole order."""
+        return "{}_{}_{}".format(i, j, ell)
+
+    def _first_block_meta(self, spectra, idx):
+        """Restrict per-bin metadata to the highest multipole block and
+        record ell_max."""
+        stype = spectra["spectrum_type"][idx][0].decode()
+        if stype in ALPHA_TYPES:
+            return idx, {}
+        ell_max = np.max(spectra["ell"][idx])
+        idx = idx & (spectra["ell"] == ell_max)
+        return idx, {"ell_max": ell_max}
+
+    def _covariance_match_fields(self):
+        """Covariance matching includes the multipole order."""
+        return super()._covariance_match_fields() + [("ell1", "ell")]
+
+    def _post_load_spectra(self, spectra):
+        # assumes same bins for zbin0 and zbin1
+        self.n_dbins = len(np.unique(spectra["zbin0"]))
 
     def save_data_vector(self, filename, model):
         """Save a model prediction as a new data vector HDF5 file.
@@ -114,7 +146,8 @@ class RedshiftSpaceMultipoles(DataVector):
                     for k_j in self.data_vector_info[k_i].keys():
                         grp.create_dataset(k_j, data=self.data_vector_info[k_i][k_j][:])
                 else:
-                    f.create_dataset(k_i, data=self.data_vector_info[k_i][:])
+                    ds = self.data_vector_info[k_i]
+                    f.create_dataset(k_i, data=ds[()] if ds.shape == () else ds[:])
 
     def generate_data(self):
         """Generate a synthetic data vector with k-binning and window matrices.
@@ -190,130 +223,6 @@ class RedshiftSpaceMultipoles(DataVector):
 
         return spectra
 
-    def process_spectrum_info(self, spectra):
-        """Parse spectrum metadata, apply bin selection, and populate spectrum_info.
-
-        Args:
-            spectra: Structured numpy array of spectra from the data file.
-        """
-        self.spectra = []
-        for t in self.spectrum_types:
-            n_bins0_tot = len(
-                np.unique(spectra[spectra["spectrum_type"] == t.encode('utf-8')]["zbin0"])
-            )
-            n_bins1_tot = len(
-                np.unique(spectra[spectra["spectrum_type"] == t.encode('utf-8')]["zbin1"])
-            )
-            if "use_cross" not in self.spectrum_info[t]:
-                self.spectrum_info[t]["use_cross"] = True
-
-            if "bins0" not in self.spectrum_info[t]:
-                warnings.warn(
-                    f"bins0 not specified for spectrum type {t}, using all bin0 in file",
-                    UserWarning,
-                )
-                self.spectrum_info[t]["bins0"] = np.unique(
-                    spectra[spectra["spectrum_type"] == t.encode('utf-8')]["zbin0"]
-                )
-
-            if "bins1" not in self.spectrum_info[t]:
-                warnings.warn(
-                    f"bins1 not specified for spectrum type {t}, using all bin1 in file",
-                    UserWarning,
-                )
-                self.spectrum_info[t]["bins1"] = np.unique(
-                    spectra[spectra["spectrum_type"] == t.encode('utf-8')]["zbin1"]
-                )
-
-            if not self.spectrum_info[t]["use_cross"]:
-                assert np.all(
-                    self.spectrum_info[t]["bins0"] == self.spectrum_info[t]["bins1"]
-                )
-
-            # get rid of bins we don't want
-            if self.spectrum_info[t]["use_cross"]:
-                idx = (
-                    (spectra["spectrum_type"] == t.encode('utf-8'))
-                    & (np.in1d(spectra["zbin0"], self.spectrum_info[t]["bins0"]))
-                    & (np.in1d(spectra["zbin1"], self.spectrum_info[t]["bins1"]))
-                )
-                self.spectra.append(spectra[idx])
-            else:
-                for ii, i in enumerate(self.spectrum_info[t]["bins0"]):
-                    if ii == 0:
-                        idx = (
-                            (spectra["spectrum_type"] == t.encode('utf-8'))
-                            & (spectra["zbin0"] == i)
-                            & (spectra["zbin1"] == i)
-                        )
-                    else:
-                        idx |= (
-                            (spectra["spectrum_type"] == t.encode('utf-8'))
-                            & (spectra["zbin0"] == i)
-                            & (spectra["zbin1"] == i)
-                        )
-
-                self.spectra.append(spectra[idx])
-
-            self.spectrum_info[t]["bin_pairs"] = []
-            for i in self.spectrum_info[t]["bins0"]:
-                if self.spectrum_info[t]["use_cross"]:
-                    for j in self.spectrum_info[t]["bins1"]:
-                        idx = (
-                            (spectra["spectrum_type"] == t.encode('utf-8'))
-                            & (spectra["zbin0"] == i)
-                            & (spectra["zbin1"] == j)
-                        )
-                        if np.sum(idx) > 0:
-                            self.spectrum_info[t]["bin_pairs"].append((i, j))
-                else:
-                    j = i
-                    idx = (
-                        (spectra["spectrum_type"] == t.encode('utf-8'))
-                        & (spectra["zbin0"] == i)
-                        & (spectra["zbin1"] == j)
-                    )
-                    if np.sum(idx) > 0:
-                        self.spectrum_info[t]["bin_pairs"].append((i, j))
-
-            idx = spectra["spectrum_type"] == t.encode('utf-8')
-            z0 = spectra["zbin0"][idx][0]
-            z1 = spectra["zbin1"][idx][0]
-            idx &= (spectra["zbin0"] == z0) & (spectra["zbin1"] == z1)
-            ell_max = np.max(spectra["ell"][idx])
-            idx &= spectra["ell"] == ell_max
-
-            sep_unmasked = spectra[idx]["separation"]
-            ndv_per_bin = np.sum(idx)
-
-            self.spectrum_info[t].update(
-                {
-                    "n_dv_per_bin": ndv_per_bin,
-                    "separation": sep_unmasked,
-                    "n_bins0_tot": n_bins0_tot,
-                    "n_bins1_tot": n_bins1_tot,
-                    "ell_max": ell_max,
-                }
-            )
-
-        self.spectra = np.hstack(self.spectra)
-        self.spectrum_values = jnp.array(self.spectra["value"])
-        self.n_dv = len(self.spectra)
-
-    def load_data_vector(self):
-        """Loads the required data."""
-
-        self.data_vector_info = h5.File(self.data_vector_info_filename, "r")
-
-        if not self.generate_data_vector:
-            spectra = self.data_vector_info['spectra'][:]
-        else:
-            spectra = self.generate_data()
-            
-        self.n_dbins = len(np.unique(spectra["zbin0"]))  # assumes same bins for zbin0 and zbin1
-
-        self.process_spectrum_info(spectra)
-
     def load_requirements(self):
         """Load fiducial cosmology, redshift distributions, and window matrices from the data file."""
         requirements = []
@@ -322,6 +231,17 @@ class RedshiftSpaceMultipoles(DataVector):
             for r in requirements:
                 if r in ["z_fid", "chiz_fid", "hz_fid"]:
                     self.spectrum_info[t][r] = jnp.array(self.data_vector_info[r][:])
+                elif t in ALPHA_TYPES:
+                    if r not in self.data_vector_info:
+                        raise ValueError(
+                            f"Data file is missing dataset '{r}' required by "
+                            f"BAO alpha spectrum type '{t}'"
+                        )
+                    ds = self.data_vector_info[r]
+                    if ds.shape == ():
+                        self.spectrum_info[t][r] = float(ds[()])
+                    else:
+                        self.spectrum_info[t][r] = jnp.array(ds[:])
 #                elif "nz" in r:
 #                    nz_ = self.data_vector_info[r][:]
 #
@@ -358,167 +278,25 @@ class RedshiftSpaceMultipoles(DataVector):
                 self.W[ij] = window_matrix_files[ij]
 
 
-    def setup_scale_cuts(self):
-        """Build per-bin-pair-ell scale cut masks and the combined scale_mask index array."""
-        # make scale cut mask
-        if self.scale_cuts is not None:
-            for t in self.spectrum_info:
-                if t in self.scale_cuts:
-                    scale_cut_dict = self.scale_cuts[t]
-                    scale_cut_mask = {}
-                    sep_unmasked = self.spectrum_info[t]["separation"]
-                    for ii, i in enumerate(self.spectrum_info[t]["bins0"]):
-                        if self.spectrum_info[t]["use_cross"]:
-                            if field_types[t][0] == field_types[t][1]:
-                                bins1 = self.spectrum_info[t]["bins1"][ii:]
-                            else:
-                                bins1 = self.spectrum_info[t]["bins1"][:]
-                            for jj, j in enumerate(bins1):
-                                for ell in self.ells:
-                                    try:
-                                        sep_min, sep_max = scale_cut_dict[
-                                            "{}_{}_{}".format(i, j, ell)
-                                        ]
-                                        mask = (sep_min <= sep_unmasked) & (
-                                            sep_unmasked <= sep_max
-                                        )
-                                        scale_cut_mask["{}_{}_{}".format(i, j, ell)] = (
-                                            mask
-                                        )
-                                    except:
-                                        raise ValueError(
-                                            "Scale cuts not provided for {} bin pair {},{}, ell {}".format(
-                                                t, i, j, ell
-                                            )
-                                        )
-                        else:
-                            for ell in self.ells:
-                                try:
-                                    sep_min, sep_max = scale_cut_dict[
-                                        "{}_{}_{}".format(i, i, ell)
-                                    ]
-                                    mask = (sep_min <= sep_unmasked) & (
-                                        sep_unmasked <= sep_max
-                                    )
-                                    scale_cut_mask["{}_{}_{}".format(i, i, ell)] = mask
-                                except:
-                                    raise ValueError(
-                                        "Scale cuts not provided for {} bin pair {},{}, ell {}".format(
-                                            t, i, i, ell
-                                        )
-                                    )
-
-                    self.spectrum_info[t]["scale_cut_masks"] = scale_cut_mask
-
-                else:
-                    raise ValueError("No scale cuts specified for {}".format(t))
-        else:
-            warnings.warn("No scale cuts specified for any spectra!", UserWarning)
-
-            for t in self.spectrum_info:
-                self.spectrum_info[t]["scale_cut_masks"] = None
-
-        zbin_counter = {}
-        scale_mask = []
-        for t0 in self.spectrum_types:
-            zbin_counter[t0] = []
-            for zb0 in self.spectrum_info[t0]["bins0"]:
-                for zb1 in self.spectrum_info[t0]["bins1"]:
-                    for ell in self.ells:
-                        if (zb0, zb1, ell) in zbin_counter[t0]:
-                            continue
-
-                        idxi = np.where(
-                            (self.spectra["spectrum_type"] == t0.encode('utf-8'))
-                            & (self.spectra["zbin0"] == zb0)
-                            & (self.spectra["zbin1"] == zb1)
-                            & (self.spectra["ell"] == ell)
-                        )[0]
-
-                        try:
-                            start_idx = np.min(idxi)
-                        except ValueError as e:
-                            continue
-
-                        # mask scales
-                        if self.spectrum_info[t0]["scale_cut_masks"] is not None:
-                            mask_i = np.where(
-                                self.spectrum_info[t0]["scale_cut_masks"][
-                                    "{}_{}_{}".format(zb0, zb1, ell)
-                                ]
-                            )[0]
-                        else:
-                            mask_i = np.arange(self.spectrum_info[t0]["n_dv_per_bin"])
-
-                        scale_mask.extend((mask_i + start_idx).tolist())
-
-        self.scale_mask = jnp.unique(jnp.array(scale_mask))
-        self.scale_mask.sort()
-        self.n_dv_masked = len(self.scale_mask)
-        self.measured_spectra = jnp.array(self.spectra["value"])
-
-    def load_covariance_matrix(self):
-        """Load the covariance matrix from the data file and compute its inverse.
-
-        Matches covariance entries to the current spectrum ordering (including
-        multipole index) and applies scale-cut masking before inverting.
-        """
-        cov_raw = self.data_vector_info['covariance'][:]
-        if len(cov_raw.shape)<2:
-            cov_raw = cov_raw.reshape(
-                int(cov_raw.shape[0] ** 0.5), int(cov_raw.shape[0] ** 0.5))
-
-        cov_slice = cov_raw[0, :]
-        idxi = np.zeros(len(self.spectra), dtype=int)
-
-        for i in range(self.n_dv):
-            idx = np.where(
-                (
-                    (cov_slice["spectrum_type1"] == self.spectra[i]["spectrum_type"])
-                    & (cov_slice["zbin10"] == self.spectra[i]["zbin0"])
-                    & (cov_slice["zbin11"] == self.spectra[i]["zbin1"])
-                    & (cov_slice["separation1"] == self.spectra[i]["separation"])
-                    & (cov_slice["ell1"] == self.spectra[i]["ell"])
-                )
-            )[0]
-            if len(idx) > 1:
-                raise (ValueError)
-            elif len(idx) < 1:
-                raise (
-                    ValueError(
-                        "No matching cov entry for {}, {}, {}, {}, {}".format(
-                            self.spectra[i]["spectrum_type"],
-                            self.spectra[i]["zbin0"],
-                            self.spectra[i]["zbin1"],
-                            self.spectra[i]["separation"],
-                            self.spectra[i]["ell"],
-                        )
-                    )
-                )
-
-            idxi[i] = idx[0]
-
-        covidx, covidy = np.meshgrid(idxi, idxi, indexing="ij")
-        self.cov = cov_raw[covidx, covidy]
-        assert np.allclose(self.cov["value"], self.cov["value"].T, 1e-12)
-
-        cov_scale_mask_i, cov_scale_mask_j = np.meshgrid(
-            self.scale_mask, self.scale_mask, indexing="ij"
-        )
-        self.cinv = jnp.linalg.inv(
-            self.cov["value"][cov_scale_mask_i, cov_scale_mask_j].reshape(
-                self.n_dv_masked, self.n_dv_masked
-            )
-        )
-
     def _ensure_covariance_info(self):
-        """Prompt interactively for any f_sky or noise terms missing from covariance_info."""
+        """Prompt interactively for any v_survey or noise terms missing from covariance_info."""
+        alpha_present = [t for t in self.spectrum_info if t in ALPHA_TYPES]
+        if alpha_present:
+            raise ValueError(
+                "The internal Gaussian covariance cannot be generated for BAO "
+                f"alpha types {alpha_present}; provide a joint covariance in "
+                "the data file instead."
+            )
+
         if self.covariance_info is None:
             self.covariance_info = {}
 
-        if "f_sky" not in self.covariance_info:
-            val = input("f_sky not found in config. Enter f_sky: ")
-            self.covariance_info["f_sky"] = float(val)
+        # P_ell(k) mode counting uses the survey volume, not a sky fraction.
+        if "v_survey" not in self.covariance_info:
+            val = input(
+                "v_survey (survey volume, [Mpc/h]^3) not found in config. Enter v_survey: "
+            )
+            self.covariance_info["v_survey"] = float(val)
 
         for t in self.spectrum_info:
             if t not in self.covariance_info:
@@ -547,21 +325,26 @@ class RedshiftSpaceMultipoles(DataVector):
         Returns:
             Array of variance values per k bin.
         """
-        c0 = f"c_{covariance_field_types[si][0]}{covariance_field_types[sj][0]}"
-        if c0 not in field_types:
-            c0 = f"c_{covariance_field_types[sj][0]}{covariance_field_types[si][0]}"
+        # Resolve the four constituent spectra of the disconnected (Gaussian)
+        # covariance term (P_ac P_bd + P_ad P_bc). Each entry pairs one field
+        # of spectrum ``si`` with one field of spectrum ``sj``; the spectrum
+        # that connects those two fields is found by inverting
+        # ``covariance_field_types`` (which maps a spectrum type to its two
+        # field labels). This replaces the "c_" + field-concatenation string
+        # trick from the 2pt (C_ell) class, whose key format assumes the
+        # spectrum type IS "c_<f0><f1>" and does not hold for P_ell(k) keys
+        # such as "p_gg_ell".
+        field_to_spectrum = {}
+        for stype, fields in covariance_field_types.items():
+            field_to_spectrum[(fields[0], fields[1])] = stype
+            field_to_spectrum[(fields[1], fields[0])] = stype
 
-        c1 = f"c_{covariance_field_types[si][1]}{covariance_field_types[sj][1]}"
-        if c1 not in field_types:
-            c1 = f"c_{covariance_field_types[sj][1]}{covariance_field_types[si][1]}"
-
-        c2 = f"c_{covariance_field_types[si][0]}{covariance_field_types[sj][1]}"
-        if c2 not in field_types:
-            c2 = f"c_{covariance_field_types[sj][1]}{covariance_field_types[si][0]}"
-
-        c3 = f"c_{covariance_field_types[si][1]}{covariance_field_types[sj][0]}"
-        if c3 not in field_types:
-            c3 = f"c_{covariance_field_types[sj][0]}{covariance_field_types[si][1]}"
+        fi0, fi1 = covariance_field_types[si]
+        fj0, fj1 = covariance_field_types[sj]
+        c0 = field_to_spectrum[(fi0, fj0)]
+        c1 = field_to_spectrum[(fi1, fj1)]
+        c2 = field_to_spectrum[(fi0, fj1)]
+        c3 = field_to_spectrum[(fi1, fj0)]
 
         spec_w_n = []
         for spec, za, zb, f0, f1 in zip(
@@ -581,21 +364,23 @@ class RedshiftSpaceMultipoles(DataVector):
                 covariance_field_types[sj][0],
             ],
         ):
+            # ``spectrum_type`` is stored as bytes (S10); encode the str key.
+            spec_key = spec.encode("utf-8") if isinstance(spec, str) else spec
             if (za, zb) in self.spectrum_info[spec]["bin_pairs"]:
                 c_w_n = self.spectra["value"][
-                    (self.spectra["spectrum_type"] == spec)
+                    (self.spectra["spectrum_type"] == spec_key)
                     & (self.spectra["zbin0"] == za)
                     & (self.spectra["zbin1"] == zb)
                 ] + float(self.covariance_info[spec][f"{za}_{zb}"]["noise"])
             elif covariance_field_types[spec][0] == covariance_field_types[spec][1]:
                 c_w_n = self.spectra["value"][
-                    (self.spectra["spectrum_type"] == spec)
+                    (self.spectra["spectrum_type"] == spec_key)
                     & (self.spectra["zbin0"] == zb)
                     & (self.spectra["zbin1"] == za)
                 ] + float(self.covariance_info[spec][f"{zb}_{za}"]["noise"])
             elif f1 == "d":
                 c_w_n = self.spectra["value"][
-                    (self.spectra["spectrum_type"] == spec)
+                    (self.spectra["spectrum_type"] == spec_key)
                     & (self.spectra["zbin0"] == zb)
                     & (self.spectra["zbin1"] == za)
                 ] + float(self.covariance_info[spec][f"{zb}_{za}"]["noise"])
@@ -606,16 +391,39 @@ class RedshiftSpaceMultipoles(DataVector):
 
             spec_w_n.append(c_w_n)
 
-        var = (
-            4
-            * np.pi
-            * (spec_w_n[0] * spec_w_n[1] + spec_w_n[2] * spec_w_n[3])
-            / (
-                float(self.covariance_info["f_sky"])
-                * self.delta_ell
-                * (2 * self.ell_eff)
-            )
+        # k value for every entry of the block being filled. Taken from
+        # spectrum ``si``'s own (z00, z01) rows so it aligns with the numerator
+        # arrays (same k-grid across all constituent spectra).
+        si_key = si.encode("utf-8") if isinstance(si, str) else si
+        k_block = self.spectra["separation"][
+            (self.spectra["spectrum_type"] == si_key)
+            & (self.spectra["zbin0"] == z00)
+            & (self.spectra["zbin1"] == z01)
+        ]
+
+        # Width of the k shells. Defined once in ``generate_data``; fall back to
+        # the ``ko_eff`` spacing if a data vector was loaded without it.
+        delta_k = getattr(self, "delta_k", None)
+        if delta_k is None:
+            delta_k = float(np.diff(np.asarray(self.ko_eff)).mean())
+
+        # Gaussian (disconnected) covariance of P_ell(k) bandpowers from mode
+        # counting in spherical k-shells:
+        #   N_modes(k) = V_survey * k^2 * delta_k / (2 * pi^2)
+        #   Var[P(k)]  = (P_ac P_bd + P_ad P_bc) / N_modes(k)
+        # For a single-tracer auto-spectrum the numerator reduces to
+        # 2 (P + 1/nbar)^2, i.e. the textbook 2 P^2 / N_modes result. This
+        # mirrors the 2pt (C_ell) class, where the denominator is likewise the
+        # number of independent modes in the bandpower
+        # (N_modes = f_sky * (2 ell + 1) * delta_ell).
+        n_modes = (
+            float(self.covariance_info["v_survey"])
+            * k_block**2
+            * delta_k
+            / (2.0 * np.pi**2)
         )
+
+        var = (spec_w_n[0] * spec_w_n[1] + spec_w_n[2] * spec_w_n[3]) / n_modes
 
         return var
 

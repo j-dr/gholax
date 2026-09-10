@@ -1,7 +1,7 @@
 import jax.numpy as jnp
 import numpy as np
-from jax import jacfwd, jit
-from copy import copy
+from jax import checkpoint, jacfwd, jit
+from jax.lax import scan
 import yaml
 from .likelihood import Likelihood
 
@@ -23,7 +23,14 @@ class GaussianLikelihood(Likelihood):
         self.analytic_marginalization = config.get("analytic_marginalization", True)
         self.include_am_priors = config.get("include_am_priors", True)
         self.include_am_determinant = config.get("include_am_determinant", True)
-        self.output_requirements = {}
+        # Rematerialize each pipeline module's intermediates in the backward
+        # pass instead of storing them: ~2x forward compute for peak gradient
+        # memory of roughly the largest single module. Requires the
+        # differentiable (emulator-mode) pipeline.
+        self.gradient_checkpointing = config.get("gradient_checkpointing", False)
+        # Set via set_model_sharding when the posterior runs inside a
+        # shard_map with a 'model' mesh axis; None = unsharded evaluation.
+        self.model_sharding = None
 
         if self.analytic_marginalization:
             self.linear_params_filename = config["linear_params_filename"]
@@ -52,123 +59,32 @@ class GaussianLikelihood(Likelihood):
             self.linear_params_stds = jnp.zeros(0)
             self.Nlin = 0
 
-        #set up other parameters
-        l_pars = copy(config["params"])
-        l_pars.update(shared_params) #include parameters shared between likelihoods, e.g. cosmology.
-        
-        self.fixed_params = {}
-        self.derived_params = {}
-        self.sampled_params = {}
-        
-        # if 'prior' not in params, fix it to value/ref/derived.
-        for p in l_pars:
-            if "prior" not in l_pars[p]:
-                if 'value' in l_pars[p]:
-                    self.fixed_params[p] = l_pars[p]["value"]
-                elif 'ref' in l_pars[p]:
-                    self.fixed_params[p] = l_pars[p]["ref"]
-                elif 'derived' in l_pars[p]:
-                    self.derived_params[p] = l_pars[p]["derived"]
-                else:
-                    raise (
-                                ValueError(
-                                    f"Must specify either a prior, ref/value or derived for parameter {p}."
-                                )
-                            )
-                if p in config['params']:
-                    config["params"].pop(p)
-            elif p not in config["params"]:
-                config["params"][p] = l_pars[p]
-        
-        self.sampled_params = config["params"]
-        self.free_params = copy(self.sampled_params)
+        # linear_params_dict must be set before super().__init__, which calls
+        # _augment_free_params() to inject the linear params into free_params.
+        super().__init__(config, shared_params)
+
+    def _augment_free_params(self):
+        """Add analytically marginalized linear nuisance params to free_params."""
         self.free_params.update(self.linear_params_dict)
-        
-        self.setup_params()
-        self.build_dependency_graph()
 
-    def setup_params(self):
-        """Parse derived parameters, build parameter index maps for pipeline modules."""
-        #parse arguments to derived parameters
-        for p in self.derived_params:
-            fstr = self.derived_params[p]
-            args = fstr.split(':')[0].split('lambda')[1]
-            args = [a.strip() for a in args.split(',')]
-            self.output_requirements[p] = args
-            self.derived_params[p] = eval(self.derived_params[p])
-            
-        self.fixed_params.update({"NA": 0.0})
-        self.n_free_params = len(self.free_params)
-        self.n_fixed_params = len(self.fixed_params)
+    def set_model_sharding(self, ctx):
+        """Enable (or disable, ctx=None) pair-axis sharding of the pipeline.
 
-        # ensure ordering is the same as when sampling
-        param_dict = dict(zip(self.free_params.keys(), jnp.zeros(self.n_free_params)))
-        _, param_dict = self.setup_state_params(param_dict)
+        Propagates a ModelShardingContext to every pipeline module that
+        declares `shards_pair_axis`. The likelihood itself only records the
+        context if at least one module shards (e.g. RSDPK pipelines have no
+        sharding modules and keep replicated evaluation).
 
-        self.free_param_names = list(param_dict.keys())
-
+        After enabling, the posterior may only be evaluated inside a
+        jax.shard_map over a mesh containing the context's axis.
+        """
+        any_sharded = False
         for module in self.likelihood_pipeline:
-            if hasattr(module, "indexed_params"):
-                if type(module.indexed_params) is dict:
-                    param_indices = {}
-                    for k in module.indexed_params:
-                        if type(module.indexed_params[k]) is list:
-                            param_indices[k] = []
-                            for l in range(len(module.indexed_params[k])):  # noqa: E741
-                                param_indices[k].append(
-                                    jnp.zeros(
-                                        module.indexed_params[k][l].shape, dtype=int
-                                    )
-                                )
-                                for i in range(param_indices[k][l].shape[0]):
-                                    for j in range(param_indices[k][l].shape[1]):
-                                        param_indices[k][l] = (
-                                            param_indices[k][l]
-                                            .at[i, j]
-                                            .set(
-                                                self.free_param_names.index(
-                                                    module.indexed_params[k][l][i, j]
-                                                )
-                                            )
-                                        )
+            if getattr(module, "shards_pair_axis", False):
+                module.model_sharding = ctx
+                any_sharded = ctx is not None
+        self.model_sharding = ctx if any_sharded else None
 
-                        else:
-                            param_indices[k] = jnp.zeros(
-                                module.indexed_params[k].shape, dtype=int
-                            )
-                            for i in range(param_indices[k].shape[0]):
-                                for j in range(param_indices[k].shape[1]):
-                                    param_indices[k] = (
-                                        param_indices[k]
-                                        .at[i, j]
-                                        .set(
-                                            self.free_param_names.index(
-                                                module.indexed_params[k][i, j]
-                                            )
-                                        )
-                                    )
-                else:
-                    param_indices = jnp.zeros(module.indexed_params.shape, dtype=int)
-                    for i in range(param_indices.shape[0]):
-                        for j in range(param_indices.shape[1]):
-                            param_indices = param_indices.at[i, j].set(
-                                self.free_param_names.index(module.indexed_params[i, j])
-                            )
-
-                module.param_indices = param_indices
-
-    def build_dependency_graph(self):
-        """Resolve transitive dependencies across all pipeline modules."""
-        state_dependencies = {}
-        for module in self.likelihood_pipeline:
-            state_dependencies.update(module.output_requirements)
-        
-        state_dependencies.update(self.output_requirements)
-
-        for module in self.likelihood_pipeline:
-            module.get_dependencies(state_dependencies)
-
-            
     def setup_training_requirements(self, required_data):
         """Determine pipeline modules and parameters needed for training data generation.
 
@@ -215,30 +131,8 @@ class GaussianLikelihood(Likelihood):
         self.training_pipeline = required_modules_all
         return required_modules_all, required_params_all
 
-    def setup_state_params(self, params_values):
-        """Merge fixed/derived params and sort, returning (state, param_dict)."""
-        for p in self.fixed_params:
-            params_values[p] = jnp.array(self.fixed_params[p])
-        
-        for p in self.derived_params:
-            params_values[p] = jnp.array(self.derived_params[p](*[params_values[arg] for arg in self.output_requirements[p]]))
-
-        # sort param dict by keys so that always have predetermined
-        # param ordering in all likelihood modules. Important
-        # because jit can change order otherwise.
-        param_dict = {}
-        sorted_keys = list(params_values.keys())
-        sorted_keys.sort()
-        for p in sorted_keys:
-            param_dict[p] = params_values[p]
-
-        state = {}
-        state["derived"] = {}
-
-        return state, param_dict
-
     def predict_model(
-        self, params, params_am, return_state=False, apply_scale_mask=True,
+        self, params, params_am=None, return_state=False, apply_scale_mask=True,
         apply_window=True,
     ):
         """Run the full pipeline and return the model prediction vector.
@@ -254,12 +148,16 @@ class GaussianLikelihood(Likelihood):
             Model prediction vector, or (prediction, state) if return_state.
         """
         params_all = params.copy()
-        params_all.update(params_am)
+        if params_am is not None:
+            params_all.update(params_am)
         state, params_dict = self.setup_state_params(params_all)
 
         pipeline = self.likelihood_pipeline if apply_window else self.likelihood_pipeline[:-1]
         for module in pipeline:
-            state = module.compute(state, params_dict)
+            if self.gradient_checkpointing:
+                state = checkpoint(module.compute)(state, params_dict)
+            else:
+                state = module.compute(state, params_dict)
 
         if apply_window:
             model = self.get_model_from_state(state)
@@ -284,11 +182,54 @@ class GaussianLikelihood(Likelihood):
 
         return state
 
-    def get_model_from_state(
-        self,
-        state,
-    ):
-        return
+    def _build_all_spectra(self, field_types):
+        """Build the per-spectrum-type index arrays used to gather the model
+        vector out of the pipeline state.
+
+        Args:
+            field_types: The field_types dict of the data-vector module the
+                subclass observes (they differ per data-vector type).
+        """
+        spectrum_info = self.observed_data_vector.spectrum_info
+        self.all_spectra = {}
+
+        for t in self.observed_data_vector.spectrum_types:
+            self.all_spectra[t] = []
+            for ii, i in enumerate(spectrum_info[t]["bins0"]):
+                if spectrum_info[t]["use_cross"]:
+                    if field_types[t][0] == field_types[t][1]:
+                        bins1 = spectrum_info[t]["bins1"][ii:]
+                    else:
+                        bins1 = spectrum_info[t]["bins1"][:]
+
+                    for j in bins1:
+                        self.all_spectra[t].append(
+                            i * spectrum_info[t]["n_bins1_tot"] + j
+                        )
+                else:
+                    self.all_spectra[t].append(i)
+            self.all_spectra[t] = jnp.array(self.all_spectra[t])
+
+    def get_model_from_state(self, state):
+        """Extract the windowed model vector from the pipeline state."""
+        dv = self.observed_data_vector
+        model = []
+        for t in dv.spectrum_types:
+            obs = state[f"{t}_obs"]
+            if self.model_sharding is not None:
+                # obs is this shard's block of the pair axis; reassemble the
+                # full axis (replicated) before gathering observed pairs.
+                obs = self.model_sharding.gather_full(
+                    obs, self.model_sharding.pair_counts[t]
+                )
+            def f(carry, i):
+                return (carry, obs[i])
+            _, m_t = scan(f, 0, self.all_spectra[t])
+            model.append(m_t.flatten())
+
+        model = jnp.hstack(model)
+
+        return model
 
     def get_model_from_state_no_window(self, state):
         """Extract the model prediction before window convolution (subclass override)."""
@@ -352,7 +293,7 @@ class GaussianLikelihood(Likelihood):
     def compute_noam(self, params):
         """Compute the log-likelihood without analytic marginalization."""
         params_am = {}
-        model = self.predict_model(params, params_am)
+        model, state = self.predict_model(params, params_am, return_state=True)
 
         diff = (
             self.observed_data_vector.measured_spectra[
@@ -362,7 +303,7 @@ class GaussianLikelihood(Likelihood):
         )
 
         chi2 = jnp.dot(diff, jnp.dot(self.observed_data_vector.cinv, diff))
-        lnL = -0.5 * chi2
+        lnL = -0.5 * chi2 + state.get("log_penalty", 0.0)
 
         return lnL
 

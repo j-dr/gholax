@@ -82,7 +82,7 @@ def load_model_samples(config_file, compute_sigma8=False, burn_in_frac=0,
                 samples_i = raw_samples[i, :, :]
                 if compute_sigma8 and s8_emu is not None:
                     x = _build_emu_input(samples_i, names, cosmo_params, like)
-                    om = (samples_i[:, names.index('omch2')] + samples_i[:, names.index('ombh2')]) / (samples_i[:, names.index('H0')] / 100) ** 2
+                    om = _omegam(samples_i, names, like)
                     sigma8 = s8_emu.predict(x)
                     s8 = sigma8[:, 0] * np.sqrt(om / 0.3)
                     samples_i = np.hstack([samples_i, om[:, None], sigma8, s8[:, None]])
@@ -112,7 +112,7 @@ def load_model_samples(config_file, compute_sigma8=False, burn_in_frac=0,
             samples_i = samples_flat
             if compute_sigma8 and s8_emu is not None:
                 x = _build_emu_input(samples_i, names, cosmo_params, like)
-                om = (samples_i[:, names.index('omch2')] + samples_i[:, names.index('ombh2')]) / (samples_i[:, names.index('H0')] / 100) ** 2
+                om = _omegam(samples_i, names, like)
                 sigma8 = s8_emu.predict(x)
                 s8 = sigma8[:, 0] * np.sqrt(om / 0.3)
                 samples_i = np.hstack([samples_i, om[:, None], sigma8, s8[:, None]])
@@ -134,15 +134,15 @@ def load_model_samples(config_file, compute_sigma8=False, burn_in_frac=0,
         with open(minimization_path, 'r') as fp:
             opt = json.load(fp)
 
-        x_bf = np.array(opt['x_opt'][0]) * sigmas + reference
+        x_bf = (np.array(opt['x_opt_physical'][0]) if 'x_opt_physical' in opt
+            else np.array(opt['x_opt'][0]) * sigmas + reference)
         best_fit = dict(zip(names, x_bf))
         best_fit['logposterior'] = opt['value'][0]
 
         if compute_sigma8 and s8_emu is not None:
             x = _build_emu_input(x_bf[None, :], names, cosmo_params, like)
             sigma8_val = float(s8_emu.predict(x)[0, 0])
-            omegam_val = float((best_fit['omch2'] + best_fit['ombh2'])
-                               / (best_fit['H0'] / 100) ** 2)
+            omegam_val = float(_omegam(x_bf[None, :], names, like)[0])
             best_fit['sigma8'] = sigma8_val
             best_fit['omegam'] = omegam_val
             best_fit['s8'] = sigma8_val * np.sqrt(omegam_val / 0.3)
@@ -162,6 +162,28 @@ def load_model_samples(config_file, compute_sigma8=False, burn_in_frac=0,
                 warmup_params = json.load(fp)
 
     return model, gds, best_fit, warmup_params
+
+
+def _omegam(samples_i, names, like):
+    """Compute Omega_m including the massive neutrino contribution.
+
+    omnuh2 = sum(m_nu) / 93.14 eV, with m_nu taken from the samples ('mnu' or
+    'logmnu') or from the likelihood's fixed params (default 0.06 eV).
+    """
+    n = len(samples_i)
+    if 'mnu' in names:
+        mnu = samples_i[:, names.index('mnu')]
+    elif 'logmnu' in names:
+        mnu = 10 ** samples_i[:, names.index('logmnu')]
+    else:
+        fixed = getattr(like, 'fixed_params', {})
+        if 'logmnu' in fixed:
+            mnu = np.ones(n) * 10 ** fixed['logmnu']
+        else:
+            mnu = np.ones(n) * fixed.get('mnu', 0.06)
+    omnuh2 = mnu / 93.14
+    omh2 = samples_i[:, names.index('omch2')] + samples_i[:, names.index('ombh2')] + omnuh2
+    return omh2 / (samples_i[:, names.index('H0')] / 100) ** 2
 
 
 def _build_emu_input(samples_i, names, cosmo_params, like):
@@ -226,7 +248,8 @@ def load_samples_checkpoint_nuts(output_file, model, likelihood_name, s8_module_
 
     with open(f'{output_file}.minimization_results.json', 'r') as fp:
         opt = json.load(fp)
-    samples_i = np.array(opt['x_opt'])*sigmas + reference
+    samples_i = (np.array(opt['x_opt_physical']) if 'x_opt_physical' in opt
+                 else np.array(opt['x_opt'])*sigmas + reference)
     like = model.likelihoods[likelihood_name]
     s8_emu = like.likelihood_pipeline[s8_module_index].emulator
     ipo = getattr(s8_emu, 'input_param_order', ['As', 'ns', 'H0', 'w', 'ombh2', 'omch2', 'logmnu', 'z'])
@@ -235,7 +258,7 @@ def load_samples_checkpoint_nuts(output_file, model, likelihood_name, s8_module_
 
     x = _build_emu_input(samples_i, names, cosmo_params, like)
 
-    om_bf = (samples_i[:, names.index('omch2')]+samples_i[:, names.index('ombh2')])/(samples_i[:, names.index('H0')]/100)**2
+    om_bf = _omegam(samples_i, names, like)
     sigma8_bf = s8_emu.predict(x)
 
     log_post = []
@@ -243,7 +266,7 @@ def load_samples_checkpoint_nuts(output_file, model, likelihood_name, s8_module_
         if i in ignore_chains: continue
         samples_i = samples[i,:,:]
         x = _build_emu_input(samples_i, names, cosmo_params, like)
-        om = (samples_i[:, names.index('omch2')]+samples_i[:, names.index('ombh2')])/(samples_i[:, names.index('H0')]/100)**2
+        om = _omegam(samples_i, names, like)
         sigma8 = s8_emu.predict(x)
         s8 = sigma8[:,0] * np.sqrt(om/0.3)
         log_post.append(log_posterior[i,:])
@@ -256,7 +279,7 @@ def load_samples_checkpoint_nuts(output_file, model, likelihood_name, s8_module_
     log_post = np.array(log_post)
     gds = MCSamples(samples=samples[:,:,:], names = names, labels=labels, ignore_rows=burn_in_frac, loglikes=log_post, settings={'smooth_scale_2D':smooth_scale, 'smooth_scale_1D':smooth_scale})
 
-    params_bf_chain = dict(zip(names, np.array(opt['x_opt'][0])*sigmas + reference))    
+    params_bf_chain = dict(zip(names, (np.array(opt['x_opt_physical'][0]) if 'x_opt_physical' in opt else np.array(opt['x_opt'][0])*sigmas + reference)))    
     params_bf_chain['sigma8'] = sigma8_bf[0]
     params_bf_chain['omegam'] = om_bf[0]
     params_bf_chain['s8'] = sigma8_bf[0] * np.sqrt(om_bf[0]/0.3)
@@ -295,7 +318,8 @@ def load_samples_checkpoint_mh(output_file, model, likelihood_name, s8_module_in
 
     with open(f'{output_file}.minimization_results.json', 'r') as fp:
         opt = json.load(fp)
-    samples_i = np.array(opt['x_opt'])*sigmas + reference
+    samples_i = (np.array(opt['x_opt_physical']) if 'x_opt_physical' in opt
+                 else np.array(opt['x_opt'])*sigmas + reference)
     like = model.likelihoods[likelihood_name]
     s8_emu = like.likelihood_pipeline[s8_module_index].emulator
     ipo = getattr(s8_emu, 'input_param_order', ['As', 'ns', 'H0', 'w', 'ombh2', 'omch2', 'logmnu', 'z'])
@@ -304,7 +328,7 @@ def load_samples_checkpoint_mh(output_file, model, likelihood_name, s8_module_in
 
     x = _build_emu_input(samples_i, names, cosmo_params, like)
 
-    om_bf = (samples_i[:, names.index('omch2')]+samples_i[:, names.index('ombh2')])/(samples_i[:, names.index('H0')]/100)**2
+    om_bf = _omegam(samples_i, names, like)
     sigma8_bf = s8_emu.predict(x)
 
     log_post = []
@@ -312,7 +336,7 @@ def load_samples_checkpoint_mh(output_file, model, likelihood_name, s8_module_in
         if i in ignore_chains: continue
         samples_i = samples[i,:,:]
         x = _build_emu_input(samples_i, names, cosmo_params, like)
-        om = (samples_i[:, names.index('omch2')]+samples_i[:, names.index('ombh2')])/(samples_i[:, names.index('H0')]/100)**2
+        om = _omegam(samples_i, names, like)
         sigma8 = s8_emu.predict(x)
         s8 = sigma8[:,0] * np.sqrt(om/0.3)
         samples_i = np.hstack([samples_i, om[:,None], sigma8, s8[:,None]])
@@ -324,7 +348,7 @@ def load_samples_checkpoint_mh(output_file, model, likelihood_name, s8_module_in
     log_post = np.array(log_post)
     gds = MCSamples(samples=samples[:,:,:], names = names, labels=labels, ignore_rows=burn_in_frac, settings={'smooth_scale_2D':smooth_scale, 'smooth_scale_1D':smooth_scale})
 
-    params_bf_chain = dict(zip(names, np.array(opt['x_opt'][0])*sigmas + reference))    
+    params_bf_chain = dict(zip(names, (np.array(opt['x_opt_physical'][0]) if 'x_opt_physical' in opt else np.array(opt['x_opt'][0])*sigmas + reference)))    
     params_bf_chain['sigma8'] = sigma8_bf[0]
     params_bf_chain['omegam'] = om_bf[0]
     params_bf_chain['s8'] = sigma8_bf[0] * np.sqrt(om_bf[0]/0.3)
@@ -364,7 +388,7 @@ def load_samples_emcee(output_file, model, likelihood_name, s8_module_index=1, s
 
     x = _build_emu_input(samples_i, names, cosmo_params, like)
 
-    om = (samples_i[:, names.index('omch2')]+samples_i[:, names.index('ombh2')])/(samples_i[:, names.index('H0')]/100)**2
+    om = _omegam(samples_i, names, like)
     sigma8 = s8_emu.predict(x)
     s8 = sigma8[:,0] * np.sqrt(om/0.3)    
     

@@ -1,12 +1,10 @@
-import json
-from datetime import datetime
-
-import jax
 import jax.numpy as jnp
-import jaxopt
+
+from .base import BaseSampler
+from .seeding import SeedingConfig
 
 
-class Minimize(object):
+class Minimize(BaseSampler):
     """L-BFGS minimizer for finding the maximum a posteriori (MAP) point.
 
     Uses jaxopt L-BFGS with parallel starts across available JAX devices
@@ -20,8 +18,12 @@ class Minimize(object):
             config: Full config dict containing 'sampler' -> 'Minimize' section.
         """
         c = config["sampler"]["Minimize"]
+        self._sampler_cfg = c
 
         self.random_start = c.get("random_start", True)
+        self.seeding_config = SeedingConfig.from_sampler_config(
+            c, sampler="Minimize"
+        )
 
     def run(self, model, output_file):
         """Run L-BFGS minimization across parallel chains.
@@ -34,50 +36,34 @@ class Minimize(object):
             Tuple of (samples array with shape (n_devices, 1, n_params+1),
             parameter names list).
         """
-        rng_key = jax.random.key(int(datetime.now().strftime("%Y%m%d%s")))
-        param_names = model.prior.params
-        prior = model.prior
+        from ..util.distributed import build_mesh
 
-        sigmas = prior.get_prior_sigmas()
-        reference = prior.get_reference_values()
-        log_posterior = model.log_posterior_scaled_params
+        self.mesh = build_mesh(self._sampler_cfg)
 
-        n_devices = jax.local_device_count()
-        keys = jax.random.split(rng_key, n_devices + 1)
-        rng_key = keys[0]
-        initial_keys = keys[1:]
-        initial_positions = jnp.array(
-            [
-                list(
-                    prior.initial_position(
-                        random_start=self.random_start, key=k, normalize=True
-                    ).values()
-                )
-                for k in initial_keys
-            ]
+        (
+            rng_key,
+            param_names,
+            prior,
+            sigmas,
+            reference,
+            log_posterior,
+            jlp,
+            n_devices,
+            initial_positions,
+        ) = self._init_chains(model, jit_logpost=False)
+
+        # mode="per_chain": every chain keeps its own optimum.  The shared
+        # "auto" mode would collapse identical starts onto one solve and
+        # re-tile poor chains onto the best one, which is exactly what a
+        # minimizer must not do.
+        seeder = self._seeder()
+        optimal_positions = seeder.minimize(
+            log_posterior, initial_positions, n_devices, output_file,
+            mode="per_chain",
         )
+        optimal_values = seeder.map_values
 
-        jnlp = jax.jit(lambda p: -log_posterior(p))
-        vgrad = jax.value_and_grad(jnlp)
-        solver = jaxopt.LBFGS(fun=vgrad, value_and_grad=True)
-
-        minimize_pmap = jax.pmap(solver.run, in_axes=(0))
-        print("Running minimization", flush=True)
-        res = minimize_pmap(initial_positions)
-
-        optimal_positions = res.params
-        optimal_values = res.state.value
-
-        with open(f"{output_file}.minimization_results.json", "w") as fp:
-            json.dump(
-                {
-                    "x_opt": optimal_positions.tolist(),
-                    "value": optimal_values.tolist(),
-                },
-                fp,
-            )
-
-        samples = optimal_positions * sigmas[None, :] + reference[None, :]
+        samples = prior.constrain(jnp.asarray(optimal_positions))
         log_density = -optimal_values
 
         samples = samples[:, None, :]

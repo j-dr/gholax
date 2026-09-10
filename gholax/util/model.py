@@ -1,4 +1,5 @@
 import argparse
+import warnings
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -11,6 +12,110 @@ from gholax import likelihood
 from gholax.sampler.priors import Prior
 
 jax.config.update("jax_default_matmul_precision", "float32")
+
+_EMU_ATTRS = ("emulator", "emulators", "sigma8_emu")
+
+
+def _iter_emulators(likelihoods):
+    """Yield every emulator object attached to a likelihood pipeline module."""
+    for like in likelihoods.values():
+        for module in getattr(like, "likelihood_pipeline", []):
+            for attr in _EMU_ATTRS:
+                obj = getattr(module, attr, None)
+                objs = obj.values() if isinstance(obj, dict) else (
+                    obj if isinstance(obj, (list, tuple)) else [obj])
+                for e in objs:
+                    if hasattr(e, "param_ranges"):
+                        yield module, e
+
+
+def _uses_spectral_equivalence(likelihoods):
+    return any(
+        type(m).__name__ == "SpectralEquivalence"
+        for like in likelihoods.values()
+        for m in getattr(like, "likelihood_pipeline", [])
+    )
+
+
+def _collect_emulator_ranges(likelihoods):
+    """Intersection of all emulators' training boxes: {name: (lo, hi)}.
+
+    With spectral equivalence active, wCDM emulators (no 'wa' input) are fed
+    the z-dependent w_equiv/As_equiv rather than the sampled w/As, so their
+    'w' and 'As' ranges do not constrain the sampled parameters (the clip in
+    predict still protects them)."""
+    ranges, unguarded = {}, []
+    spec_equiv = _uses_spectral_equivalence(likelihoods)
+    for module, emu in _iter_emulators(likelihoods):
+        if not emu.param_ranges:
+            unguarded.append(type(module).__name__)
+            continue
+        for k, (lo, hi) in emu.param_ranges.items():
+            if spec_equiv and "wa" not in emu.param_ranges and k in ("w", "As"):
+                continue
+            a, b = ranges.get(k, (-np.inf, np.inf))
+            ranges[k] = (max(a, lo), min(b, hi))
+    if unguarded:
+        warnings.warn(
+            "emulators without param_ranges (inputs are not clipped): "
+            + ", ".join(sorted(set(unguarded)))
+        )
+    return ranges
+
+
+def _sampled_range_edges(param_names, emulator_ranges):
+    """Map emulator ranges onto sampled parameters (logmnu <-> mnu via 10**).
+    Returns (idx, lo, hi) arrays or (None, None, None)."""
+    idx, lo, hi = [], [], []
+    for name, (a, b) in emulator_ranges.items():
+        if name == "z":
+            continue
+        if name in param_names:
+            idx.append(param_names.index(name)); lo.append(a); hi.append(b)
+        elif name == "logmnu" and "mnu" in param_names:
+            idx.append(param_names.index("mnu")); lo.append(10**a); hi.append(10**b)
+    if not idx:
+        return None, None, None
+    return jnp.asarray(idx), jnp.asarray(lo, dtype=jnp.float32), jnp.asarray(hi, dtype=jnp.float32)
+
+
+def _prior_mass_outside(pi, lo, hi):
+    """Fraction of a uniform or normal prior's mass outside [lo, hi]."""
+    if pi["dist"] == "uniform":
+        w = pi["max"] - pi["min"]
+        return (max(0.0, lo - pi["min"]) + max(0.0, pi["max"] - hi)) / w
+    if pi["dist"] == "norm":
+        from scipy.stats import norm
+        return 1.0 - (norm.cdf((hi - pi["loc"]) / pi["scale"])
+                      - norm.cdf((lo - pi["loc"]) / pi["scale"]))
+    return 0.0
+
+
+def _warn_prior_outside_ranges(prior, likelihoods, emulator_ranges, warn_frac):
+    """Warn for sampled priors with mass outside the emulator training box and
+    for fixed cosmological values outside it."""
+    for name, (lo, hi) in emulator_ranges.items():
+        if name == "z":
+            continue
+        cands = [(name, lo, hi)]
+        if name == "logmnu":
+            cands.append(("mnu", 10**lo, 10**hi))
+        for p, a, b in cands:
+            if p in prior.prior_info and p not in prior.joint_prior_params:
+                frac = _prior_mass_outside(prior.prior_info[p], a, b)
+                if frac > warn_frac:
+                    warnings.warn(
+                        f"prior for {p} ({prior.prior_info[p]['dist']}) has "
+                        f"{frac:.3g} of its mass outside the emulator training "
+                        f"range [{a:g}, {b:g}]; the range penalty will truncate it"
+                    )
+            for like in likelihoods.values():
+                v = getattr(like, "fixed_params", {}).get(p, None)
+                if v is not None and not (a <= v <= b):
+                    warnings.warn(
+                        f"fixed {p} = {v:g} is outside the emulator training "
+                        f"range [{a:g}, {b:g}]; emulator inputs will be clipped"
+                    )
 
 
 class Model:
@@ -88,9 +193,35 @@ class Model:
         linear_constraint_priors = cfg.get("linear_constraint_priors", {})
         self.prior = Prior(
             prior_info, derived_params=derived_params, fixed_params=fixed_params,
-            joint_priors=joint_priors, linear_constraint_priors=linear_constraint_priors
+            joint_priors=joint_priors, linear_constraint_priors=linear_constraint_priors,
+            transform=cfg.get("sample_transform", False),
         )
         self.likelihood_param_index = param_idx
+
+        # emulator training-box guard: smooth penalty outside the box (inputs
+        # are clipped inside the emulators) and a construction-time warning
+        self.emulator_range_penalty = bool(cfg.get("emulator_range_penalty", True))
+        self.emulator_range_softness = float(cfg.get("emulator_range_softness", 0.05))
+        self.emulator_ranges = _collect_emulator_ranges(self.likelihoods)
+        self._range_idx, self._range_lo, self._range_hi = _sampled_range_edges(
+            self.param_names, self.emulator_ranges
+        )
+        _warn_prior_outside_ranges(
+            self.prior, self.likelihoods, self.emulator_ranges,
+            float(cfg.get("emulator_range_warn_fraction", 1e-3)),
+        )
+
+    def _range_penalty(self, param_values):
+        """-0.5*((x-edge)/(soft*width))**2 outside the emulator box, 0 inside."""
+        if not self.emulator_range_penalty or self._range_idx is None:
+            return 0.0
+        x = param_values[self._range_idx]
+        w = self.emulator_range_softness * (self._range_hi - self._range_lo)
+        d = jnp.where(
+            x < self._range_lo, (x - self._range_lo) / w,
+            jnp.where(x > self._range_hi, (x - self._range_hi) / w, 0.0),
+        )
+        return -0.5 * jnp.sum(d * d)
 
     def log_posterior(self, param_values):
         """Compute the log-posterior for a parameter vector.
@@ -106,6 +237,7 @@ class Model:
         """
         param_dict_all = dict(zip(self.param_names, param_values))
         logp = self.prior.log_prior(param_dict_all)
+        logp += self._range_penalty(param_values)
 
         for lname in self.likelihoods:
             param_dict_like = dict(
@@ -130,11 +262,13 @@ class Model:
         Returns:
             Scalar log-posterior value (NaN mapped to -inf).
         """
-        param_values = (
-            param_values * self.prior.prior_sigmas + self.prior.reference_values
-        )  # rescale
+        y = param_values
+        # affine y*sigma + ref, or the logit map for uniform params when the
+        # prior transform is enabled (identical posterior, smooth geometry)
+        param_values = self.prior.constrain(y)
         param_dict_all = dict(zip(self.param_names, param_values))
         logp = self.prior.log_prior(param_dict_all)
+        logp += self._range_penalty(param_values)
 
         for lname in self.likelihoods:
             param_dict_like = dict(
@@ -145,7 +279,59 @@ class Model:
             )
             logp += self.likelihoods[lname].compute(param_dict_like)
 
+        logp = logp + self.prior.log_jacobian(y)
         return jnp.nan_to_num(logp, nan=-jnp.inf)
+
+    def set_model_sharding(self, ctx):
+        """Propagate a ModelShardingContext (or None) to all likelihoods."""
+        for like in self.likelihoods.values():
+            if hasattr(like, "set_model_sharding"):
+                like.set_model_sharding(ctx)
+
+    def sharded_log_posterior_scaled_params(self, mesh):
+        """Build a jitted scaled log-posterior sharded over the mesh 'model' axis.
+
+        The returned function takes the same (dim,) normalized parameter
+        vector as log_posterior_scaled_params and returns the same scalar,
+        but evaluates the Nx2PT projection stage with its bin-pair axis
+        partitioned across the mesh's 'model' axis (replicated across any
+        other mesh axes). With model_shards == 1 this is a plain jit.
+
+        Side effect: the model's likelihoods are switched to sharded mode, so
+        after calling this with model_shards > 1, only evaluate the posterior
+        through the returned function (or inside an equivalent shard_map).
+
+        Args:
+            mesh: jax.sharding.Mesh containing a 'model' axis (from
+                gholax.util.distributed.build_mesh).
+
+        Returns:
+            Jitted callable (dim,) -> scalar.
+        """
+        from jax.sharding import PartitionSpec as P
+
+        from .distributed import MODEL_AXIS, ModelShardingContext
+
+        n_shards = mesh.shape[MODEL_AXIS]
+        ctx = ModelShardingContext(MODEL_AXIS, n_shards) if n_shards > 1 else None
+        self.set_model_sharding(ctx)
+        if ctx is None:
+            return jax.jit(self.log_posterior_scaled_params)
+
+        # check_vma=False: jax 0.6.2's varying-axes checker cannot type two
+        # legal patterns used here (jacfwd inside the shard body for analytic
+        # marginalization, and searchsorted's while_loop mixing model-varying
+        # queries with unvaried grids in the interpolators) and its own error
+        # message prescribes disabling it. Numerical equivalence of value and
+        # gradient vs the unsharded path is covered by tests/test_model_sharding.py.
+        f = jax.shard_map(
+            self.log_posterior_scaled_params,
+            mesh=mesh,
+            in_specs=P(),
+            out_specs=P(),
+            check_vma=False,
+        )
+        return jax.jit(f)
 
     def log_likelihood(self, param_values):
         """Compute the log-likelihood (without the prior contribution).
@@ -248,12 +434,18 @@ class Model:
         return like.generate_training_data(params_like)
 
 
-def _minimize(model, output_base):
+def _minimize(model, output_base, init_params=None, maxiter=2000):
     """Find the maximum-a-posteriori parameters using L-BFGS optimization.
 
     Args:
         model: Model instance.
         output_base: Base path for output files (unused, kept for API compat).
+        init_params: Optional dict of natural-unit starting values (e.g. a
+            previous fit's ``best_fit_params``); parameters not listed start
+            at their reference values. Without it the search starts at the
+            reference point, which for a data vector far from it can run to
+            the prior bounds before jaxopt's iteration cap.
+        maxiter: L-BFGS iteration cap.
 
     Returns:
         Dict mapping parameter names to best-fit values in natural units.
@@ -267,9 +459,16 @@ def _minimize(model, output_base):
 
     jnlp = jax.jit(lambda p: -log_posterior(p))
     vgrad = jax.value_and_grad(jnlp)
-    solver = jaxopt.LBFGS(fun=vgrad, value_and_grad=True)
+    solver = jaxopt.LBFGS(fun=vgrad, value_and_grad=True, maxiter=maxiter)
 
     x0 = jnp.zeros(len(model.param_names))
+    if init_params:
+        theta0 = np.array([float(init_params.get(p, r))
+                           for p, r in zip(model.param_names, reference)])
+        x0 = jnp.asarray(prior.unconstrain(jnp.asarray(theta0)))
+        n_init = sum(p in init_params for p in model.param_names)
+        print(f"  warm start: {n_init}/{len(model.param_names)} params from init_params",
+              flush=True)
 
     # --- NaN diagnostics ---
     val0 = jnlp(x0)
@@ -291,11 +490,17 @@ def _minimize(model, output_base):
     print("Running minimization", flush=True)
     res = solver.run(x0)
 
-    x_opt_scaled = res.params
-    x_opt = x_opt_scaled * sigmas + reference
+    # invert the same map log_posterior_scaled_params uses (logit box for
+    # uniform params when the prior transform is on, affine otherwise)
+    x_opt = prior.constrain(res.params)
     params = dict(zip(model.param_names, x_opt))
 
-    print(f"Best-fit -logp = {float(res.state.value):.4f}", flush=True)
+    print(f"Best-fit -logp = {float(res.state.value):.4f} "
+          f"(L-BFGS iters {int(res.state.iter_num)}/{maxiter}, "
+          f"grad norm {float(res.state.error):.3g})", flush=True)
+    if int(res.state.iter_num) >= maxiter:
+        print("  WARNING: L-BFGS hit the iteration cap; the fit may not have converged",
+              flush=True)
     #for p in params:
     #    print(f"  {p} = {float(params[p]):.6g}", flush=True)
 
@@ -407,12 +612,15 @@ def save_model_pred():
                         help='Run LBFGS minimizer to find best-fit parameters')
     parser.add_argument('--params', metavar='FILE',
                         help='Load best-fit parameters from an HDF5 file')
+    parser.add_argument('--init-params', metavar='FILE',
+                        help='Warm-start --minimize from the best_fit_params of this HDF5 file')
     parser.add_argument('--gauss-cov', action='store_true',
                         help='Replace covariance with a Gaussian covariance evaluated '
                              'at the reference parameter point, then run best-fit minimization')
     parser.add_argument('--plot', action='store_true',
                         help='Save PDF plots of the best-fit model vs data for each likelihood')
     args = parser.parse_args()
+    init_params = _load_params_from_h5(args.init_params) if args.init_params else None
 
     with open(args.config, 'r') as fp:
         cfg = yaml.load(fp, Loader=yaml.SafeLoader)
@@ -454,7 +662,7 @@ def save_model_pred():
             )
             _apply_gaussian_covariance(like, None, model_spectra=cross_spectra)
 
-        params = _minimize(model, output_base)
+        params = _minimize(model, output_base, init_params=init_params)
     elif args.params is not None:
         params = _load_params_from_h5(args.params)
         ref = model.prior.get_reference_point()
@@ -463,7 +671,7 @@ def save_model_pred():
                 params[p] = ref[p]
         print(f"Loaded parameters from {args.params}")
     elif args.minimize:
-        params = _minimize(model, output_base)
+        params = _minimize(model, output_base, init_params=init_params)
     else:
         params = model.prior.get_reference_point()
 

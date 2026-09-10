@@ -7,56 +7,6 @@ import numpy as np
 import yaml
 
 
-class NNPowerSpectrumInterpolator(object):
-    """Wrapper providing a P(z, k) interface around a spectrum emulator and sigma8(z) emulator."""
-
-    def __init__(self, emu, sigma8z_emu, cosmo_params, nz_max=200, nonu=False):
-        """Initialize the interpolator.
-
-        Args:
-            emu: Emulator instance for the power spectrum.
-            sigma8z_emu: ScalarEmulator instance for sigma8(z).
-            cosmo_params: Array of cosmological parameters [As, ns, H0, w, ombh2, omch2, mnu].
-            nz_max: Maximum number of redshift bins to pre-allocate.
-            nonu: If True, skip log10 transform of neutrino mass parameter.
-        """
-        self.emu = emu
-        self.sigma8z_emu = sigma8z_emu
-        self.cosmo_params = jnp.copy(cosmo_params)
-        # set zero neutrino mass to 1e-2 eV (this is the boundary of our training data)
-        if not nonu:
-            if self.cosmo_params[-1] != 0:
-                self.cosmo_params = self.cosmo_params.at[-1].set(
-                    jnp.log10(self.cosmo_params[-1])
-                )
-            else:
-                self.cosmo_params = self.cosmo_params.at[-1].set(-2)
-
-        self.cparam_grid = jnp.zeros((nz_max, len(self.cosmo_params) + 1))
-        self.cparam_grid = self.cparam_grid.at[:, :-1].set(self.cosmo_params)
-
-    def P(self, z, k):
-        """Evaluate the power spectrum at given redshifts and wavenumbers.
-
-        Args:
-            z: Array of redshift values.
-            k: Array of wavenumber values in h/Mpc.
-
-        Returns:
-            2D array of shape (len(k), len(z)) with P(k, z) values.
-        """
-        self.cparam_grid = self.cparam_grid.at[: len(z), -1].set(z)
-        sigma8z = self.sigma8z_emu.predict(self.cparam_grid[: len(z)])[:, 0]
-        self.cparam_grid = self.cparam_grid.at[: len(z), -1].set(sigma8z)
-
-        k_emu, p = self.emu.predict(self.cparam_grid[: len(z)])
-        p_result = jnp.zeros((len(k), len(z)))
-        for i in range(len(z)):
-            p_result = p_result.at[:, i].set(jnp.interp(k, k_emu, p[:, i]))
-
-        return p_result
-
-
 def activation(x, alpha, beta):
     """
     Swish-like activation function with learnable parameters.
@@ -78,6 +28,186 @@ def activation(x, alpha, beta):
     )
 
 
+def _resolve_emu_config(config, abspath=False, data_dir=None,
+                        empty_data_dir_on_abspath=False):
+    """Resolve an emulator YAML config name/dict to (cfg dict, data_dir).
+
+    Relative config names are resolved against data_dir (default:
+    emu_weights/ next to this file). With abspath=True the config is opened
+    as given (or used directly if already a dict);
+    empty_data_dir_on_abspath reproduces MultiSpectrumEmulator's convention
+    of blanking data_dir so weight paths come verbatim from the config.
+    """
+    if not abspath:
+        if data_dir is None:
+            data_dir = "/".join(
+                [
+                    os.path.dirname(os.path.realpath(__file__)),
+                    "emu_weights",
+                ]
+            )
+
+            if type(config) is not dict:
+                config_abspath = "/".join(
+                    [
+                        data_dir,
+                        config,
+                    ]
+                )
+        else:
+            if type(config) is not dict:
+                config_abspath = "/".join(
+                    [
+                        data_dir,
+                        config,
+                    ]
+                )
+
+        with open(config_abspath, "r") as fp:
+            cfg = yaml.load(fp, Loader=yaml.SafeLoader)
+    else:
+        if type(config) is not dict:
+            config_abspath = config
+            with open(config_abspath, "r") as fp:
+                cfg = yaml.load(fp, Loader=yaml.SafeLoader)
+        else:
+            cfg = config
+
+        if empty_data_dir_on_abspath:
+            data_dir = ""
+
+    return cfg, data_dir
+
+
+def _load_h5_weights(filebase, scale_As=False, As_param_order=None,
+                     first_layer_param_order=None, param_idx=None):
+    """Load MLP weights from filebase.h5 into a dict of jnp arrays.
+
+    Args:
+        filebase: Path to the weight file (without .h5 extension).
+        scale_As: Multiply the As entry of param_mean/param_sigmas by 1e9.
+        As_param_order: Parameter order used to locate As (index 0 if None).
+        first_layer_param_order: When given, the first W layer's input width
+            is asserted against its length and the layer is reordered by
+            param_idx; param_mean/param_sigmas are reordered as well.
+        param_idx: Index list mapping the weights' parameter order to the
+            caller's input parameter order.
+    """
+    out = {}
+    with h5.File("{}.h5".format(filebase), "r") as weights:
+        for k in weights:
+            if k in ["W", "b", "alphas", "betas"]:
+                w = []
+                for i, wi in enumerate(weights[k]):
+                    w.append(weights[k][wi][:].astype(np.float32))
+                    if (first_layer_param_order is not None) & (i == 0) & (k == "W"):
+                        assert w[i].shape[0] == len(first_layer_param_order)
+                        w[i] = w[i][param_idx, :]
+                    w[i] = jnp.array(w[i]).astype(jnp.float32)
+
+            elif k in ["param_mean", "param_sigmas"]:
+                w = np.array(weights[k][f'{k}_0']).astype(np.float32)
+                if scale_As:
+                    if As_param_order is not None:
+                        w[As_param_order.index("As")] *= 1e9
+                    else:
+                        w[0] *= 1e9
+                if first_layer_param_order is not None:
+                    w = w[param_idx]
+
+                w = jnp.array(w).astype(jnp.float32)
+
+            else:
+                w = jnp.array(weights[k][f'{k}_0']).astype(jnp.float32)
+
+            out[k] = w
+    return out
+
+
+def _build_scan_stacks(W, b, alphas, betas):
+    """Pre-stack hidden layer weights for the scan-based forward pass.
+
+    Returns (use_scan, W_hidden, b_hidden, alphas_hidden, betas_hidden);
+    the stacks are None unless all middle hidden layers share one shape.
+    """
+    mid_W = W[1:-1]
+    use_scan = (
+        len(W) > 2
+        and len(mid_W) > 0
+        and all(w.shape == mid_W[0].shape for w in mid_W)
+    )
+    if not use_scan:
+        return False, None, None, None, None
+    return (
+        True,
+        jnp.stack(mid_W),
+        jnp.stack(b[1:-1]),
+        jnp.stack(alphas[1:]),
+        jnp.stack(betas[1:]),
+    )
+
+
+def _mlp_step(x, wandb):
+    """Single hidden layer step for use with jax.lax.scan."""
+    W_i, b_i, alpha_i, beta_i = wandb
+    x = x @ W_i + b_i
+    x = activation(x, alpha_i, beta_i)
+    return x, None
+
+
+def _hidden_forward(x, W, b, alphas, betas, use_scan, hidden_stacks):
+    """Run the input + hidden layers of the MLP (everything before the
+    linear output layer), via scan when the hidden stacks are available."""
+    if use_scan:
+        # First hidden layer
+        x = x @ W[0] + b[0]
+        x = activation(x, alphas[0], betas[0])
+
+        # Middle hidden layers via scan
+        x, _ = jax.lax.scan(_mlp_step, x, hidden_stacks)
+    else:
+        for i in range(len(W) - 1):
+            x = x @ W[i] + b[i]
+            x = activation(x, alphas[i], betas[i])
+    return x
+
+
+_DEFAULT_PARAM_ORDER = ["As", "ns", "H0", "w", "ombh2", "omch2", "logmnu", "z"]
+
+
+def _build_range_arrays(param_ranges, param_order):
+    """(lo, hi) arrays aligned with param_order (+-inf where a parameter has
+    no range), or (None, None) when param_ranges is empty.  Names not in
+    param_order raise, as does lo > hi."""
+    if not param_ranges:
+        return None, None
+    if param_order is None:
+        raise ValueError("param_ranges given but the input parameter order is unknown")
+    lo = np.full(len(param_order), -np.inf, dtype=np.float32)
+    hi = np.full(len(param_order), np.inf, dtype=np.float32)
+    for name, (a, b) in param_ranges.items():
+        if name not in param_order:
+            raise ValueError(
+                f"param_ranges key {name!r} not in emulator inputs {param_order}"
+            )
+        if a > b:
+            raise ValueError(f"param_ranges for {name!r}: lo {a} > hi {b}")
+        lo[param_order.index(name)] = a
+        hi[param_order.index(name)] = b
+    return jnp.asarray(lo), jnp.asarray(hi)
+
+
+def _clip_params(parameters, lo, hi):
+    """Clip emulator inputs to the training box when ranges are set."""
+    if lo is None:
+        return parameters
+    return jnp.clip(parameters, lo, hi)
+
+
+def _range_dict(param_ranges):
+    return {k: (float(v[0]), float(v[1])) for k, v in (param_ranges or {}).items()}
+
+
 class Emulator(object):
     """MLP emulator for single-spectrum power spectrum predictions.
 
@@ -85,7 +215,8 @@ class Emulator(object):
     loaded from HDF5 files.
     """
 
-    def __init__(self, filebase, kmin=1e-3, kmax=0.5, scale_As=True):
+    def __init__(self, filebase, kmin=1e-3, kmax=0.5, scale_As=True,
+                 param_ranges=None, param_order=None):
         """Initialize the emulator and load weights.
 
         Args:
@@ -93,12 +224,22 @@ class Emulator(object):
             kmin: Minimum wavenumber for the k grid.
             kmax: Maximum wavenumber for the k grid.
             scale_As: If True, scale As by 1e9 in normalization parameters.
+            param_ranges: Optional {name: [lo, hi]} training box; inputs are
+                clipped to it in predict.
+            param_order: Input parameter names (defaults to the 8-parameter
+                gholax order when the network has 8 inputs).
         """
         super(Emulator, self).__init__()
         self.scale_As = scale_As
         self.load(filebase)
 
         self.n_parameters = self.W[0].shape[0]
+        if param_order is None and self.n_parameters == len(_DEFAULT_PARAM_ORDER):
+            param_order = _DEFAULT_PARAM_ORDER
+        self.param_ranges = _range_dict(param_ranges)
+        self.param_lo, self.param_hi = _build_range_arrays(
+            self.param_ranges, param_order
+        )
         self.n_components = self.W[-1].shape[-1]
         self.n_layers = len(self.W)
         self.nk = self.sigmas.shape[0]
@@ -135,6 +276,7 @@ class Emulator(object):
         Returns:
             Array of predicted power spectrum values.
         """
+        parameters = _clip_params(parameters, self.param_lo, self.param_hi)
         x = (parameters - self.param_mean) / self.param_sigmas
 
         for i in range(self.n_layers - 1):
@@ -188,43 +330,10 @@ class MultiSpectrumEmulator(object):
         """
         super(MultiSpectrumEmulator, self).__init__()
 
-        if not abspath:
-            if data_dir is None:
-                data_dir = "/".join(
-                    [
-                        os.path.dirname(os.path.realpath(__file__)),
-                        "emu_weights",
-                    ]
-                )
-
-                if type(config) is not dict:
-                    config_abspath = "/".join(
-                        [
-                            os.path.dirname(os.path.realpath(__file__)),
-                            "emu_weights",
-                            config,
-                        ]
-                    )
-            else:
-                if type(config) is not dict:
-                    config_abspath = "/".join(
-                        [
-                            data_dir,
-                            config,
-                        ]
-                    )
-
-            with open(config_abspath, "r") as fp:
-                cfg = yaml.load(fp, Loader=yaml.SafeLoader)
-        else:
-            if type(config) is not dict:
-                config_abspath = config
-                with open(config_abspath, "r") as fp:
-                    cfg = yaml.load(fp, Loader=yaml.SafeLoader)
-            else:
-                cfg = config
-
-            data_dir = ""
+        cfg, data_dir = _resolve_emu_config(
+            config, abspath=abspath, data_dir=data_dir,
+            empty_data_dir_on_abspath=True,
+        )
 
         spec_base = cfg["spec_base"]
         s8z_base = cfg["s8z_base"]
@@ -242,6 +351,7 @@ class MultiSpectrumEmulator(object):
         ]
 
         self.input_param_order = input_param_order
+        self.param_ranges = _range_dict(cfg.get("param_ranges", None))
 
         if s8_tvar is None:
             self.s8_tvar = bool(cfg.get("s8_tvar", True))
@@ -270,6 +380,7 @@ class MultiSpectrumEmulator(object):
                 data_dir=data_dir,
                 input_param_order=input_param_order,
                 weight_param_order=self.param_order_d,
+                param_ranges=self.param_ranges,
             )
         else:
             self.sigma8z_emu = ScalarEmulator(
@@ -277,29 +388,27 @@ class MultiSpectrumEmulator(object):
                 scale_As=self.scale_As_d,
                 input_param_order=input_param_order,
                 weight_param_order=self.param_order_d,
+                param_ranges=self.param_ranges,
             )
 
         self.load_spec(f"{data_dir}/{spec_base}")
 
         self.n_parameters = self.W[0].shape[0]
+        self.param_lo, self.param_hi = _build_range_arrays(
+            self.param_ranges, self.input_param_order
+        )
         self.n_components = self.W[-1].shape[-1]
         self.n_layers = len(self.W)
         self.nk = self.sigmas.shape[0] // self.n_spec
         self.k = jnp.logspace(jnp.log10(kmin), jnp.log10(kmax), self.nk)
 
-        # Pre-stack hidden layer weights for scan-based forward pass
-        # (only if all middle hidden layers have the same shape)
-        mid_W = self.W[1:-1]
-        self._use_scan = (
-            self.n_layers > 2
-            and len(mid_W) > 0
-            and all(w.shape == mid_W[0].shape for w in mid_W)
-        )
-        if self._use_scan:
-            self._W_hidden = jnp.stack(mid_W)
-            self._b_hidden = jnp.stack(self.b[1:-1])
-            self._alphas_hidden = jnp.stack(self.alphas[1:])
-            self._betas_hidden = jnp.stack(self.betas[1:])
+        (
+            self._use_scan,
+            self._W_hidden,
+            self._b_hidden,
+            self._alphas_hidden,
+            self._betas_hidden,
+        ) = _build_scan_stacks(self.W, self.b, self.alphas, self.betas)
 
     def load_spec(self, filebase):
         """Load spectrum emulator weights from an HDF5 file.
@@ -307,33 +416,15 @@ class MultiSpectrumEmulator(object):
         Args:
             filebase: Path to the weight file (without .h5 extension).
         """
-        with h5.File("{}.h5".format(filebase), "r") as weights:
-            for k in weights:
-                if k in ["W", "b", "alphas", "betas"]:
-                    w = []
-                    for i, wi in enumerate(weights[k]):
-                        w.append(weights[k][wi][:].astype(np.float32))
-                        if (self.param_order_spec is not None) & (i == 0) & (k == "W"):
-                            assert w[i].shape[0] == len(self.param_order_spec)
-                            w[i] = w[i][self.param_idx_spec, :]
-                        w[i] = jnp.array(w[i]).astype(jnp.float32)
-
-                elif k in ["param_mean", "param_sigmas"]:
-                    w = np.array(weights[k][f'{k}_0']).astype(np.float32)
-                    if self.scale_As_spec:
-                        if self.param_order_spec is not None:
-                            w[self.param_order_spec.index("As")] *= 1e9
-                        else:
-                            w[0] *= 1e9
-                    if self.input_param_order is not None:
-                        w = w[self.param_idx_spec]
-
-                    w = jnp.array(w).astype(jnp.float32)
-
-                else:
-                    w = jnp.array(weights[k][f'{k}_0']).astype(jnp.float32)
-
-                setattr(self, k, w)
+        loaded = _load_h5_weights(
+            filebase,
+            scale_As=self.scale_As_spec,
+            As_param_order=self.param_order_spec,
+            first_layer_param_order=self.param_order_spec,
+            param_idx=self.param_idx_spec,
+        )
+        for k, w in loaded.items():
+            setattr(self, k, w)
 
     def predict(self, parameters):
         """Run the MLP forward pass to predict multiple spectra.
@@ -344,32 +435,16 @@ class MultiSpectrumEmulator(object):
         Returns:
             Array of shape (n_samples, n_spec, nk) with predicted spectra.
         """
+        parameters = _clip_params(parameters, self.param_lo, self.param_hi)
         if self.s8_tvar:
             s8z = self.sigma8z_emu.predict(parameters)[:, 0]
             parameters = parameters.at[:, -1].set(s8z)
 
         x = (parameters - self.param_mean) / self.param_sigmas
-
-        if self._use_scan:
-            # First hidden layer
-            x = x @ self.W[0] + self.b[0]
-            x = activation(x, self.alphas[0], self.betas[0])
-
-            # Middle hidden layers via scan
-            def _mlp_step(x, wandb):
-                W_i, b_i, alpha_i, beta_i = wandb
-                x = x @ W_i + b_i
-                x = activation(x, alpha_i, beta_i)
-                return x, None
-
-            x, _ = jax.lax.scan(
-                _mlp_step, x,
-                (self._W_hidden, self._b_hidden, self._alphas_hidden, self._betas_hidden),
-            )
-        else:
-            for i in range(self.n_layers - 1):
-                x = x @ self.W[i] + self.b[i]
-                x = activation(x, self.alphas[i], self.betas[i])
+        x = _hidden_forward(
+            x, self.W, self.b, self.alphas, self.betas, self._use_scan,
+            (self._W_hidden, self._b_hidden, self._alphas_hidden, self._betas_hidden),
+        )
 
         # Linear output layer
         x = ((x @ self.W[-1]) + self.b[-1]) * self.pc_sigmas[
@@ -397,6 +472,7 @@ class ScalarEmulator(object):
         data_dir=None,
         input_param_order=None,
         weight_param_order=None,
+        param_ranges=None,
     ):
         """Initialize the scalar emulator.
 
@@ -411,6 +487,8 @@ class ScalarEmulator(object):
                 Overrides config value when explicitly provided.
             weight_param_order: Ordering of parameters used during training.
                 Overrides config value when explicitly provided.
+            param_ranges: {name: [lo, hi]} training box; inputs are clipped
+                to it in predict. Overrides config value when provided.
         """
         super(ScalarEmulator, self).__init__()
 
@@ -420,6 +498,7 @@ class ScalarEmulator(object):
             filebase = cfg["filebase"]
             cfg_param_order = cfg.get("param_order", None)
             cfg_scale_As = cfg.get("scale_As", True)
+            cfg_param_ranges = cfg.get("param_ranges", None)
         elif isinstance(filebase_or_config, str) and filebase_or_config.endswith(".yaml"):
             cfg_path = filebase_or_config
             if data_dir is None:
@@ -433,10 +512,12 @@ class ScalarEmulator(object):
             filebase = cfg["filebase"]
             cfg_param_order = cfg.get("param_order", None)
             cfg_scale_As = cfg.get("scale_As", True)
+            cfg_param_ranges = cfg.get("param_ranges", None)
         else:
             filebase = filebase_or_config
             cfg_param_order = None
             cfg_scale_As = True
+            cfg_param_ranges = None
 
         # Apply config defaults, kwargs override
         self.scale_As = cfg_scale_As if scale_As is None else scale_As
@@ -458,20 +539,23 @@ class ScalarEmulator(object):
         self.n_parameters = self.W[0].shape[0]
         self.n_components = self.W[-1].shape[-1]
         self.n_layers = len(self.W)
-
-        # Pre-stack hidden layer weights for scan-based forward pass
-        # (only if all middle hidden layers have the same shape)
-        mid_W = self.W[1:-1]
-        self._use_scan = (
-            self.n_layers > 2
-            and len(mid_W) > 0
-            and all(w.shape == mid_W[0].shape for w in mid_W)
+        order = self.input_param_order or self.weight_param_order
+        if order is None and self.n_parameters == len(_DEFAULT_PARAM_ORDER):
+            order = _DEFAULT_PARAM_ORDER
+        self.param_ranges = _range_dict(
+            cfg_param_ranges if param_ranges is None else param_ranges
         )
-        if self._use_scan:
-            self._W_hidden = jnp.stack(mid_W)
-            self._b_hidden = jnp.stack(self.b[1:-1])
-            self._alphas_hidden = jnp.stack(self.alphas[1:])
-            self._betas_hidden = jnp.stack(self.betas[1:])
+        self.param_lo, self.param_hi = _build_range_arrays(
+            self.param_ranges, order
+        )
+
+        (
+            self._use_scan,
+            self._W_hidden,
+            self._b_hidden,
+            self._alphas_hidden,
+            self._betas_hidden,
+        ) = _build_scan_stacks(self.W, self.b, self.alphas, self.betas)
 
     def load(self, filebase, data_dir=None):
         """Load neural network weights from an HDF5 file.
@@ -496,33 +580,15 @@ class ScalarEmulator(object):
                 ]
             )
 
-        with h5.File("{}.h5".format(emu_abspath), "r") as weights:
-            for k in weights:
-                if k in ["W", "b", "alphas", "betas"]:
-                    w = []
-                    for i, wi in enumerate(weights[k]):
-                        w.append(weights[k][wi][:].astype(np.float32))
-                        if (self.input_param_order is not None) & (i == 0) & (k == "W"):
-                            assert w[i].shape[0] == len(self.input_param_order)
-                            w[i] = w[i][self.param_idx, :]
-                        w[i] = jnp.array(w[i]).astype(jnp.float32)
-
-                elif k in ["param_mean", "param_sigmas"]:
-                    w = np.array(weights[k][f'{k}_0']).astype(np.float32)
-                    if self.scale_As:
-                        if self.weight_param_order is not None:
-                            w[self.weight_param_order.index("As")] *= 1e9
-                        else:
-                            w[0] *= 1e9
-                    if self.input_param_order is not None:
-                        w = w[self.param_idx]
-
-                    w = jnp.array(w).astype(jnp.float32)
-
-                else:
-                    w = jnp.array(weights[k][f'{k}_0']).astype(jnp.float32)
-
-                setattr(self, k, w)
+        loaded = _load_h5_weights(
+            emu_abspath,
+            scale_As=self.scale_As,
+            As_param_order=self.weight_param_order,
+            first_layer_param_order=self.input_param_order,
+            param_idx=getattr(self, "param_idx", None),
+        )
+        for k, w in loaded.items():
+            setattr(self, k, w)
 
     def predict(self, parameters):
         """Run the MLP forward pass to predict a scalar quantity.
@@ -533,28 +599,12 @@ class ScalarEmulator(object):
         Returns:
             Array of predicted scalar values.
         """
+        parameters = _clip_params(parameters, self.param_lo, self.param_hi)
         x = (parameters - self.param_mean) / self.param_sigmas
-
-        if self._use_scan:
-            # First hidden layer
-            x = x @ self.W[0] + self.b[0]
-            x = activation(x, self.alphas[0], self.betas[0])
-
-            # Middle hidden layers via scan
-            def _mlp_step(x, wandb):
-                W_i, b_i, alpha_i, beta_i = wandb
-                x = x @ W_i + b_i
-                x = activation(x, alpha_i, beta_i)
-                return x, None
-
-            x, _ = jax.lax.scan(
-                _mlp_step, x,
-                (self._W_hidden, self._b_hidden, self._alphas_hidden, self._betas_hidden),
-            )
-        else:
-            for i in range(self.n_layers - 1):
-                x = x @ self.W[i] + self.b[i]
-                x = activation(x, self.alphas[i], self.betas[i])
+        x = _hidden_forward(
+            x, self.W, self.b, self.alphas, self.betas, self._use_scan,
+            (self._W_hidden, self._b_hidden, self._alphas_hidden, self._betas_hidden),
+        )
 
         # linear output layer
         x = ((x @ self.W[-1]) + self.b[-1]) * self.pc_sigmas + self.pc_mean
@@ -581,41 +631,9 @@ class PijEmulator(object):
             scale_As: If True, scale As by 1e9 for normalization.
             s8_tvar: If True, use sigma8(z) as a transformed variable.
         """
-        if not abspath:
-            if data_dir is None:
-                data_dir = "/".join(
-                    [
-                        os.path.dirname(os.path.realpath(__file__)),
-                        "emu_weights",
-                    ]
-                )
-
-                if type(config) is not dict:
-                    config_abspath = "/".join(
-                        [
-                            os.path.dirname(os.path.realpath(__file__)),
-                            "emu_weights",
-                            config,
-                        ]
-                    )
-            else:
-                if type(config) is not dict:
-                    config_abspath = "/".join(
-                        [
-                            data_dir,
-                            config,
-                        ]
-                    )
-
-            with open(config_abspath, "r") as fp:
-                cfg = yaml.load(fp, Loader=yaml.SafeLoader)
-        else:
-            if type(config) is not dict:
-                config_abspath = config
-                with open(config_abspath, "r") as fp:
-                    cfg = yaml.load(fp, Loader=yaml.SafeLoader)
-            else:
-                cfg = config
+        cfg, data_dir = _resolve_emu_config(
+            config, abspath=abspath, data_dir=data_dir
+        )
 
         pij_emu_bases = cfg["pij_bases"]
         s8z_base = cfg["s8z_base"]
@@ -626,6 +644,15 @@ class PijEmulator(object):
 
         self.input_param_order = cfg.get("param_order_spec", None)
         self.param_order_d = cfg.get("param_order_d", None)
+        self.param_ranges = _range_dict(cfg.get("param_ranges", None))
+        # input order used for range alignment only; input_param_order stays
+        # None for configs without param_order_spec (callers branch on it)
+        self.effective_param_order = (
+            self.input_param_order or self.param_order_d or _DEFAULT_PARAM_ORDER
+        )
+        self.param_lo, self.param_hi = _build_range_arrays(
+            self.param_ranges, self.effective_param_order
+        )
 
         self.pij_emus = []
 
@@ -637,19 +664,26 @@ class PijEmulator(object):
                         kmin=kmin,
                         kmax=kmax,
                         scale_As=scale_As,
+                        param_ranges=self.param_ranges,
+                        param_order=self.effective_param_order,
                     )
                 )
             else:
                 self.pij_emus.append(
-                    Emulator(pij_emu_bases[i], kmin=kmin, kmax=kmax, scale_As=scale_As)
+                    Emulator(pij_emu_bases[i], kmin=kmin, kmax=kmax, scale_As=scale_As,
+                             param_ranges=self.param_ranges,
+                             param_order=self.effective_param_order)
                 )
 
         if not abspath:
             self.sigma8z_emu = ScalarEmulator(
-                s8z_base, scale_As=scale_As, data_dir=data_dir
+                s8z_base, scale_As=scale_As, data_dir=data_dir,
+                param_ranges=self.param_ranges,
             )
         else:
-            self.sigma8z_emu = ScalarEmulator(s8z_base, scale_As=scale_As)
+            self.sigma8z_emu = ScalarEmulator(
+                s8z_base, scale_As=scale_As, param_ranges=self.param_ranges
+            )
 
         # Pre-stack weights across all n_spec emulators for scan-based predict.
         self._stacked_weights = self._stack_emulator_weights()
@@ -685,6 +719,7 @@ class PijEmulator(object):
         Returns:
             Array of shape (n_samples, n_spec, nk) with predicted P_ij spectra.
         """
+        parameters = _clip_params(parameters, self.param_lo, self.param_hi)
         if self.s8_tvar:
             s8z = self.sigma8z_emu.predict(parameters)[:, 0]
             parameters = parameters.at[:, -1].set(s8z)
@@ -731,14 +766,7 @@ def predict_scan(parameters, xs):
     x = x @ W_0 + b[0]
     x = activation(x, alphas[0], betas[0])
 
-    def MLP(x, wandb):
-        """Single hidden layer step for use with jax.lax.scan."""
-        W_i, b_i, alpha_i, beta_i = wandb
-        x = x @ W_i + b_i
-        x = activation(x, alpha_i, beta_i)
-        return x, None
-
-    x, _ = jax.lax.scan(MLP, x, (W, b[1:], alphas[1:], betas[1:]))
+    x, _ = jax.lax.scan(_mlp_step, x, (W, b[1:], alphas[1:], betas[1:]))
 
     # linear output layer
     x = ((x @ W_m1) + b_m1) * pc_sigmas + pc_mean

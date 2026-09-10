@@ -1,3 +1,4 @@
+import copy
 import warnings
 
 import jax.numpy as jnp
@@ -18,6 +19,8 @@ class LensingCounterterm(LikelihoodModule):
     Computes sigma_N_o integrals over the matter power spectrum above
     a cutoff scale and adds counterterm corrections to C_ell.
     """
+
+    shards_pair_axis = True
 
     def __init__(
         self,
@@ -77,8 +80,10 @@ class LensingCounterterm(LikelihoodModule):
                 )
 
         self.all_spectra = {}
+        # Instance copy: never mutate the module-level dict shared with Limber.
+        self.required_components = copy.deepcopy(required_components)
         if not self.magnification_x_ia:
-            required_components["c_dk"] = [
+            self.required_components["c_dk"] = [
                 (("w_d_dk", "w_k"), ("p_gm",0), "zeff_w_d_dk"),
                 (("w_mag_dk", "w_k"), ("p_mm",0), "z_limber"),
                 (("w_d_dk", "w_ia"), ("p_gi",0), "zeff_w_d_dk"),
@@ -101,7 +106,7 @@ class LensingCounterterm(LikelihoodModule):
 
         for t in self.spectrum_types:
             self.output_requirements[f"{t}_w_lensing_ct"] = []
-            for (w_i, w_j), (p, td_), zfield_ in required_components[t]:
+            for (w_i, w_j), (p, td_), zfield_ in self.required_components[t]:
                 if (w_i in self.lensing_kernels) & (w_j in self.lensing_kernels):
                     self.output_requirements[f"{t}_w_lensing_ct"].extend(
                         self.lensing_counterterms
@@ -159,6 +164,24 @@ class LensingCounterterm(LikelihoodModule):
             self._ct_dz = 0.01
             self._ct_eps = 0.001
             self._ct_z_all = self._ct_eps + jnp.arange(max_points) * self._ct_dz
+
+            # Sparse index set of the counterterm contraction: only terms
+            # with N == n + m + o contribute (order^3-ish entries instead of
+            # the order^4 dense tensor previously masked by where=).
+            ct_idx = np.array(
+                [
+                    (N, n, m, o)
+                    for N in range(ct_order)
+                    for n in range(ct_order)
+                    for m in range(ct_order)
+                    for o in range(ct_order)
+                    if N == n + m + o
+                ]
+            )
+            self._ct_N_idx = jnp.array(ct_idx[:, 0])
+            self._ct_n_idx = jnp.array(ct_idx[:, 1])
+            self._ct_m_idx = jnp.array(ct_idx[:, 2])
+            self._ct_o_idx = jnp.array(ct_idx[:, 3])
 
     def sigma_N_o(self, state, lk):
         """Compute sigma_N_o integrals from the matter power spectrum above k_cutoff."""
@@ -337,18 +360,24 @@ class LensingCounterterm(LikelihoodModule):
                     self.lensing_counterterm_order, -1
                 ),
             )
-            N, n, m, o = jnp.meshgrid(
-                jnp.arange(self.lensing_counterterm_order),
-                jnp.arange(self.lensing_counterterm_order),
-                jnp.arange(self.lensing_counterterm_order),
-                jnp.arange(self.lensing_counterterm_order),
-                indexing="ij",
-            )
+
+            if self.mean_model == "ct":
+                print(
+                    "CT mean model should only be used for illustrative purposes.",
+                    flush=True,
+                )
+
+            if self.mean_model in ("dmo", "ct"):
+                sigma_factor = sigma_N_o_emu * sigma_N_o
+            elif self.mean_model == "zero":
+                sigma_factor = sigma_N_o_emu * (1 + sigma_N_o)
+            else:
+                raise ValueError(f"Unknown mean_model '{self.mean_model}'")
 
         for t in self.spectrum_types:
             add_ct = False
             if self.lensing_counterterm_order > 0:
-                for (w_i, w_j), _, _ in required_components[t]:
+                for (w_i, w_j), _, _ in self.required_components[t]:
                     if (w_i in self.lensing_kernels) & (w_j in self.lensing_kernels):
                         w_i_n = self.w_n(w_i, state)
                         w_j_n = self.w_n(w_j, state)
@@ -356,7 +385,13 @@ class LensingCounterterm(LikelihoodModule):
 
                         n_i = w_i_n.shape[0]
                         n_j = w_j_n.shape[0]
-                        n_c_l = c_l.shape[0]
+                        # Under sharding c_l is a local block; the per-pair
+                        # arrays are built at the full pair length recorded by
+                        # Limber, then sliced to the same block.
+                        if self.model_sharding is not None:
+                            n_c_l = self.model_sharding.pair_counts[t]
+                        else:
+                            n_c_l = c_l.shape[0]
                         if n_i != n_c_l:
                             w_i_n = jnp.repeat(w_i_n, n_j, 0)
                         if n_j != n_c_l:
@@ -364,60 +399,36 @@ class LensingCounterterm(LikelihoodModule):
                                 w_j_n = jnp.tile(w_j_n, (n_i // n_j, 1))
                             else:
                                 w_j_n = jnp.tile(w_j_n, (n_i, 1))
+                        if self.model_sharding is not None:
+                            w_i_n = self.model_sharding.slice_local(w_i_n)
+                            w_j_n = self.model_sharding.slice_local(w_j_n)
 
-                        if self.mean_model == "dmo":
-                            c_l_uv = jnp.einsum(
-                                "in,im,No,Nl->ilNnmo",
-                                w_i_n,
-                                w_j_n,
-                                sigma_N_o_emu * sigma_N_o,
-                                ell_N,
-                            )
-                        elif self.mean_model == "ct":
-                            print(
-                                "CT mean model should only be used for illustrative purposes.",
-                                flush=True,
-                            )
-                            c_l_uv = jnp.einsum(
-                                "in,im,No,Nl->ilNnmo",
-                                w_i_n,
-                                w_j_n,
-                                sigma_N_o_emu * sigma_N_o,
-                                ell_N,
-                            )
-                        elif self.mean_model == "zero":
-                            c_l_uv = jnp.einsum(
-                                "in,im,No,Nl->ilNnmo",
-                                w_i_n,
-                                w_j_n,
-                                sigma_N_o_emu * (1 + sigma_N_o),
-                                ell_N,
-                            )
-
+                        # Contract only the sparse (N, n, m, o) terms with
+                        # N == n + m + o over the shared index axis s.
                         c_l_uv = (
-                            jnp.sum(c_l_uv, axis=(2, 3, 4, 5), where=(N == (n + m + o)))
+                            jnp.einsum(
+                                "is,is,s,sl->il",
+                                w_i_n[:, self._ct_n_idx],
+                                w_j_n[:, self._ct_m_idx],
+                                sigma_factor[self._ct_N_idx, self._ct_o_idx],
+                                ell_N[self._ct_N_idx, :],
+                            )
                             * (3 / 2 * state["omegam"] / self.hubble_radius**2) ** 2
                         )
 
-                        if "mag" in w_i:
-                            smag = param_vec[self.param_indices[w_i]][:, 0]
-                            if smag.shape[0] != c_l_uv.shape[0]:
-                                c_l_uv = (
-                                    c_l_uv.reshape(smag.shape[0], -1, self.n_ell)
-                                    * (5 * smag[:, None, None] - 2)
-                                ).reshape(-1, self.n_ell)
-                            else:
-                                c_l_uv = c_l_uv * (5 * smag[:, None] - 2)
-
-                        if "mag" in w_j:
-                            smag = param_vec[self.param_indices[w_j]][:, 0]
-                            if smag.shape[0] != c_l_uv.shape[0]:
-                                c_l_uv = (
-                                    c_l_uv.reshape(smag.shape[0], -1, self.n_ell)
-                                    * (5 * smag[:, None, None] - 2)
-                                ).reshape(-1, self.n_ell)
-                            else:
-                                c_l_uv = c_l_uv * (5 * smag[:, None] - 2)
+                        for w_mag in (w_i, w_j):
+                            if "mag" not in w_mag:
+                                continue
+                            smag = param_vec[self.param_indices[w_mag]][:, 0]
+                            # Build the full per-pair magnification vector
+                            # (repeat = the row-major grouping the previous
+                            # reshape-based scaling applied), then slice to
+                            # the local block under sharding.
+                            if smag.shape[0] != n_c_l:
+                                smag = jnp.repeat(smag, n_c_l // smag.shape[0])
+                            if self.model_sharding is not None:
+                                smag = self.model_sharding.slice_local(smag)
+                            c_l_uv = c_l_uv * (5 * smag[:, None] - 2)
 
                         state[f"{t}_w_lensing_ct"] = c_l + c_l_uv
                         add_ct = True

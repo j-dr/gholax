@@ -50,9 +50,19 @@ class Likelihood(metaclass=abc.ABCMeta):
         
         self.sampled_params = config_params
         self.free_params = copy(self.sampled_params)
-        
+        self._augment_free_params()
+
         self.setup_params()
         self.build_dependency_graph()
+
+    def _augment_free_params(self):
+        """Hook for subclasses to add extra free parameters before setup_params.
+
+        Default is a no-op. Subclasses (e.g. GaussianLikelihood) override this
+        to inject additional free parameters such as analytically marginalized
+        linear nuisance parameters.
+        """
+        pass
 
     def setup_params(self):
         """Parse derived parameters, build parameter index maps for pipeline modules."""

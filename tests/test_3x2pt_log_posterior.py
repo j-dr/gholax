@@ -22,7 +22,15 @@ CONFIG_PATH_AM = os.path.join(
     os.path.dirname(__file__), '..', 'example_configs', 'abacus_3x2_w0wa_am_example.yaml'
 )
 
-REFERENCE_LOG_POSTERIOR = -10293.5488281250
+# Recorded 2026-07-21 on CPU at commit 86bf3be. The GPU backend gives
+# -18849.287, so the tolerance below must absorb a ~0.1 spread; float32
+# reductions are ordered differently on the two backends.
+REFERENCE_LOG_POSTERIOR = -18849.1816406250
+
+# Loose enough for the CPU/GPU spread, tight enough to catch a real change:
+# the two physics/accuracy shifts in this model's history moved the value by
+# 42.8 (6bab76d, IA counterterm) and 62.2 (b4820a6, SE n_a_ode 30 -> 100).
+LOG_POSTERIOR_ATOL = 0.5
 
 
 def _build_model():
@@ -40,7 +48,7 @@ def test_3x2pt_log_posterior():
     param_norm = 0.1 * jnp.ones(len(model.param_names))
     log_post = float(model.log_posterior_scaled_params(param_norm))
 
-    assert np.isclose(log_post, REFERENCE_LOG_POSTERIOR, atol=0.01), (
+    assert np.isclose(log_post, REFERENCE_LOG_POSTERIOR, atol=LOG_POSTERIOR_ATOL), (
         f"log_posterior = {log_post}, expected {REFERENCE_LOG_POSTERIOR}"
     )
 

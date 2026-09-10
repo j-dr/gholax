@@ -12,7 +12,12 @@ from .window.redshift_space_multipole_power_spectrum_window import (
     RedshiftSpaceMultipolePowerSpectrumWindow,
 )
 from .gaussian_likelihood import GaussianLikelihood
-from ..data_vector.redshift_space_multipoles import RedshiftSpaceMultipoles, field_types
+from ..data_vector.redshift_space_multipoles import (
+    RedshiftSpaceMultipoles,
+    field_types,
+    ALPHA_TYPES,
+)
+from ..theory.bao_alphas import BAOAlphas
 import jax.numpy as jnp
 from jax.lax import scan
 
@@ -51,6 +56,10 @@ class RSDPK(GaussianLikelihood):
         config_theory = config.get("theory", {})
         spectrum_types = self.observed_data_vector.spectrum_types
         spectrum_info = self.observed_data_vector.spectrum_info
+        # BAO alphas are predicted directly from the expansion history; only
+        # the full-shape types go through the bias expansion and window.
+        alpha_types = [t for t in spectrum_types if t in ALPHA_TYPES]
+        fs_types = [t for t in spectrum_types if t not in ALPHA_TYPES]
         if self.use_boltzmann:
             self.likelihood_pipeline = [
                 Boltzmann(),
@@ -74,15 +83,24 @@ class RSDPK(GaussianLikelihood):
                 )
             )
 
-        self.likelihood_pipeline.extend(
-            [
-                ExpansionHistory(
-                    zmin=self.zmin_proj,
-                    zmax=self.zmax_proj,
-                    nz=self.nz_proj,
-                    **config_theory.get("ExpansionHistory", {}),
-                ),
-                *spectral_equiv_modules,
+        bao_modules = []
+        if alpha_types:
+            bao_modules.append(
+                BAOAlphas(
+                    spectrum_info,
+                    alpha_types,
+                    use_boltzmann=self.use_boltzmann,
+                    **config_theory.get("BAOAlphas", {}),
+                )
+            )
+
+        # The full-shape half of the pipeline is only needed when the data
+        # vector actually carries P_ell(k) blocks. A BAO-only data vector has
+        # no p_gg_ell entry in spectrum_info, so these modules are skipped
+        # entirely (their fiducial-geometry arguments live under p_gg_ell).
+        fs_modules = []
+        if fs_types:
+            fs_modules = [
                 LinearGrowthRate(
                     zmin=self.zmin_pk,
                     zmax=self.zmax_pk,
@@ -109,7 +127,7 @@ class RSDPK(GaussianLikelihood):
                 ),
                 RedshiftSpaceBiasExpansion(
                     self.observed_data_vector,
-                    spectrum_types,
+                    fs_types,
                     spectrum_info,
                     spectrum_info["p_gg_ell"]["z_fid"],
                     kmin=self.kmin,
@@ -120,7 +138,7 @@ class RSDPK(GaussianLikelihood):
                 ),
                 RedshiftSpaceMultipolePowerSpectrumWindow(
                     self.observed_data_vector,
-                    spectrum_types,
+                    fs_types,
                     spectrum_info,
                     kmin=self.kmin,
                     kmax=self.kmax,
@@ -128,51 +146,46 @@ class RSDPK(GaussianLikelihood):
                     **config.get("RedshiftSpaceMultipolePowerSpectrumWindow", {}),
                 ),
             ]
+
+        self.fs_types = fs_types
+        self.likelihood_pipeline.extend(
+            [
+                ExpansionHistory(
+                    zmin=self.zmin_proj,
+                    zmax=self.zmax_proj,
+                    nz=self.nz_proj,
+                    **config_theory.get("ExpansionHistory", {}),
+                ),
+                *bao_modules,
+                *spectral_equiv_modules,
+                *fs_modules,
+            ]
         )
 
         self.n_modules = len(self.likelihood_pipeline)
 
         # calling this builds the dependency information
         super(RSDPK, self).__init__(c, config["likelihood"].get('params', {}))
-        self.all_spectra = {}
-
-        for t in self.observed_data_vector.spectrum_types:
-            self.all_spectra[t] = []
-            for ii, i in enumerate(spectrum_info[t]["bins0"]):
-                if spectrum_info[t]["use_cross"]:
-                    if field_types[t][0] == field_types[t][1]:
-                        bins1 = spectrum_info[t]["bins1"][ii:]
-                    else:
-                        bins1 = spectrum_info[t]["bins1"][:]
-
-                    for j in bins1:
-                        self.all_spectra[t].append(
-                            i * spectrum_info[t]["n_bins1_tot"] + j
-                        )
-                else:
-                    self.all_spectra[t].append(i)
-            self.all_spectra[t] = jnp.array(self.all_spectra[t])
-
-    def get_model_from_state(self, state):
-        """Extract the windowed model vector from the pipeline state."""
-        dv = self.observed_data_vector
-        model = []
-        for t in dv.spectrum_types:
-            f = lambda carry, i: (carry, state[f"{t}_obs"][i])
-            _, m_t = scan(f, 0, self.all_spectra[t])
-            model.append(m_t.flatten())
-
-        model = jnp.hstack(model)
-
-        return model
+        self._build_all_spectra(field_types)
 
     def get_model_from_state_no_window(self, state):
-        """Extract the pre-window theory P_ell(k) predictions from the state."""
+        """Extract the pre-window theory P_ell(k) predictions from the state.
+
+        BAO alpha types are skipped: they are scalar observables with no
+        pre-window analog.
+        """
+        if not self.fs_types:
+            raise ValueError(
+                "No-window predictions are undefined for a BAO-only data "
+                "vector: the alphas are scalars and there is no window module."
+            )
         self.k_no_window = jnp.linspace(0, 0.6, 600)
         window_module = self.likelihood_pipeline[-1]
         k_theory = window_module.k
         model = []
         for t in self.observed_data_vector.spectrum_types:
+            if t in ALPHA_TYPES:
+                continue
             pl_pre = state[f"{t}{window_module.pl_tag}"]
 
             def f(carry, pl):

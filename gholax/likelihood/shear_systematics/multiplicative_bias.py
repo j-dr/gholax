@@ -10,6 +10,8 @@ class ShearMultiplicativeBias(LikelihoodModule):
     Multiplies C_ell by (1+m_i)(1+m_j) for each bin pair involving shear fields.
     """
 
+    shards_pair_axis = True
+
     def __init__(self, observed_data_vector, spectrum_types, spectrum_info, **config):
         """Initialize the multiplicative bias module.
 
@@ -59,11 +61,19 @@ class ShearMultiplicativeBias(LikelihoodModule):
 
         for t in self.spectrum_types:
             c_l = state[f"{t}{self.cl_tag}"]
-            n_c_l = c_l.shape[0]
+            # Under sharding c_l is a local block of the pair axis; build the
+            # per-pair m_bias vectors at the full length recorded by Limber
+            # and slice them to the same block.
+            if self.model_sharding is not None:
+                n_c_l = self.model_sharding.pair_counts[t]
+            else:
+                n_c_l = c_l.shape[0]
 
             if "gamma" in field_types[t][0]:
                 m_bias = param_vec[self.param_indices[t][:, 0]]
                 m_bias = jnp.repeat(m_bias, n_c_l // m_bias.shape[0], 0)
+                if self.model_sharding is not None:
+                    m_bias = self.model_sharding.slice_local(m_bias)
                 state["m_bias_0"] = m_bias
                 state["param_vec"] = param_vec
                 state["params_values"] = params_values
@@ -71,6 +81,8 @@ class ShearMultiplicativeBias(LikelihoodModule):
             if "gamma" in field_types[t][1]:
                 m_bias = param_vec[self.param_indices[t][:, 0]]
                 m_bias = jnp.tile(m_bias, n_c_l // m_bias.shape[0]).flatten()
+                if self.model_sharding is not None:
+                    m_bias = self.model_sharding.slice_local(m_bias)
                 state["m_bias_1"] = m_bias
                 c_l = c_l * (1 + m_bias[:, None])
 

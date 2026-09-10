@@ -543,6 +543,18 @@ class RedshiftSpaceBiasExpansion(LikelihoodModule):
                         self.spectrum_basis["p_gg_ell"]
                     )
 
+        if self.compute_p_gg_cross:
+            raise NotImplementedError(
+                "RSD galaxy-galaxy cross-spectra are not implemented "
+                "(compute_p_gg_cross=True, triggered by "
+                "spectrum_info['p_gg_ell']['use_cross']=True). The cross compute "
+                "path in RedshiftSpaceBiasExpansion.compute references unbound "
+                "variables (bias_params, s8z, fz, aap are assigned only in the "
+                "auto-spectrum branch), and combine_lpt_redshift_space_gg_cross_spectra "
+                "unconditionally raises NotImplementedError. Set "
+                "spectrum_info['p_gg_ell']['use_cross']=False to use RSD p_gg_ell."
+            )
+
         self.dbins = jnp.unique(jnp.array(self.dbins))
         self.n_dbins = self.dbins.shape[0]
 
@@ -699,9 +711,9 @@ def combine_lpt_redshift_space_spectra(
         b1 = b1 - 1
 
     if fracb1_counterterm:
-        alpha0 = (1 + b1) ** 2 * alpha0p / 0.2**2
-        alpha2 = f * (1 + b1) * (alpha0p * sqaap + alpha2p / sqaap) / 0.2**2
-        alpha4 = f * (f * alpha2p / aap + (1 + b1) * alpha4p / sqaap) / 0.2**2
+        alpha0 = (1 + b1) ** 2 * sqaap ** 2 * alpha0p / 0.2**2 / aap
+        alpha2 = f * (1 + b1) * sqaap * (alpha0p + alpha2p) / 0.2**2 / aap
+        alpha4 = f * (f * alpha2p + (1 + b1) * sqaap * alpha4p) / 0.2**2 / aap
         alpha6 = f**2 * alpha4p / 0.2**2 / aap
             
     bias_monomials = jnp.array(

@@ -3,6 +3,7 @@ import numpy as np
 import h5py as h5
 from interpax import interp1d
 from scipy.interpolate import interp1d as scipy_interp1d
+from jax import vmap
 from jax.lax import scan
 from spinosaurus.density_shape_correlators_fftw import DensityShapeCorrelators
 from spinosaurus.shape_shape_correlators_fftw import ShapeShapeCorrelators
@@ -371,8 +372,7 @@ class RealSpaceIAExpansion(LikelihoodModule):
             
 
         self.output_requirements = {}
-        if self.scale_by_s8z:
-            self.sigma8_fid = 0.81
+        self.sigma8_fid = 0.81
 
         if self.save_spherical_harmonic_spectra:
             self.required_spectra = {
@@ -885,6 +885,18 @@ class RealSpaceIAExpansion(LikelihoodModule):
 
         return pars
 
+    def _sigma8_z(self, state):
+        """sigma8(z) feeding the bias reparameterization.
+
+        Every consumer normalizes this by ``sigma8_fid``, so returning
+        ``sigma8_fid`` when ``scale_by_s8z`` is off makes that normalization
+        unity. ``state['sigma8_z']`` is only requested when the flag is on, so
+        it must not be read otherwise.
+        """
+        if not self.scale_by_s8z:
+            return jnp.full(self.z.shape[0], self.sigma8_fid)
+        return state["sigma8_z"]
+
     def set_cs(self, param_vec, param_indices, zeff, s8z, z_evolution_model):
         """Compute IA bias coefficients with redshift evolution applied.
 
@@ -1033,7 +1045,7 @@ class RealSpaceIAExpansion(LikelihoodModule):
         bvec = [0] * len(self.spectrum_params["p_gi"][0])
         bvec[0] = 1
         p_ij = state["p_ij_real_space_density_shape_grid"]
-        s8z = state["sigma8_z"] / self.sigma8_fid
+        s8z = self._sigma8_z(state) / self.sigma8_fid
 
         pmi = combine_density_shape_spectra(
             self.k, p_ij[...], jnp.array(bvec), cvec, s8z_d=None, s8z_s=s8z, b1e=True
@@ -1070,14 +1082,13 @@ class RealSpaceIAExpansion(LikelihoodModule):
         n_dbins_tot = self.n_dbins_tot
 
         for s in self.all_spectra:
-            computer = getattr(self, f"compute_{s}")
-
-            def fspec(carry, xs):
-                p = computer(state, xs)
-                return carry, p
 
             if s == "p_mi":
-                
+
+                if self.no_ia:
+                    state[s] = jnp.zeros((n_sbins_tot, self.nk, self.nz))
+                    continue
+
                 def f(carry, x):
                     p_idx, s8z = x
                     return carry+1, self.set_cs(
@@ -1089,29 +1100,49 @@ class RealSpaceIAExpansion(LikelihoodModule):
                     0,
                     (
                         self.param_indices[s][1],
-                        jnp.tile(state["sigma8_z"], n_sbins_tot).reshape(
+                        jnp.tile(self._sigma8_z(state), n_sbins_tot).reshape(
                             n_sbins_tot, -1
                         ),
                     ),
                 )
                 if self.z_evolution_model == 'tabulated':
                     xs = [self.c_z, xs[1]]
-                    
-                _, p = scan(fspec, None, xs)
+
+                # Matter side is a fixed delta-only bias vector (see
+                # compute_p_mi); the shape/IA side (xs[0]) varies per bin and
+                # the shape s8z(z) normalization is shared across bins.
+                bvec = [0] * len(self.spectrum_params["p_gi"][0])
+                bvec[0] = 1
+                bvec = jnp.array(bvec)
+                s8z_s = self._sigma8_z(state) / self.sigma8_fid
+                p_ij = state["p_ij_real_space_density_shape_grid"]
+
+                bias_poly_all = vmap(
+                    lambda cvec: density_shape_bias_poly(
+                        bvec, cvec, s8z_d=None, s8z_s=s8z_s, b1e=True
+                    )
+                )(xs[0])
+                p = 3 * _contract_ia_basis(bias_poly_all, p_ij) / 4
                 state[s] = p
 
             elif s == "p_gi":
 
+                if self.no_ia:
+                    state[s] = jnp.zeros(
+                        (n_dbins_tot, n_sbins_tot, self.nk, self.nz)
+                    )
+                    continue
+
                 def f_i(carry, x):
                     p_idx, zeff, s8z = x
                     return carry+1, self.set_cs(
-                        param_vec, p_idx, zeff, s8z, "scalar_bias", 
+                        param_vec, p_idx, zeff, s8z, "scalar_bias",
                     )
 
                 def f_j(carry, x):
                     p_idx, zeff, s8z = x
                     return carry+1, self.set_cs(
-                        param_vec, p_idx, zeff, s8z, self.z_evolution_model,  
+                        param_vec, p_idx, zeff, s8z, self.z_evolution_model,
                     )
 
                 _, (bias_params_i, s8z_i) = scan(
@@ -1121,7 +1152,7 @@ class RealSpaceIAExpansion(LikelihoodModule):
                         self.param_indices[s][0],
                         state["zeff_w_d_dk"],
                         jnp.tile(
-                            state["sigma8_z"], len(self.param_indices[s][0])
+                            self._sigma8_z(state), len(self.param_indices[s][0])
                         ).reshape(len(self.param_indices[s][0]), -1),
                     ),
                 )
@@ -1133,23 +1164,34 @@ class RealSpaceIAExpansion(LikelihoodModule):
                         self.param_indices[s][1],
                         state["zeff_w_d_dk"][:, None],
                         jnp.tile(
-                            state["sigma8_z"], len(self.param_indices[s][0])
+                            self._sigma8_z(state), len(self.param_indices[s][0])
                         ).reshape(len(self.param_indices[s][0]), -1),
                     ),
                 )
                 if self.z_evolution_model == 'tabulated':
                     bias_params_j = jnp.tile(self.c_z, (n_dbins_tot, 1, 1))
 
-                xs = [bias_params_i, bias_params_j, s8z_i, s8z_j]
-                _, p = scan(fspec, None, xs)
+                p_ij = state["p_ij_real_space_density_shape_grid"]
+                bias_poly_all = vmap(
+                    lambda bd, bia, sd, ss: density_shape_bias_poly(
+                        bd, bia, s8z_d=sd, s8z_s=ss, b1e=True
+                    )
+                )(bias_params_i, bias_params_j, s8z_i, s8z_j)
+                p = 3 * _contract_ia_basis(bias_poly_all, p_ij) / 4
                 state[s] = p.reshape(n_dbins_tot, n_sbins_tot, self.nk, self.nz)
 
             elif s in ["p_ii_ee", "p_ii_bb", "p_ii_22_0", "p_ii_22_1", "p_ii_22_2"]:
 
+                if self.no_ia:
+                    state[s] = jnp.zeros(
+                        (n_sbins_tot, n_sbins_tot, self.nk, self.nz)
+                    )
+                    continue
+
                 def f_i(carry, x):
                     p_idx, zeff, s8z = x
                     return carry+1, self.set_cs(
-                        param_vec, p_idx, zeff, s8z, self.z_evolution_model 
+                        param_vec, p_idx, zeff, s8z, self.z_evolution_model
                     )
                 _, (bias_params_i, s8z_i) = scan(
                     f_i,
@@ -1158,7 +1200,7 @@ class RealSpaceIAExpansion(LikelihoodModule):
                         self.param_indices[s][0],
                         jnp.repeat(state["zeff_w_ia"][:, None], n_sbins_tot),
                         jnp.tile(
-                            state["sigma8_z"], len(self.param_indices[s][0])
+                            self._sigma8_z(state), len(self.param_indices[s][0])
                         ).reshape(len(self.param_indices[s][0]), -1),
                     ),
                 )
@@ -1169,7 +1211,7 @@ class RealSpaceIAExpansion(LikelihoodModule):
                         self.param_indices[s][1],
                         jnp.repeat(state["zeff_w_ia"][:, None], n_sbins_tot),
                         jnp.tile(
-                            state["sigma8_z"], len(self.param_indices[s][0])
+                            self._sigma8_z(state), len(self.param_indices[s][0])
                         ).reshape(len(self.param_indices[s][1]), -1),
                     ),
                 )
@@ -1177,8 +1219,38 @@ class RealSpaceIAExpansion(LikelihoodModule):
                     bias_params_i = jnp.repeat(self.c_z, n_sbins_tot, 0)
                     bias_params_j = jnp.tile(self.c_z, (n_sbins_tot, 1, 1))
 
-                xs = [bias_params_i, bias_params_j, s8z_i, s8z_j]
-                _, p = scan(fspec, None, xs)
+                p_mij = state["p_mij_real_space_shape_shape_grid"]
+                bias_poly_all, shot_all = vmap(
+                    lambda bi, bj, si, sj: shape_shape_bias_poly(
+                        bi, bj, s8z_i=si, s8z_j=sj
+                    )
+                )(bias_params_i, bias_params_j, s8z_i, s8z_j)
+
+                if s == "p_ii_ee":
+                    pii0 = _add_shape_shot(
+                        _contract_ia_basis(bias_poly_all, p_mij[0, ...]), shot_all
+                    )
+                    pii2 = _add_shape_shot(
+                        _contract_ia_basis(bias_poly_all, p_mij[2, ...]), shot_all
+                    )
+                    p = 0.125 * (3 * pii0 + pii2)
+                elif s == "p_ii_bb":
+                    p = _add_shape_shot(
+                        _contract_ia_basis(bias_poly_all, p_mij[1, ...]), shot_all
+                    )
+                elif s == "p_ii_22_0":
+                    p = _add_shape_shot(
+                        _contract_ia_basis(bias_poly_all, p_mij[0, ...]), shot_all
+                    )
+                elif s == "p_ii_22_1":
+                    p = _add_shape_shot(
+                        _contract_ia_basis(bias_poly_all, p_mij[1, ...]), shot_all
+                    )
+                elif s == "p_ii_22_2":
+                    p = _add_shape_shot(
+                        _contract_ia_basis(bias_poly_all, p_mij[2, ...]), shot_all
+                    )
+
                 state[s] = p.reshape(n_sbins_tot, n_sbins_tot, self.nk, self.nz)
 
         return state
@@ -1202,7 +1274,28 @@ def combine_density_shape_spectra(
     Returns:
         Dictionary of combined density-shape power spectra
     """
-    b1, b2, bs, b3, bk2 = bvec_d  
+    bias_poly = density_shape_bias_poly(
+        bvec_d, bvec_ia, s8z_d=s8z_d, s8z_s=s8z_s, b1e=b1e
+    )
+
+    if len(bias_poly.shape) == 1:
+        bias_poly = bias_poly.reshape(-1, 1)
+
+    return jnp.sum(bias_poly[:, None, :] * spectra, axis=0)
+
+
+def density_shape_bias_poly(bvec_d, bvec_ia, s8z_d=None, s8z_s=None, b1e=False):
+    """Build the density-shape bias polynomial (basis-coefficient vector).
+
+    This is the per-bin-pair coefficient vector that multiplies the fixed
+    (21, nk, nz) density-shape basis tensor. It is factored out of
+    ``combine_density_shape_spectra`` so that the coefficients for all bin
+    pairs can be built at once (via ``vmap``) and contracted against the
+    basis in a single reduction, instead of scanning per pair.
+
+    Returns an array of shape ``(21,)`` (z-independent bias) or ``(21, nz)``.
+    """
+    b1, b2, bs, b3, bk2 = bvec_d
     c_s, c_ds, c_s2, c_L2, c_3, c_dt, alpha_s, sigma_s = bvec_ia
 
     if s8z_d is not None:
@@ -1223,7 +1316,7 @@ def combine_density_shape_spectra(
 
     if b1e:
         b1 = b1 - 1
-    
+
     bk2 = 0.5 * c_s * (1 + b1) * bk2 / 0.4**2
     alpha_s = 0.5 * c_s * (1 + b1) * alpha_s / 0.4**2
 
@@ -1254,10 +1347,7 @@ def combine_density_shape_spectra(
         ]
     )
 
-    if len(bias_poly.shape) == 1:
-        bias_poly = bias_poly.reshape(-1, 1)
-
-    return jnp.sum(bias_poly[:, None, :] * spectra, axis=0)
+    return bias_poly
 
 
 def combine_shape_shape_spectra(
@@ -1280,6 +1370,33 @@ def combine_shape_shape_spectra(
     """
     # Here we have to specify spectra for a specific helicity
 
+    bias_poly, shot = shape_shape_bias_poly(
+        shape_bvec1, shape_bvec2, s8z_i=s8z_i, s8z_j=s8z_j
+    )
+
+    if len(bias_poly.shape) == 1:
+        bias_poly = bias_poly.reshape(-1, 1)
+
+    p = jnp.sum(bias_poly[:, None, :] * spectra, axis=0) + shot
+
+    #    add_sn = lambda p, sn_a: p + sn_a
+    # noadd_sn = lambda p, sn_a: p
+    #    p = cond(jnp.all(eps_s1==eps_s2), add_sn, noadd_sn, p, 2 * eps_s1)
+
+    return p
+
+
+def shape_shape_bias_poly(shape_bvec1, shape_bvec2, s8z_i=None, s8z_j=None):
+    """Build the shape-shape bias polynomial and shot-noise term.
+
+    Factored out of ``combine_shape_shape_spectra`` so the coefficients for
+    all bin pairs can be built at once (via ``vmap``) and contracted against
+    the fixed (13, nk, nz) shape-shape basis in a single reduction.
+
+    Returns ``(bias_poly, shot)`` where ``bias_poly`` has shape ``(13,)`` or
+    ``(13, nz)`` and ``shot = sigma_s1 * sigma_s2`` is the additive
+    shape-noise term (scalar or ``(nz,)``).
+    """
     c_s, c_ds, c_s2, c_L2, c_3, c_dt, alpha_s1, sigma_s1 = shape_bvec1
     b_s, b_ds, b_s2, b_L2, b_3, b_dt, alpha_s2, sigma_s2 = shape_bvec2
 
@@ -1322,13 +1439,34 @@ def combine_shape_shape_spectra(
         ]
     )
 
-    if len(bias_poly.shape) == 1:
-        bias_poly = bias_poly.reshape(-1, 1)
+    return bias_poly, sigma_s1 * sigma_s2
 
-    p = jnp.sum(bias_poly[:, None, :] * spectra, axis=0) + sigma_s1 * sigma_s2
 
-    #    add_sn = lambda p, sn_a: p + sn_a
-    # noadd_sn = lambda p, sn_a: p
-    #    p = cond(jnp.all(eps_s1==eps_s2), add_sn, noadd_sn, p, 2 * eps_s1)
+def _contract_ia_basis(bias_poly_all, spectra):
+    """Contract per-bin-pair bias polynomials against a fixed basis tensor.
 
-    return p
+    ``bias_poly_all`` is the stacked coefficient matrix for every bin pair,
+    shape ``(npairs, ncomp)`` (z-independent bias) or ``(npairs, ncomp, nz)``.
+    ``spectra`` is the fixed ``(ncomp, nk, nz)`` basis. Returns
+    ``(npairs, nk, nz)``.
+
+    The reduction contracts the component axis directly via einsum rather
+    than materializing the (npairs, ncomp, nk, nz) product; results agree
+    with the per-pair path to float32 accumulation order.
+    """
+    if bias_poly_all.ndim == 2:
+        # z-independent bias: (npairs, ncomp)
+        return jnp.einsum("pc,ckz->pkz", bias_poly_all, spectra)
+    # z-dependent bias: (npairs, ncomp, nz)
+    return jnp.einsum("pcz,ckz->pkz", bias_poly_all, spectra)
+
+
+def _add_shape_shot(p, shot):
+    """Add the shape-noise term to a batched shape-shape spectrum.
+
+    ``p`` has shape ``(npairs, nk, nz)``; ``shot`` has shape ``(npairs,)``
+    (z-independent) or ``(npairs, nz)``. Mirrors the per-pair ``+ shot`` add.
+    """
+    if jnp.ndim(shot) == 1:
+        return p + shot[:, None, None]
+    return p + shot[:, None, :]

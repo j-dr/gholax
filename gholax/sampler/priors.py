@@ -2,6 +2,7 @@ import warnings
 from datetime import datetime
 
 import jax
+import jax.scipy.special
 import jax.numpy as jnp
 import scipy.stats
 
@@ -14,7 +15,7 @@ class Prior(object):
     """
 
     def __init__(self, config, derived_params=[], fixed_params=[], joint_priors={},
-                 linear_constraint_priors={}):
+                 linear_constraint_priors={}, transform=False):
         """Initialize priors from parameter configuration.
 
         Args:
@@ -109,6 +110,57 @@ class Prior(object):
         self._normal_locs = jnp.array(normal_locs) if normal_locs else None
         self._normal_scales = jnp.array(normal_scales) if normal_scales else None
 
+        # Unbounded reparametrization (transform=True): uniform-bounded
+        # params are sampled as y with theta = min + range * sigmoid(y),
+        # removing the log(0) = -inf cliff (and its zero-gradient plateau)
+        # at the box edges that drives boundary divergences. Other params
+        # keep the affine y*sigma + ref map. Box priors are exactly flat in
+        # this convention (no erf softening): the Jacobian alone provides
+        # the edge repulsion.
+        self.transform = bool(transform)
+        t_mask, t_lo, t_hi = [], [], []
+        # iterate prior_info (not self.params): its ordering defines the
+        # prior_sigmas / reference_values vectors these arrays align with
+        for p in self.prior_info:
+            pi = self.prior_info[p]
+            is_u = pi["dist"] == "uniform"
+            t_mask.append(is_u)
+            t_lo.append(pi["min"] if is_u else 0.0)
+            t_hi.append(pi["max"] if is_u else 1.0)
+        self._t_mask = jnp.array(t_mask)
+        self._t_lo = jnp.array(t_lo)
+        self._t_hi = jnp.array(t_hi)
+
+    def constrain(self, y):
+        """Map sampling-space values to physical parameters (broadcasts over
+        leading axes; last axis is the parameter axis). Affine when the
+        transform is off."""
+        affine = y * self.prior_sigmas + self.reference_values
+        if not self.transform:
+            return affine
+        box = self._t_lo + (self._t_hi - self._t_lo) * jax.nn.sigmoid(y)
+        return jnp.where(self._t_mask, box, affine)
+
+    def unconstrain(self, theta):
+        """Inverse of constrain (theta clipped 1e-6 inside uniform bounds)."""
+        affine = (theta - self.reference_values) / self.prior_sigmas
+        if not self.transform:
+            return affine
+        u = (theta - self._t_lo) / (self._t_hi - self._t_lo)
+        u = jnp.clip(u, 1e-6, 1.0 - 1e-6)
+        return jnp.where(self._t_mask, jnp.log(u) - jnp.log1p(-u), affine)
+
+    def log_jacobian(self, y):
+        """log|d theta / d y| summed over transformed params (0 when off)."""
+        if not self.transform:
+            return 0.0
+        lj = (
+            jnp.log(self._t_hi - self._t_lo)
+            + jax.nn.log_sigmoid(y)
+            + jax.nn.log_sigmoid(-y)
+        )
+        return jnp.sum(jnp.where(self._t_mask, lj, 0.0))
+
     def uniform(self, x, x_l, x_r, L=10):
         """Compute log-probability of a smooth uniform prior using error functions."""
         delta = (x_r - x_l)
@@ -122,8 +174,10 @@ class Prior(object):
         """Compute the total log-prior for all parameters."""
         logp = 0.0
 
-        # Vectorized uniform priors
-        if self._uniform_mins is not None:
+        # Vectorized uniform priors (flat when transform=True: the sigmoid
+        # map keeps samples in-box and the Jacobian supplies the edge repulsion,
+        # so the erf softening is dropped)
+        if self._uniform_mins is not None and not self.transform:
             x_u = jnp.stack([params_values[p] for p in self._uniform_params])
             logp += jnp.sum(self.uniform(x_u, self._uniform_mins, self._uniform_maxs))
 
@@ -147,9 +201,10 @@ class Prior(object):
             scale = jnp.sum(jnp.abs(group["coeffs"]) * self.prior_sigmas[
                 jnp.array([self.params.index(p) for p in group["params"]])
             ])
-            logp += jnp.log(0.5 * (1 - jax.lax.erf(
-                group["L"] * (linear_combo - group["bound"]) / scale
-            )))
+            # log(0.5*erfc(x)) via log_ndtr: finite gradient far past the bound
+            logp += jax.scipy.special.log_ndtr(
+                -jnp.sqrt(2.0) * group["L"] * (linear_combo - group["bound"]) / scale
+            )
 
         return logp
 
@@ -164,6 +219,15 @@ class Prior(object):
         Returns:
             Dict mapping parameter names to initial values.
         """
+        if normalize and self.transform:
+            # Sampling space is the unconstrained transform of the physical
+            # draw (note the reference maps to unconstrain(ref), not 0).
+            phys = self.initial_position(
+                random_start=random_start, key=key, normalize=False
+            )
+            y = self.unconstrain(jnp.array(list(phys.values())))
+            return dict(zip(phys.keys(), y))
+
         init = {}
         if random_start & (key is None):
             key = jax.random.key(int(datetime.now().strftime("%Y%m%d%s")))

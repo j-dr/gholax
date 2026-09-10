@@ -1,13 +1,17 @@
-import json
 import os
-from datetime import datetime
+from dataclasses import replace
 
 import blackjax
 import jax
 import jax.numpy as jnp
-import jaxopt
 import numpy as np
 from blackjax.diagnostics import potential_scale_reduction
+
+from .base import BaseSampler
+from .seeding import (
+    SeedingConfig,
+    proposal_covariance_from_metric,
+)
 
 
 def choleskyL_corr(M):
@@ -105,7 +109,7 @@ def get_gaussian_proposal_generator(proposal_cov):
     return proposal_generator
 
 
-class MetropolisHastings(object):
+class MetropolisHastings(BaseSampler):
     def __init__(self, config):
         c = config["sampler"]["MetropolisHastings"]
         self.target_r_minus_one = c.get("target_r_minus_one", 0.1)
@@ -132,36 +136,51 @@ class MetropolisHastings(object):
                 )
                 self.minimize_and_sample = True
 
+        self.seeding_config = SeedingConfig.from_sampler_config(
+            c, sampler="MetropolisHastings"
+        )
+        # The hessian coercion above also has to reach the seeding config: it
+        # drives whether the metric branch re-polishes the MAP.
+        if self.minimize_and_sample != self.seeding_config.minimize_and_sample:
+            self.seeding_config = replace(
+                self.seeding_config, minimize_and_sample=self.minimize_and_sample
+            )
+        # init_covariance doubles as the seeding ladder's mass_matrix_init for
+        # every value the ladder knows; None/jacobian/from_file stay MH's own.
+        if self.init_covariance not in (None, "jacobian", "from_file"):
+            # "hessian" means a full covariance with correlations here, which
+            # is the ladder's hessian_dense; the ladder's "hessian" is the
+            # diagonal metric.
+            self.seeding_config = replace(
+                self.seeding_config,
+                mass_matrix_init=(
+                    "hessian_dense" if self.init_covariance == "hessian"
+                    else self.init_covariance
+                ),
+            )
+
         if self.init_covariance == "from_file":
             self.proposal_covariance = np.genfromtxt(self.covariance_filename)
         else:
             self.proposal_covariance = None
 
     def run(self, model, output_file):
-        rng_key = jax.random.key(int(datetime.now().strftime("%Y%m%d%s")))
-        param_names = model.prior.params
-        prior = model.prior
-
-        sigmas = prior.get_prior_sigmas()
-        reference = prior.get_reference_values()
-        log_posterior = model.log_posterior_scaled_params
-
-        n_devices = jax.local_device_count()
-        keys = jax.random.split(rng_key, n_devices + 1)
-        rng_key = keys[0]
-        initial_keys = keys[1:]
-        initial_positions = jnp.array(
-            [
-                list(
-                    prior.initial_position(
-                        random_start=self.random_start, key=k, normalize=True
-                    ).values()
-                )
-                for k in initial_keys
-            ]
-        )
-
-        jlp = jax.jit(log_posterior)
+        if getattr(model.prior, "transform", False):
+            raise NotImplementedError(
+                "sample_transform is only supported by the NUTS and Minimize "
+                "samplers; disable it for this sampler."
+            )
+        (
+            rng_key,
+            param_names,
+            prior,
+            sigmas,
+            reference,
+            log_posterior,
+            jlp,
+            n_devices,
+            initial_positions,
+        ) = self._init_chains(model)
 
         if (self.restart) & (os.path.exists(f"{output_file}.proposal_cov.npy")):
             proposal_cov = np.load(f"{output_file}.proposal_cov.npy")
@@ -179,31 +198,17 @@ class MetropolisHastings(object):
 
         else:
             samples = None
+            seeder = self._seeder()
             if self.minimize_and_sample:
-                # minimize negative log posterior
-                jnlp = jax.jit(lambda p: -log_posterior(p))
-                vgrad = jax.value_and_grad(jnlp)
-                solver = jaxopt.LBFGS(fun=vgrad, value_and_grad=True)
-
-                minimize_pmap = jax.pmap(solver.run, in_axes=(0))
-                print("Running minimization before sampling", flush=True)
-                res = minimize_pmap(initial_positions)
-                initial_positions = res.params
-                with open(f"{output_file}.minimization_results.json", "w") as fp:
-                    json.dump(
-                        {
-                            "x_opt": initial_positions.tolist(),
-                            "value": res.state.value.tolist(),
-                        },
-                        fp,
-                    )
-
-                chi2_ratio = res.state.value / np.min(res.state.value)
-                initial_positions_min = jnp.tile(
-                    initial_positions[jnp.argmin(res.state.value)], n_devices
-                ).reshape(n_devices, -1)
-                initial_positions = jnp.where(
-                    chi2_ratio[:, None] > 2, initial_positions_min, initial_positions
+                # n_chains, not n_devices: with chains_per_device > 1
+                # the chain axis is n_devices * K.  MH never parses
+                # chains_per_device, so this is a no-op today.
+                initial_positions = seeder.minimize(
+                    log_posterior,
+                    initial_positions,
+                    initial_positions.shape[0],
+                    output_file,
+                    chi2_threshold=2,
                 )
 
             if self.proposal_covariance is None:
@@ -222,63 +227,26 @@ class MetropolisHastings(object):
                         initial_positions[0], n_devices
                     ).reshape(n_devices, -1)
 
-                elif self.init_covariance == "hessian":
-                    hess = jax.hessian(jnlp)
-                    hx = jnp.array(
-                        [hess(initial_positions[i]) for i in range(n_devices)]
+                elif self.init_covariance is not None:
+                    # Every other value is a seeding mass_matrix_init: take
+                    # the metric from the shared ladder and turn it into a
+                    # proposal covariance with MH's prior-width cap.
+                    rng_key, mm_key = jax.random.split(rng_key)
+                    imm, _ = seeder.initial_metric(
+                        jlp, initial_positions[0], initial_positions, mm_key
                     )
-                    np.save(f"{output_file}.hx.npy", hx)
-
-                    hx = jnp.array(
-                        [(hx[i] + hx[i].T) / 2 for i in range(n_devices)]
-                    )  # sometimes not symmetric due to numerical precision
-
-                    eigvals = jnp.array(
-                        [jnp.linalg.eigvalsh(hx[i]) for i in range(n_devices)]
-                    )
-                    is_psd = jnp.array(
-                        [(eigvals[i] > 0).all() for i in range(n_devices)]
-                    )
-
-                    if not any(
-                        is_psd
-                    ):  # find hessian with least negative minimum eigv, adjust to make psd
-                        idx = jnp.argmax(jnp.min(eigvals, axis=1))
-                        eig = jnp.linalg.eigh(hx)
-                        eps = 1e-2
-                        eigv_pos = eig.eigenvalues - jnp.min(eig.eigenvalues) + eps
-                        hx = jnp.dot(
-                            eig.eigenvectors,
-                            jnp.dot(jnp.diag(eigv_pos), eig.eigenvectors.T),
+                    if imm is None:
+                        raise ValueError(
+                            f"init_covariance: {self.init_covariance} is not a "
+                            "known seeding mass_matrix_init"
                         )
-                        initial_positions = jnp.tile(
-                            initial_positions[idx], n_devices
-                        ).reshape(n_devices, -1)
-
-                        assert (jnp.linalg.eigvalsh(hx) > 0).all()
-                    else:  # pick hessian with smallest condition number
-                        hx = hx[is_psd]
-                        eigvals = eigvals[is_psd]
-                        cond = jnp.max(eigvals, axis=1) / jnp.min(eigvals, axis=1)
-                        idx = jnp.argmin(cond)
-                        hx = hx[idx]
-                        initial_positions = jnp.tile(
-                            initial_positions[idx], n_devices
-                        ).reshape(n_devices, -1)
-
-                    # make sure proposals are not larger than prior widths
-                    hx_sigmas = jnp.sqrt(jnp.diag(hx))
-                    prior_step = jnp.ones_like(hx_sigmas)
-                    hxc = jnp.einsum("ij, i, j -> ij", hx, 1 / hx_sigmas, 1 / hx_sigmas)
-                    proposal_corr = jnp.linalg.inv(hxc)
-                    proposal_sigmas = jnp.min(
-                        jnp.array([prior_step, 1 / hx_sigmas]), axis=0
-                    )
-                    proposal_cov = jnp.einsum(
-                        "ij, i, j -> ij",
-                        proposal_corr,
-                        proposal_sigmas,
-                        proposal_sigmas,
+                    proposal_cov = proposal_covariance_from_metric(imm)
+                    ev = jnp.linalg.eigvalsh(proposal_cov)
+                    print(
+                        f"Proposal covariance from {self.init_covariance} "
+                        f"metric: eigenvalue range [{float(ev.min()):.3e}, "
+                        f"{float(ev.max()):.3e}]",
+                        flush=True,
                     )
 
             else:
@@ -296,17 +264,6 @@ class MetropolisHastings(object):
             proposal_generator = get_cosmomc_proposal_generator(proposal_cov)
             random_walk = blackjax.rmh(jlp, proposal_generator)
 
-        def inference_loop(rng_key, kernel, initial_state, num_samples):
-            @jax.jit
-            def one_step(state, rng_key):
-                state, info = kernel(rng_key, state)
-                return state, [state, info]
-
-            keys = jax.random.split(rng_key, num_samples)
-            _, states = jax.lax.scan(one_step, initial_state, keys)
-
-            return states
-
         #        random_walk = blackjax.rmh(jlp, proposal_generator)
         init_pmap = jax.pmap(random_walk.init, in_axes=(0))
         states = init_pmap(initial_positions)
@@ -321,11 +278,7 @@ class MetropolisHastings(object):
         rng_key = keys[0]
         sample_keys = keys[1:]
 
-        pmap_inference_loop = jax.pmap(
-            inference_loop,
-            in_axes=(0, None, 0, None),
-            static_broadcasted_argnums=(1, 3),
-        )
+        pmap_inference_loop = self._make_pmap_inference_loop(collect_info=True)
 
         print("Running inference loop", flush=True)
         rhat = 10000
